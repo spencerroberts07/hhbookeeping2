@@ -1,0 +1,407 @@
+[
+  {
+    "rule_id": "DCB-01",
+    "area": "Daily cash balancing",
+    "source": "Daily Cash Balancing workbook + POS sales summary",
+    "trigger_match": "One JE per business day from cash balancing tab.",
+    "posting_logic": "Dr 1010 opening/closing cash movement; Dr 1020 card/debit/cash deposit lines; Cr 4010 sales; Cr 2300 HST; post gift cards/house accts/ecomm/cash over-short as separate lines.",
+    "key_accounts": [
+      "1010",
+      "1020",
+      "4010",
+      "2300",
+      "1085",
+      "1095",
+      "5020",
+      "6699"
+    ],
+    "auto_level": "Auto-post after translation table is finalized",
+    "review_tier": "Medium",
+    "exception_logic": "If cash sheet line uses legacy code with no QB translation, hold in review queue.",
+    "evidence": "Daily JEs 1848-1916 and Feb cash tabs"
+  },
+  {
+    "rule_id": "DCB-02",
+    "area": "House accounts",
+    "source": "Daily Cash Balancing workbook",
+    "trigger_match": "Cash sheet lines 'House Acct Charge' and 'House Acct Payment'.",
+    "posting_logic": "Charge: Dr 1085 House Accounts / Cr sales side inside daily JE. Payment: Dr bank or EFT clearing / Cr 1085 House Accounts.",
+    "key_accounts": [
+      "1085",
+      "1020"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If payment amount does not appear in daily sheet or memo mismatch, send to review.",
+    "evidence": "JEs 1854, 1864, 1866, 1893"
+  },
+  {
+    "rule_id": "DCB-03",
+    "area": "Gift cards and loyalty",
+    "source": "Daily Cash Balancing workbook + HH support invoices",
+    "trigger_match": "Gift card / e-gift / home gift card / loyalty lines on cash sheet; monthly HH loyalty invoice.",
+    "posting_logic": "Post gift card activity to 5020 Giftcards; post loyalty redemption asset/liability activity to 1096 and expense to 6330 when support invoice is received.",
+    "key_accounts": [
+      "5020",
+      "1096",
+      "6330"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If loyalty/gift card support does not match cash sheet total, hold for review.",
+    "evidence": "Daily JEs + JE 1948 + JE 1922"
+  },
+  {
+    "rule_id": "ECO-01",
+    "area": "E-commerce pickup sales",
+    "source": "Cash balancing report + store pickup gateway CSV",
+    "trigger_match": "Cash sheet 'ECOM' amount on pickup date; cross-check to gateway statement detail.",
+    "posting_logic": "Dr 1095 Ecommerce for dealer amount awaiting payout; Cr 4010 sales; Cr 2300 HST. Record related fees to 6320 Ecommerce based on gateway statement if not already netted in JE.",
+    "key_accounts": [
+      "1095",
+      "4010",
+      "2300",
+      "6320"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If gateway statement total for period does not reconcile to daily ECOM entries, hold payout cycle open.",
+    "evidence": "Daily JEs 1854, 1858, 1864, 1865, 1915, 1916 + gateway CSVs"
+  },
+  {
+    "rule_id": "ECO-02",
+    "area": "E-commerce payout clearing",
+    "source": "Gateway payment CSV + bank feed / HH settlement",
+    "trigger_match": "Electronic payment sent amount in gateway CSV matches bank deposit or HH settlement amount within a date window.",
+    "posting_logic": "Dr 1020 bank (or Dr 2030 HH AP if netted through HH settlement) / Cr 1095 Ecommerce. Book 6320 fees and 2300 HST fee component if payout JE includes them.",
+    "key_accounts": [
+      "1020",
+      "2030",
+      "1095",
+      "6320",
+      "2300"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If payout is netted or split across bank / HH AP and not one-for-one, send to review.",
+    "evidence": "Gateway payouts 2,925.25 and 943.32; JE 1867 / 1896 pattern"
+  },
+  {
+    "rule_id": "HH-01",
+    "area": "HH weekly remittance cash payment",
+    "source": "TD bank feed + HH weekly remittance",
+    "trigger_match": "Bank memo 'HOME HARDWARE MSP' / remittance total.",
+    "posting_logic": "Dr 2030 Accounts Payable - HHSL / Cr 1020 TD Canada Trust.",
+    "key_accounts": [
+      "2030",
+      "1020"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If amount does not match a weekly remittance, leave unmatched in HH AP queue.",
+    "evidence": "Bank/GL expenses on Feb 4, 11, 18, 25"
+  },
+  {
+    "rule_id": "HH-02",
+    "area": "HH month-end statement import",
+    "source": "HH AP statement",
+    "trigger_match": "Month-end HH statement imported for Bridlewood.",
+    "posting_logic": "Book statement detail by invoice/document number. Warehouse inventory to 1120. Five Year Notes / Special Shares / HH advertising / HST lines booked from statement detail. Offset to 2030 HH AP.",
+    "key_accounts": [
+      "1120",
+      "1320",
+      "1330",
+      "6210",
+      "2300",
+      "2030"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If statement line cannot be mapped to an invoice or category, hold in HH exception queue.",
+    "evidence": "JE 1913 HHSL Statement"
+  },
+  {
+    "rule_id": "HH-03",
+    "area": "AP Direct real estate invoices",
+    "source": "AP Direct invoice PDF",
+    "trigger_match": "Invoice number match from HH direct invoice (large real estate invoices usually 30-40k).",
+    "posting_logic": "Split invoice by line description: Dr 6010 Rent, Dr 6020 Property Taxes, Dr 6050 Common Area Expense, Dr 6550 Other Store Expenses (pylon sign), Cr 2201 Accrued Rent or Cr 2030/2020 depending on workflow. Do not trust remittance label alone.",
+    "key_accounts": [
+      "6010",
+      "6020",
+      "6050",
+      "6550",
+      "2201",
+      "2030/2020"
+    ],
+    "auto_level": "Auto-draft after invoice OCR",
+    "review_tier": "High",
+    "exception_logic": "If invoice OCR cannot confidently identify line split, require human review.",
+    "evidence": "Invoice 52593682 / JE 1860"
+  },
+  {
+    "rule_id": "HH-04",
+    "area": "Warehouse invoices",
+    "source": "HH warehouse invoice PDF / statement",
+    "trigger_match": "Warehouse invoice number in HH statement / remittance.",
+    "posting_logic": "Default Dr 1120 Inventory; HST per invoice; offset to 2030 HH AP via statement import.",
+    "key_accounts": [
+      "1120",
+      "2300",
+      "2030"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If invoice contains non-inventory service lines, split and review.",
+    "evidence": "User rule + HH statement pattern"
+  },
+  {
+    "rule_id": "HH-05",
+    "area": "Vendor direct invoices",
+    "source": "Vendor direct invoice PDF / HH statement",
+    "trigger_match": "Invoice number in remittance / statement; read invoice body.",
+    "posting_logic": "Classify by invoice content, not remittance label. Inventory vendors to 1120. Non-inventory vendors to correct expense account (e.g., shipping / occupancy / store expense).",
+    "key_accounts": [
+      "1120 and expense accounts by invoice"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "High",
+    "exception_logic": "If vendor not seen before or account classification confidence < threshold, require review.",
+    "evidence": "User rule and GL behavior"
+  },
+  {
+    "rule_id": "HH-06",
+    "area": "Shipping vendors / Purolator / courier",
+    "source": "Vendor direct invoice + bank/HH statement",
+    "trigger_match": "Vendor name indicates shipping / courier rather than inventory vendor.",
+    "posting_logic": "Dr shipping or courier expense (Bridlewood currently uses expense path, not inventory) / Cr AP or HH AP depending on source.",
+    "key_accounts": [
+      "Use shipping-related expense account; not 1120 Inventory"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If vendor could be inventory and freight-in, review manually.",
+    "evidence": "User instruction: Purolator is shipping expense"
+  },
+  {
+    "rule_id": "HH-07",
+    "area": "HH rebates",
+    "source": "Rebate support + bank deposit + close package",
+    "trigger_match": "Monthly accrual or actual rebate cash receipt.",
+    "posting_logic": "Monthly accrual: Dr 1105 HHSL Rebates Accrual / Cr 5030 HHSL Rebates. Cash receipt: Dr 1020 Bank / Cr 1105 HHSL Rebates Accrual.",
+    "key_accounts": [
+      "1105",
+      "5030",
+      "1020"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "Large one-time annual patronage / quarter-end items should route to review.",
+    "evidence": "JE 1954 and JE 1906; FY25 recurring pattern"
+  },
+  {
+    "rule_id": "PAY-01",
+    "area": "Payroll cash posting",
+    "source": "Canadian Payroll Systems / ENetEmployer output",
+    "trigger_match": "Bank memo ENetEmployer / payroll batch date.",
+    "posting_logic": "Dr 6120 Wages & Benefits; Dr 2220 Vacation Payable portion; Dr 6160 Payroll Fees; Cr 1020 Bank. Include HST on payroll fees only if present.",
+    "key_accounts": [
+      "6120",
+      "2220",
+      "6160",
+      "1020",
+      "2300"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If CPS summary does not reconcile to bank debit, hold batch for review.",
+    "evidence": "ENetEmployer entries Feb 17 and Feb 28"
+  },
+  {
+    "rule_id": "PAY-02",
+    "area": "Payroll accrual at month-end",
+    "source": "Payroll calendar + GL close checklist",
+    "trigger_match": "Pay period crosses month-end.",
+    "posting_logic": "Dr payroll expense accounts / Cr 2210 Accrued Payroll for unpaid days at month-end. Reverse next month.",
+    "key_accounts": [
+      "2210 plus payroll expense accounts"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "High",
+    "exception_logic": "No entry if month-end falls on payroll cycle end (as in Feb-26).",
+    "evidence": "FY25 GL shows day-count accruals; no Feb-26 posting"
+  },
+  {
+    "rule_id": "PAY-03",
+    "area": "Group insurance and WSIB",
+    "source": "Vendor invoice / WSIB bill",
+    "trigger_match": "Insurance or WSIB vendor document imported.",
+    "posting_logic": "Dr 6130 Group Insurance or Dr 6140 WSIB / Cr AP. HST per invoice if applicable.",
+    "key_accounts": [
+      "6130",
+      "6140",
+      "2020",
+      "2300"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If invoice period overlaps with prepaid schedule, send to review.",
+    "evidence": "JE 1875 and Bill 22826"
+  },
+  {
+    "rule_id": "PAY-04",
+    "area": "Employer Health Tax",
+    "source": "Recurring close schedule",
+    "trigger_match": "Month-end close.",
+    "posting_logic": "Dr 6150 Employer Health Tax / Cr 1200 Prepaid Expenses (or other EHT clearing used by Bridlewood schedule).",
+    "key_accounts": [
+      "6150",
+      "1200"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If annual EHT return true-up changes amount, route to review.",
+    "evidence": "JE 1935"
+  },
+  {
+    "rule_id": "ME-13",
+    "area": "Prepaid insurance",
+    "source": "Prepaid schedule",
+    "trigger_match": "Month-end close.",
+    "posting_logic": "Amortize building and vehicle insurance from 1200 Prepaid Expenses into 6360 / 6370.",
+    "key_accounts": [
+      "1200",
+      "6360",
+      "6370"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If new policy or invoice amount changes, update prepaid schedule first.",
+    "evidence": "JE 1844 and JE 1904"
+  },
+  {
+    "rule_id": "ME-14",
+    "area": "Accounting accrual",
+    "source": "Close checklist / recurring schedule",
+    "trigger_match": "Month-end close.",
+    "posting_logic": "Dr 6410 Accounting / Cr 2202 Accrued Accounting. Reverse when vendor bill recorded.",
+    "key_accounts": [
+      "6410",
+      "2202"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If year-end bill or special project invoice received, review actual bill against accrual.",
+    "evidence": "JE 1908"
+  },
+  {
+    "rule_id": "ME-15",
+    "area": "Depreciation",
+    "source": "Close checklist / fixed asset schedule",
+    "trigger_match": "Month-end close.",
+    "posting_logic": "Dr 6900 Depreciation / Cr 1650 A/D - Provision.",
+    "key_accounts": [
+      "6900",
+      "1650"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If fixed asset additions/disposals occur, update schedule before posting.",
+    "evidence": "JE 1909"
+  },
+  {
+    "rule_id": "ME-16",
+    "area": "Term loan payment",
+    "source": "Bank feed + amortization schedule",
+    "trigger_match": "Bank memo LN PYMT 966037102 (or equivalent).",
+    "posting_logic": "Split cash payment between Dr 2500 Term Loan principal and Dr 6280 Interest on Term Loan; Cr 1020 Bank.",
+    "key_accounts": [
+      "2500",
+      "6280",
+      "1020"
+    ],
+    "auto_level": "Auto-post after amort table loaded",
+    "review_tier": "Low",
+    "exception_logic": "If bank amount differs from amort schedule, send to review.",
+    "evidence": "JE 1917"
+  },
+  {
+    "rule_id": "ME-17",
+    "area": "HST filing and payment",
+    "source": "Sales tax filing + bank feed",
+    "trigger_match": "Filed sales tax JE and CRA payment.",
+    "posting_logic": "File: Dr 2300 HST Payable / Cr 2301 GST/HST Suspense. Payment: Dr 2301 / Cr 1020.",
+    "key_accounts": [
+      "2300",
+      "2301",
+      "1020"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If tax filing period or payment amount differs, route to review.",
+    "evidence": "Feb-26 filing and payment entries"
+  },
+  {
+    "rule_id": "ME-18",
+    "area": "Inventory adjustment",
+    "source": "Month-end inventory report + adjustment reports",
+    "trigger_match": "Month-end close after inventory finalized.",
+    "posting_logic": "Book inventory/COGS adjustment from report, usually Dr 5010 Purchases - COS / Cr 1120 Inventory for decrease.",
+    "key_accounts": [
+      "5010",
+      "1120"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "High",
+    "exception_logic": "If report missing or physical / system inventory mismatch is abnormal, require review.",
+    "evidence": "JE 1952"
+  },
+  {
+    "rule_id": "ME-19",
+    "area": "Prism store use / donations",
+    "source": "Monthly support invoice / internal report",
+    "trigger_match": "Month-end support from HH / Prism charges.",
+    "posting_logic": "Reclass from inventory to expense: store use to 6510; donations to 6695; loyalty/email/dealer support to 6330 / 6670 as supported.",
+    "key_accounts": [
+      "1120",
+      "6510",
+      "6695",
+      "6330",
+      "6670"
+    ],
+    "auto_level": "Auto-draft",
+    "review_tier": "Medium",
+    "exception_logic": "If support invoice line descriptions are unclear, review manually.",
+    "evidence": "JEs 1911, 1912, 1948"
+  },
+  {
+    "rule_id": "BANK-01",
+    "area": "Bank service charges and overdraft",
+    "source": "Bank feed",
+    "trigger_match": "TD memo TAX PYT FEE / SEND E-TFR FEE / BRW Billing / EFT Billing / SERVICE CHARGE / OVERDRAFT INTEREST.",
+    "posting_logic": "Dr 6260 Bank Service Charges or Dr 6270 Overdraft Interest / Cr 1020 Bank.",
+    "key_accounts": [
+      "6260",
+      "6270",
+      "1020"
+    ],
+    "auto_level": "Auto-post",
+    "review_tier": "Low",
+    "exception_logic": "If memo unknown, classify as uncoded bank item.",
+    "evidence": "Feb bank-feed expenses"
+  },
+  {
+    "rule_id": "CARD-01",
+    "area": "Credit card vendor classification overlay",
+    "source": "QuickBooks auto-posted credit card feed",
+    "trigger_match": "Vendor/memo text rules (Amazon, ADT, Petro-Canada, Google, Primus, etc.).",
+    "posting_logic": "Reclass credit card expenses to normal Bridlewood accounts based on vendor dictionary. Preserve AP bill payments as AP clears, not expense duplicates.",
+    "key_accounts": [
+      "2100 / 2101 with mapped expense accounts"
+    ],
+    "auto_level": "Auto-draft until vendor dictionary matures",
+    "review_tier": "Medium",
+    "exception_logic": "Unknown vendor or mixed-use spend goes to card review queue.",
+    "evidence": "TD - Spencer Visa transactions in Feb GL"
+  }
+]

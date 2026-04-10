@@ -1,0 +1,41 @@
+openapi: 3.1.0
+info:
+  title: Bridlewood Bookkeeping Control Layer API
+  version: 0.2.0
+  summary: QuickBooks-overlay API for Bridlewood monthly close automation.
+servers:
+  - url: http://localhost:8000
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy.
+  /api/auth/quickbooks/connect:
+    get:
+      summary: Start QuickBooks OAuth flow
+      parameters:
+        - in: query
+          name: entity_code
+          schema:
+            type: string
+            default: 1877-8
+      responses:
+        "200":
+          description: Authorization URL and state.
+  /api/auth/quickbooks/callback:
+    get:
+      summary: Handle QuickBooks OAuth callback and persist tokens
+      responses:
+        "200":
+          description: Connected company info.
+  /api/sync/chart-of-accounts:
+    post:
+      summary: Pull chart of accounts from QuickBooks into local staging
+  /api/sync/transactions:
+    post:
+      summary: Pull starter transaction-like data from QuickBooks CDC into local staging
+  /api/dashboard/quickbooks-status:
+    get:
+      summary: See whether Bridlewood is connected and how much was imported
