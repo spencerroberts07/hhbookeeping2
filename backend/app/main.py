@@ -5,13 +5,13 @@ from .routes.auth import router as auth_router
 from .routes.dashboard import router as dashboard_router
 from .routes.sync import router as sync_router
 from .schemas import HealthResponse
-
+from .routes.cash_balancing import router as cash_balancing_router
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.2.0")
 app.include_router(auth_router)
 app.include_router(sync_router)
 app.include_router(dashboard_router)
-
+app.include_router(cash_balancing_router)
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
