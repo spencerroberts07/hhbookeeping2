@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     qbo_api_base_url: str = "https://quickbooks.api.intuit.com"
     qbo_minor_version: str = "75"
     default_entity_code: str = "1877-8"
-
+    google_sheets_service_account_email: str = "replace_me"
+    google_sheets_private_key: str = "replace_me"
+    google_sheets_spreadsheet_id: str = "replace_me"
+    cash_balancing_lookback_days: int = 56
 
 settings = Settings()
