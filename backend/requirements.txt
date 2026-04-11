@@ -7,3 +7,5 @@ pydantic-settings==2.5.2
 sqlalchemy==2.0.35
 psycopg[binary]==3.2.3
 python-multipart==0.0.12
+PyJWT[crypto]==2.10.1
+cryptography==44.0.1
