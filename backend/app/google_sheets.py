@@ -89,13 +89,6 @@ class GoogleSheetsClient:
             payload = response.json()
 
         return payload.get("values", [])
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        payload = response.json()
-
-    return payload.get("values", [])
-
 
 def safe_decimal(value: str | None) -> float | None:
     if value is None:
