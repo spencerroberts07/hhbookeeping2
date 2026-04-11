@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import jwt
@@ -57,16 +58,38 @@ class GoogleSheetsClient:
             response = await client.post(GOOGLE_TOKEN_URL, data=data)
             response.raise_for_status()
             return response.json()["access_token"]
+            
+        def normalize_sheet_range(tab_name: str) -> str:
+        # If the caller already passed a full A1 range, keep it
+        if "!" in tab_name:
+        return tab_name
+
+        # Quote the sheet name so names like Feb1-Feb7 work properly
+        escaped = tab_name.replace("'", "''")
+        return f"'{escaped}'!A:ZZ"
 
     async def get_tab_values(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
-        access_token = await self._get_access_token()
-        url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values/{tab_name}"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        params = {"majorDimension": "ROWS"}
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json().get("values", [])
+    access_token = await self.get_access_token()
+    
+    sheet_range = normalize_sheet_range(tab_name)
+    encoded_range = quote(sheet_range, safe="!:")
+
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    params = {
+        "majorDimension": "ROWS",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        payload = response.json()
+
+    return payload.get("values", [])
 
 
 def safe_decimal(value: str | None) -> float | None:
