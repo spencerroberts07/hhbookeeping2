@@ -1,7 +1,8 @@
 import hashlib
 import json
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -26,6 +27,14 @@ EXCLUDED_DAILY_LABELS = {
     "PAID OUTS",
     "Other info",
 }
+
+# Examples:
+# Feb1-Feb7
+# Feb 1 - Feb 7
+# Mar29-Apr4
+WEEKLY_TAB_TITLE_RE = re.compile(
+    r"^[A-Za-z]{3,9}\s*\d{1,2}\s*-\s*[A-Za-z]{0,9}\s*\d{1,2}$"
+)
 
 
 @dataclass
@@ -57,13 +66,22 @@ class DailyCashLine:
     day_name: str | None
 
 
+@dataclass
+class TabDateRange:
+    title: str
+    start_date: date
+    end_date: date
+
+
 class GoogleSheetsClient:
     def __init__(self, service_account_email: str, private_key: str) -> None:
         self.service_account_email = service_account_email
         self.private_key = private_key.replace("\\n", "\n")
+        self._access_token: str | None = None
+        self._access_token_expires_at: datetime | None = None
 
     def _build_jwt(self) -> str:
-        now = int(datetime.utcnow().timestamp())
+        now = int(datetime.now(timezone.utc).timestamp())
         payload = {
             "iss": self.service_account_email,
             "scope": GOOGLE_SHEETS_SCOPE,
@@ -74,6 +92,15 @@ class GoogleSheetsClient:
         return jwt.encode(payload, self.private_key, algorithm="RS256")
 
     async def _get_access_token(self) -> str:
+        now = datetime.now(timezone.utc)
+
+        if (
+            self._access_token
+            and self._access_token_expires_at
+            and now < self._access_token_expires_at
+        ):
+            return self._access_token
+
         assertion = self._build_jwt()
         data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -88,22 +115,38 @@ class GoogleSheetsClient:
                     f"Google token error. STATUS={response.status_code} BODY={response.text}"
                 )
 
-            return response.json()["access_token"]
+            payload = response.json()
+
+        access_token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 3600))
+
+        self._access_token = access_token
+        self._access_token_expires_at = now + timedelta(
+            seconds=max(expires_in - 60, 60)
+        )
+
+        return access_token
 
     @staticmethod
-    def normalize_sheet_range(tab_name: str) -> str:
-        # Allow caller to pass a full A1 range if they ever want to later
-        if "!" in tab_name:
-            return tab_name
-
+    def build_tab_range(tab_name: str, a1_range: str = "A:ZZ") -> str:
         escaped = tab_name.replace("'", "''")
-        return f"'{escaped}'!A:ZZ"
+        return f"'{escaped}'!{a1_range}"
 
-    async def get_tab_values(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
+    @staticmethod
+    def normalize_sheet_range(tab_name_or_range: str) -> str:
+        # Allow caller to pass a full A1 range if they want to
+        if "!" in tab_name_or_range:
+            return tab_name_or_range
+
+        return GoogleSheetsClient.build_tab_range(tab_name_or_range, "A:ZZ")
+
+    async def get_tab_values(
+        self, spreadsheet_id: str, tab_name_or_range: str
+    ) -> list[list[str]]:
         access_token = await self._get_access_token()
 
-        sheet_range = self.normalize_sheet_range(tab_name)
-        encoded_range = quote(sheet_range, safe="!:")
+        sheet_range = self.normalize_sheet_range(tab_name_or_range)
+        encoded_range = quote(sheet_range, safe="!:'")
 
         url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values/{encoded_range}"
         headers = {
@@ -158,6 +201,70 @@ class GoogleSheetsClient:
             if "properties" in sheet and "title" in sheet["properties"]
         ]
 
+    async def get_weekly_tab_date_range(
+        self, spreadsheet_id: str, tab_name: str
+    ) -> TabDateRange | None:
+        title = str(tab_name).strip()
+
+        if not WEEKLY_TAB_TITLE_RE.match(title):
+            return None
+
+        # Row 4 holds the dates across the weekly sheet
+        date_values = await self.get_tab_values(
+            spreadsheet_id,
+            self.build_tab_range(title, "A4:ZZ4"),
+        )
+
+        if not date_values:
+            return None
+
+        date_row = date_values[0]
+        parsed_dates: list[date] = []
+
+        for raw_value in date_row:
+            iso_date = guess_date(raw_value)
+            if iso_date:
+                parsed_dates.append(datetime.strptime(iso_date, "%Y-%m-%d").date())
+
+        if not parsed_dates:
+            return None
+
+        return TabDateRange(
+            title=title,
+            start_date=min(parsed_dates),
+            end_date=max(parsed_dates),
+        )
+
+    async def select_recent_weekly_tabs(
+        self,
+        spreadsheet_id: str,
+        lookback_days: int,
+        today: date | None = None,
+    ) -> list[str]:
+        if lookback_days < 1:
+            raise ValueError("lookback_days must be at least 1")
+
+        end_date = today or datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=lookback_days - 1)
+
+        titles = await self.get_sheet_titles(spreadsheet_id)
+
+        matching_ranges: list[TabDateRange] = []
+
+        for title in titles:
+            tab_range = await self.get_weekly_tab_date_range(spreadsheet_id, title)
+            if not tab_range:
+                continue
+
+            overlaps_window = (
+                tab_range.end_date >= start_date and tab_range.start_date <= end_date
+            )
+            if overlaps_window:
+                matching_ranges.append(tab_range)
+
+        matching_ranges.sort(key=lambda x: (x.start_date, x.end_date, x.title.lower()))
+        return [item.title for item in matching_ranges]
+
 
 def safe_decimal(value: str | None) -> float | None:
     if value is None:
@@ -171,7 +278,6 @@ def safe_decimal(value: str | None) -> float | None:
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
 
-    # remove dollar sign if present
     text = text.replace("$", "").strip()
 
     if text == "":
@@ -196,6 +302,8 @@ def guess_date(value: str | None) -> str | None:
         "%Y/%m/%d",
         "%d-%b-%y",
         "%d-%b-%Y",
+        "%d-%B-%y",
+        "%d-%B-%Y",
     ):
         try:
             return datetime.strptime(text, fmt).date().isoformat()
@@ -229,7 +337,9 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
         if label in EXCLUDED_DAILY_LABELS:
             continue
 
-        account_code = str(row[10]).strip() if len(row) > 10 and row[10] is not None else None
+        account_code = (
+            str(row[10]).strip() if len(row) > 10 and row[10] is not None else None
+        )
         if account_code == "":
             account_code = None
 
@@ -263,7 +373,9 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
     return daily_lines
 
 
-def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[NormalizedCashRow]:
+def normalize_cash_balancing_rows(
+    tab_name: str, rows: list[list[str]]
+) -> list[NormalizedCashRow]:
     """
     Raw row staging parser.
     Keeps the weekly sheet rows mostly as-is so the raw import table preserves source detail.
@@ -297,10 +409,16 @@ def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[
             for i in range(max(len(header), len(row)))
         }
 
-        business_date = guess_date(row[idx_date]) if idx_date is not None and idx_date < len(row) else None
+        business_date = (
+            guess_date(row[idx_date])
+            if idx_date is not None and idx_date < len(row)
+            else None
+        )
         notes = row[idx_notes] if idx_notes is not None and idx_notes < len(row) else None
         row_key = f"{tab_name}|{business_date or 'no-date'}|{row_number}"
-        row_hash = hashlib.sha256(json.dumps(row, ensure_ascii=False).encode("utf-8")).hexdigest()
+        row_hash = hashlib.sha256(
+            json.dumps(row, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
 
         normalized.append(
             NormalizedCashRow(
@@ -310,14 +428,46 @@ def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[
                 row_key=row_key,
                 row_hash=row_hash,
                 notes=notes,
-                sales_amount=safe_decimal(row[idx_sales]) if idx_sales is not None and idx_sales < len(row) else None,
-                cash_amount=safe_decimal(row[idx_cash]) if idx_cash is not None and idx_cash < len(row) else None,
-                debit_amount=safe_decimal(row[idx_debit]) if idx_debit is not None and idx_debit < len(row) else None,
-                credit_amount=safe_decimal(row[idx_credit]) if idx_credit is not None and idx_credit < len(row) else None,
-                ecommerce_amount=safe_decimal(row[idx_ecom]) if idx_ecom is not None and idx_ecom < len(row) else None,
-                gift_card_amount=safe_decimal(row[idx_gift]) if idx_gift is not None and idx_gift < len(row) else None,
-                hst_amount=safe_decimal(row[idx_hst]) if idx_hst is not None and idx_hst < len(row) else None,
-                over_short_amount=safe_decimal(row[idx_over_short]) if idx_over_short is not None and idx_over_short < len(row) else None,
+                sales_amount=(
+                    safe_decimal(row[idx_sales])
+                    if idx_sales is not None and idx_sales < len(row)
+                    else None
+                ),
+                cash_amount=(
+                    safe_decimal(row[idx_cash])
+                    if idx_cash is not None and idx_cash < len(row)
+                    else None
+                ),
+                debit_amount=(
+                    safe_decimal(row[idx_debit])
+                    if idx_debit is not None and idx_debit < len(row)
+                    else None
+                ),
+                credit_amount=(
+                    safe_decimal(row[idx_credit])
+                    if idx_credit is not None and idx_credit < len(row)
+                    else None
+                ),
+                ecommerce_amount=(
+                    safe_decimal(row[idx_ecom])
+                    if idx_ecom is not None and idx_ecom < len(row)
+                    else None
+                ),
+                gift_card_amount=(
+                    safe_decimal(row[idx_gift])
+                    if idx_gift is not None and idx_gift < len(row)
+                    else None
+                ),
+                hst_amount=(
+                    safe_decimal(row[idx_hst])
+                    if idx_hst is not None and idx_hst < len(row)
+                    else None
+                ),
+                over_short_amount=(
+                    safe_decimal(row[idx_over_short])
+                    if idx_over_short is not None and idx_over_short < len(row)
+                    else None
+                ),
                 raw_row_json=raw,
             )
         )
