@@ -88,6 +88,31 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def get_accounting_period_for_date(session, entity_id: str, business_date: str):
+    period = session.execute(
+        text(
+            """
+            SELECT id, period_label, period_start, period_end, fiscal_year, fiscal_period_number
+            FROM accounting_periods
+            WHERE entity_id = :entity_id
+              AND :business_date BETWEEN period_start AND period_end
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "business_date": business_date,
+        },
+    ).mappings().first()
+
+    if not period:
+        raise RuntimeError(
+            f"No accounting period found for entity_id={entity_id} and business_date={business_date}"
+        )
+
+    return period
+
+
 @router.post("/sync")
 async def sync_cash_balancing(payload: CashBalancingSyncRequest):
     selected_tabs: list[str] = dedupe_preserve_order(payload.sheet_tabs)
@@ -190,6 +215,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         mapped_line_count = 0
         unmapped_line_count = 0
         unmapped_labels: set[str] = set()
+        period_labels_touched: set[str] = set()
         tabs_source = "manual" if selected_tabs else "auto"
 
         try:
@@ -309,6 +335,14 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
 
                 # 2) upsert daily headers and rebuild daily lines
                 for business_date, day_data in daily_groups.items():
+                    accounting_period = get_accounting_period_for_date(
+                        session=session,
+                        entity_id=entity["id"],
+                        business_date=business_date,
+                    )
+                    accounting_period_id = accounting_period["id"]
+                    period_labels_touched.add(str(accounting_period["period_label"]))
+
                     existing_day = session.execute(
                         text(
                             """
@@ -335,15 +369,28 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                             text(
                                 """
                                 INSERT INTO cash_balancing_days (
-                                    entity_id, business_date, tab_name, total_sales, total_hst, raw_json
+                                    entity_id,
+                                    accounting_period_id,
+                                    business_date,
+                                    tab_name,
+                                    total_sales,
+                                    total_hst,
+                                    raw_json
                                 ) VALUES (
-                                    :entity_id, :business_date, :tab_name, :total_sales, :total_hst, CAST(:raw_json AS jsonb)
+                                    :entity_id,
+                                    :accounting_period_id,
+                                    :business_date,
+                                    :tab_name,
+                                    :total_sales,
+                                    :total_hst,
+                                    CAST(:raw_json AS jsonb)
                                 )
                                 RETURNING id
                                 """
                             ),
                             {
                                 "entity_id": entity["id"],
+                                "accounting_period_id": accounting_period_id,
                                 "business_date": business_date,
                                 "tab_name": day_data["tab_name"],
                                 "total_sales": day_data["total_sales"],
@@ -358,7 +405,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                             text(
                                 """
                                 UPDATE cash_balancing_days
-                                SET tab_name = :tab_name,
+                                SET accounting_period_id = :accounting_period_id,
+                                    tab_name = :tab_name,
                                     total_sales = :total_sales,
                                     total_hst = :total_hst,
                                     raw_json = CAST(:raw_json AS jsonb)
@@ -367,6 +415,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                             ),
                             {
                                 "id": cash_balancing_day_id,
+                                "accounting_period_id": accounting_period_id,
                                 "tab_name": day_data["tab_name"],
                                 "total_sales": day_data["total_sales"],
                                 "total_hst": day_data["total_hst"],
@@ -439,6 +488,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 "mapped_line_count": mapped_line_count,
                 "unmapped_line_count": unmapped_line_count,
                 "unmapped_labels": sorted(unmapped_labels),
+                "period_labels_touched": sorted(period_labels_touched),
                 "lookback_days": payload.lookback_days,
                 "excluded_labels": sorted(EXCLUDED_DAILY_LABELS),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -575,6 +625,18 @@ def cash_balancing_status(entity_code: str):
             {"entity_id": entity["id"]},
         ).mappings().first()
 
+        period_linked_day_count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS period_linked_day_count
+                FROM cash_balancing_days
+                WHERE entity_id = :entity_id
+                  AND accounting_period_id IS NOT NULL
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
         return {
             "entity_code": entity_code,
             "has_cash_balancing_rows": (row_count or {}).get("row_count", 0) > 0,
@@ -583,5 +645,6 @@ def cash_balancing_status(entity_code: str):
             "line_count": (line_count or {}).get("line_count", 0),
             "mapped_line_count": (mapped_line_count or {}).get("mapped_line_count", 0),
             "pending_line_count": (pending_line_count or {}).get("pending_line_count", 0),
+            "period_linked_day_count": (period_linked_day_count or {}).get("period_linked_day_count", 0),
             "latest_run": dict(latest_run) if latest_run else None,
         }
