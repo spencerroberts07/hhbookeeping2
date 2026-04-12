@@ -1,4 +1,3 @@
-from collections import defaultdict
 from datetime import datetime, timezone
 import json
 
@@ -9,6 +8,7 @@ from sqlalchemy import text
 from ..config import settings
 from ..db import db_session
 from ..google_sheets import (
+    DailyCashLine,
     GoogleSheetsClient,
     normalize_cash_balancing_rows,
     parse_weekly_cash_sheet,
@@ -34,11 +34,16 @@ EXCLUDED_DAILY_LABELS = {
 
 class CashBalancingSyncRequest(BaseModel):
     entity_code: str = Field(..., examples=["1877-8"])
-    sheet_tabs: list[str] = Field(default_factory=list, examples=[["Feb1-Feb7", "Feb8-Feb14"]])
+    sheet_tabs: list[str] = Field(
+        default_factory=list,
+        examples=[["Feb1-Feb7", "Feb8-Feb14"]],
+    )
     lookback_days: int = Field(default=56, ge=1, le=365)
 
 
-def build_daily_groups(daily_lines: list) -> dict[str, dict]:
+def build_daily_groups(
+    daily_lines: list[DailyCashLine],
+) -> dict[str, dict]:
     grouped: dict[str, dict] = {}
 
     for line in daily_lines:
@@ -67,13 +72,25 @@ def build_daily_groups(daily_lines: list) -> dict[str, dict]:
     return grouped
 
 
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for value in values:
+        cleaned = str(value).strip()
+        if not cleaned:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+
+    return result
+
+
 @router.post("/sync")
 async def sync_cash_balancing(payload: CashBalancingSyncRequest):
-    if not payload.sheet_tabs:
-        raise HTTPException(
-            status_code=400,
-            detail="sheet_tabs is required for now. Example: ['Feb1-Feb7', 'Feb8-Feb14']",
-        )
+    selected_tabs: list[str] = dedupe_preserve_order(payload.sheet_tabs)
 
     with db_session() as session:
         entity = session.execute(
@@ -129,10 +146,28 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         raw_updated = 0
         day_upserted = 0
         line_inserted = 0
+        tabs_source = "manual" if selected_tabs else "auto"
 
         try:
-            for tab_name in payload.sheet_tabs:
-                raw_rows = await sheet_client.get_tab_values(source["spreadsheet_id"], tab_name)
+            if not selected_tabs:
+                selected_tabs = await sheet_client.select_recent_weekly_tabs(
+                    spreadsheet_id=source["spreadsheet_id"],
+                    lookback_days=payload.lookback_days,
+                )
+
+            selected_tabs = dedupe_preserve_order(selected_tabs)
+
+            if not selected_tabs:
+                raise RuntimeError(
+                    f"No weekly cash balancing tabs were found overlapping the last "
+                    f"{payload.lookback_days} days."
+                )
+
+            for tab_name in selected_tabs:
+                raw_rows = await sheet_client.get_tab_values(
+                    source["spreadsheet_id"],
+                    tab_name,
+                )
                 normalized_rows = normalize_cash_balancing_rows(tab_name, raw_rows)
                 parsed_daily_lines = parse_weekly_cash_sheet(tab_name, raw_rows)
                 daily_groups = build_daily_groups(parsed_daily_lines)
@@ -341,7 +376,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                         line_inserted += 1
 
             summary = {
-                "tabs": payload.sheet_tabs,
+                "tabs": selected_tabs,
+                "tabs_source": tabs_source,
                 "raw_inserted": raw_inserted,
                 "raw_updated": raw_updated,
                 "day_upserted": day_upserted,
@@ -364,7 +400,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 ),
                 {
                     "id": import_run["id"],
-                    "tabs_read": json.dumps(payload.sheet_tabs),
+                    "tabs_read": json.dumps(selected_tabs),
                     "summary_json": json.dumps(summary),
                 },
             )
@@ -394,10 +430,11 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 ),
                 {
                     "id": import_run["id"],
-                    "tabs_read": json.dumps(payload.sheet_tabs),
+                    "tabs_read": json.dumps(selected_tabs),
                     "summary_json": json.dumps(
                         {
-                            "tabs": payload.sheet_tabs,
+                            "tabs": selected_tabs,
+                            "tabs_source": tabs_source,
                             "lookback_days": payload.lookback_days,
                             "failed_at": datetime.now(timezone.utc).isoformat(),
                         }
