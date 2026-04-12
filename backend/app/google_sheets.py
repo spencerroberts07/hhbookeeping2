@@ -67,33 +67,40 @@ class GoogleSheetsClient:
         escaped = tab_name.replace("'", "''")
         return f"'{escaped}'!A:ZZ"
 
-    async def get_tab_values(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
-        access_token = await self._get_access_token()
+        async def get_tab_values(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
+            access_token = await self._get_access_token()
 
-        sheet_range = self.normalize_sheet_range(tab_name)
-        encoded_range = quote(sheet_range, safe="!:")
+            sheet_range = self.normalize_sheet_range(tab_name)
+            encoded_range = quote(sheet_range, safe="!:")
 
-        url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values/{encoded_range}"
+            url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values/{encoded_range}"
 
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-        }
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+            }
 
-        params = {
-            "majorDimension": "ROWS",
-        }
+            params = {
+                "majorDimension": "ROWS",
+            }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, params=params)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers, params=params)
 
-            print("GOOGLE SHEETS URL:", response.request.url)
-            print("GOOGLE SHEETS STATUS:", response.status_code)
-            print("GOOGLE SHEETS BODY:", response.text)
+                print("GOOGLE SHEETS URL:", str(response.request.url))
+                print("GOOGLE SHEETS STATUS:", response.status_code)
+                print("GOOGLE SHEETS BODY:", response.text)
 
-            response.raise_for_status()
-            payload = response.json()
+                if response.is_error:
+                    raise RuntimeError(
+                        f"Google Sheets API error. "
+                        f"URL={response.request.url} "
+                        f"STATUS={response.status_code} "
+                        f"BODY={response.text}"
+                    )
 
-        return payload.get("values", [])
+                payload = response.json()
+
+            return payload.get("values", [])
 
 def safe_decimal(value: str | None) -> float | None:
     if value is None:
