@@ -12,6 +12,7 @@ router = APIRouter(prefix="/api/month-end", tags=["month-end"])
 
 CASH_BALANCING_SOURCE_MODULE = "cash_balancing"
 CASH_BALANCING_BATCH_LABEL = "cash_balancing_month_end"
+CASH_FLOAT_SOURCE_KEY = "Cash Float Movement"
 
 
 class BuildCashBalancingJournalRequest(BaseModel):
@@ -165,6 +166,34 @@ def get_missing_posting_direction_labels(session, entity_id: str, accounting_per
     ]
 
 
+def get_cash_float_rule(session, entity_id: str):
+    row = session.execute(
+        text(
+            """
+            SELECT mapped_account_code, posting_direction
+            FROM account_mapping_rules
+            WHERE entity_id = :entity_id
+              AND source_type = 'month_end_calculated_line'
+              AND source_key = :source_key
+              AND is_active = TRUE
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "source_key": CASH_FLOAT_SOURCE_KEY,
+        },
+    ).mappings().first()
+
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing account_mapping_rules row for month_end_calculated_line / Cash Float Movement",
+        )
+
+    return row
+
+
 def get_cash_balancing_day_stats(session, entity_id: str, accounting_period_id: str):
     stats = session.execute(
         text(
@@ -188,6 +217,68 @@ def get_cash_balancing_day_stats(session, entity_id: str, accounting_period_id: 
         "day_count": int((stats or {}).get("day_count", 0) or 0),
         "total_sales": money((stats or {}).get("total_sales", 0)),
         "total_hst": money((stats or {}).get("total_hst", 0)),
+    }
+
+
+def get_cash_float_movement(session, entity_id: str, accounting_period_id: str):
+    opening_row = session.execute(
+        text(
+            """
+            SELECT business_date, opening_cash
+            FROM cash_balancing_days
+            WHERE entity_id = :entity_id
+              AND accounting_period_id = :accounting_period_id
+              AND opening_cash IS NOT NULL
+            ORDER BY business_date ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "accounting_period_id": accounting_period_id,
+        },
+    ).mappings().first()
+
+    closing_row = session.execute(
+        text(
+            """
+            SELECT business_date, closing_cash
+            FROM cash_balancing_days
+            WHERE entity_id = :entity_id
+              AND accounting_period_id = :accounting_period_id
+              AND closing_cash IS NOT NULL
+            ORDER BY business_date DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "accounting_period_id": accounting_period_id,
+        },
+    ).mappings().first()
+
+    if not opening_row or opening_row["opening_cash"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No opening_cash found for this accounting period. Re-run cash sync after updating cash_balancing.py.",
+        )
+
+    if not closing_row or closing_row["closing_cash"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No closing_cash found for this accounting period. Re-run cash sync after updating cash_balancing.py.",
+        )
+
+    opening_cash = money(opening_row["opening_cash"])
+    closing_cash = money(closing_row["closing_cash"])
+    movement = closing_cash - opening_cash
+
+    return {
+        "opening_business_date": str(opening_row["business_date"]),
+        "closing_business_date": str(closing_row["business_date"]),
+        "opening_cash": opening_cash,
+        "closing_cash": closing_cash,
+        "movement": movement,
     }
 
 
@@ -360,6 +451,9 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
                 },
             )
 
+        cash_float_rule = get_cash_float_rule(session, entity["id"])
+        cash_float_data = get_cash_float_movement(session, entity["id"], period["id"])
+
         day_stats = get_cash_balancing_day_stats(session, entity["id"], period["id"])
         aggregated_rows = get_aggregated_cash_balancing_lines(session, entity["id"], period["id"])
 
@@ -400,6 +494,36 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
                 }
             )
 
+        cash_float_movement = cash_float_data["movement"]
+        if cash_float_movement != Decimal("0.00"):
+            debit_amount, credit_amount = split_amount_by_direction(
+                cash_float_movement,
+                cash_float_rule["posting_direction"],
+            )
+            total_debits += debit_amount
+            total_credits += credit_amount
+
+            journal_lines.append(
+                {
+                    "line_number": len(journal_lines) + 1,
+                    "account_code": str(cash_float_rule["mapped_account_code"]).strip(),
+                    "debit_amount": debit_amount,
+                    "credit_amount": credit_amount,
+                    "memo": f"Cash float movement {period['period_label']}",
+                    "source_json": {
+                        "source_module": CASH_BALANCING_SOURCE_MODULE,
+                        "calculated_line": CASH_FLOAT_SOURCE_KEY,
+                        "period_label": period["period_label"],
+                        "opening_business_date": cash_float_data["opening_business_date"],
+                        "closing_business_date": cash_float_data["closing_business_date"],
+                        "opening_cash": money_float(cash_float_data["opening_cash"]),
+                        "closing_cash": money_float(cash_float_data["closing_cash"]),
+                        "movement": money_float(cash_float_movement),
+                        "posting_direction": cash_float_rule["posting_direction"],
+                    },
+                }
+            )
+
         balance_difference = total_debits - total_credits
         is_balanced = balance_difference == Decimal("0.00")
         batch_status = "draft" if is_balanced else "draft_unbalanced"
@@ -417,6 +541,11 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
             "day_count": day_stats["day_count"],
             "source_day_total_sales": money_float(day_stats["total_sales"]),
             "source_day_total_hst": money_float(day_stats["total_hst"]),
+            "cash_float_opening_business_date": cash_float_data["opening_business_date"],
+            "cash_float_closing_business_date": cash_float_data["closing_business_date"],
+            "cash_float_opening_cash": money_float(cash_float_data["opening_cash"]),
+            "cash_float_closing_cash": money_float(cash_float_data["closing_cash"]),
+            "cash_float_movement": money_float(cash_float_movement),
             "journal_line_count": len(journal_lines),
             "total_debits": money_float(total_debits),
             "total_credits": money_float(total_credits),
@@ -477,6 +606,9 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
                 "day_count": day_stats["day_count"],
                 "source_day_total_sales": money_float(day_stats["total_sales"]),
                 "source_day_total_hst": money_float(day_stats["total_hst"]),
+                "cash_float_opening_cash": money_float(cash_float_data["opening_cash"]),
+                "cash_float_closing_cash": money_float(cash_float_data["closing_cash"]),
+                "cash_float_movement": money_float(cash_float_movement),
             },
             "journal_lines": response_lines,
         }
