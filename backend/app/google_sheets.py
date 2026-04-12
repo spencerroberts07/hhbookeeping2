@@ -119,13 +119,65 @@ def guess_date(value: str | None) -> str | None:
     if not value:
         return None
     text = str(value).strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d", "%d-%b-%y", "%d-%b-%Y"):
         try:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
     return None
+@dataclass
+class DailyCashLine:
+    source_tab_name: str
+    business_date: str
+    line_label: str
+    amount: float | None
+    account_code: str | None
+    day_name: str | None
 
+def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyCashLine]:
+    if not rows or len(rows) < 6:
+        return []
+
+    date_row = rows[3] if len(rows) > 3 else []
+    day_row = rows[4] if len(rows) > 4 else []
+
+    daily_lines: list[DailyCashLine] = []
+
+    # dates are across columns 2 to 8 in your current sheet layout
+    for row in rows[5:]:
+        label = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+
+        if label in {"", "PAID OUTS", "Other info", "Total", "Total PAID OUTS"}:
+            continue
+
+        account_code = str(row[10]).strip() if len(row) > 10 and row[10] is not None else None
+
+        for col_index in range(1, 8):
+            if col_index >= len(date_row):
+                continue
+
+            raw_date = date_row[col_index] if col_index < len(date_row) else None
+            raw_day = day_row[col_index] if col_index < len(day_row) else None
+            raw_amount = row[col_index] if col_index < len(row) else None
+
+            business_date = guess_date(raw_date)
+            amount = safe_decimal(raw_amount)
+
+            if business_date is None:
+                continue
+
+            daily_lines.append(
+                DailyCashLine(
+                    source_tab_name=tab_name,
+                    business_date=business_date,
+                    line_label=label,
+                    amount=amount,
+                    account_code=account_code,
+                    day_name=str(raw_day).strip() if raw_day else None,
+                )
+            )
+
+    return daily_lines
 
 def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[NormalizedCashRow]:
     if not rows:
