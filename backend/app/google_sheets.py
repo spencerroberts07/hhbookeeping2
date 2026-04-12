@@ -1,6 +1,5 @@
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -28,13 +27,36 @@ EXCLUDED_DAILY_LABELS = {
     "Other info",
 }
 
-# Examples:
-# Feb1-Feb7
-# Feb 1 - Feb 7
-# Mar29-Apr4
-WEEKLY_TAB_TITLE_RE = re.compile(
-    r"^[A-Za-z]{3,9}\s*\d{1,2}\s*-\s*[A-Za-z]{0,9}\s*\d{1,2}$"
-)
+EXPECTED_WEEKLY_LABELS = {
+    "Opening Cash",
+    "Item Sales",
+    "Tax - HST",
+    "Visa",
+    "Mastercard",
+    "Amex",
+    "Debit Card",
+    "Bank Deposit/EFT",
+    "ECOM",
+    "Cash over (short)",
+    "House Acct Charge",
+    "House Acct Payment",
+    "Gift Card Issued",
+    "Home Gift Cards",
+    "e-gift cards",
+    "Misc Cash Income",
+    "Credit note issue",
+    "Credit note redeemed",
+}
+
+EXPECTED_DAY_NAMES = {
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+}
 
 
 @dataclass
@@ -71,14 +93,17 @@ class TabDateRange:
     title: str
     start_date: date
     end_date: date
+    covered_dates: list[date]
+    label_score: int
+    day_name_score: int
 
 
 class GoogleSheetsClient:
     def __init__(self, service_account_email: str, private_key: str) -> None:
         self.service_account_email = service_account_email
         self.private_key = private_key.replace("\\n", "\n")
-        self._access_token: str | None = None
-        self._access_token_expires_at: datetime | None = None
+        self._cached_access_token: str | None = None
+        self._cached_access_token_expires_at: datetime | None = None
 
     def _build_jwt(self) -> str:
         now = int(datetime.now(timezone.utc).timestamp())
@@ -95,11 +120,11 @@ class GoogleSheetsClient:
         now = datetime.now(timezone.utc)
 
         if (
-            self._access_token
-            and self._access_token_expires_at
-            and now < self._access_token_expires_at
+            self._cached_access_token
+            and self._cached_access_token_expires_at
+            and now < self._cached_access_token_expires_at
         ):
-            return self._access_token
+            return self._cached_access_token
 
         assertion = self._build_jwt()
         data = {
@@ -120,8 +145,8 @@ class GoogleSheetsClient:
         access_token = payload["access_token"]
         expires_in = int(payload.get("expires_in", 3600))
 
-        self._access_token = access_token
-        self._access_token_expires_at = now + timedelta(
+        self._cached_access_token = access_token
+        self._cached_access_token_expires_at = now + timedelta(
             seconds=max(expires_in - 60, 60)
         )
 
@@ -134,14 +159,16 @@ class GoogleSheetsClient:
 
     @staticmethod
     def normalize_sheet_range(tab_name_or_range: str) -> str:
-        # Allow caller to pass a full A1 range if they want to
+        # Allow caller to pass a full A1 range if they ever want to later
         if "!" in tab_name_or_range:
             return tab_name_or_range
 
         return GoogleSheetsClient.build_tab_range(tab_name_or_range, "A:ZZ")
 
     async def get_tab_values(
-        self, spreadsheet_id: str, tab_name_or_range: str
+        self,
+        spreadsheet_id: str,
+        tab_name_or_range: str,
     ) -> list[list[str]]:
         access_token = await self._get_access_token()
 
@@ -201,39 +228,75 @@ class GoogleSheetsClient:
             if "properties" in sheet and "title" in sheet["properties"]
         ]
 
-    async def get_weekly_tab_date_range(
-        self, spreadsheet_id: str, tab_name: str
+    @staticmethod
+    def _analyze_weekly_preview(
+        tab_name: str,
+        rows: list[list[str]],
     ) -> TabDateRange | None:
-        title = str(tab_name).strip()
+        """
+        Detect a weekly cash balancing tab by reading the actual cells, not the tab title.
 
-        if not WEEKLY_TAB_TITLE_RE.match(title):
+        Expected preview range:
+        - original row 4 contains dates across columns
+        - original row 5 contains day names
+        - original row 6 onward contains labels in column A
+        """
+        if not rows:
             return None
 
-        # Row 4 holds the dates across the weekly sheet
-        date_values = await self.get_tab_values(
-            spreadsheet_id,
-            self.build_tab_range(title, "A4:ZZ4"),
-        )
+        date_row = rows[0] if len(rows) > 0 else []
+        day_row = rows[1] if len(rows) > 1 else []
+        body_rows = rows[2:] if len(rows) > 2 else []
 
-        if not date_values:
-            return None
-
-        date_row = date_values[0]
         parsed_dates: list[date] = []
-
         for raw_value in date_row:
-            iso_date = guess_date(raw_value)
-            if iso_date:
-                parsed_dates.append(datetime.strptime(iso_date, "%Y-%m-%d").date())
+            iso_value = guess_date(raw_value)
+            if iso_value:
+                parsed_dates.append(datetime.strptime(iso_value, "%Y-%m-%d").date())
 
-        if not parsed_dates:
+        unique_dates = sorted(set(parsed_dates))
+        if len(unique_dates) < 5:
+            return None
+
+        span_days = (max(unique_dates) - min(unique_dates)).days
+        if span_days > 7:
+            return None
+
+        label_values = {
+            str(row[0]).strip()
+            for row in body_rows
+            if row and len(row) > 0 and row[0] is not None and str(row[0]).strip()
+        }
+        label_score = len(label_values.intersection(EXPECTED_WEEKLY_LABELS))
+
+        day_name_score = 0
+        for raw_value in day_row:
+            if str(raw_value).strip().lower() in EXPECTED_DAY_NAMES:
+                day_name_score += 1
+
+        # Require this to look enough like the known weekly cash balancing sheet
+        if label_score < 2 and day_name_score < 5:
             return None
 
         return TabDateRange(
-            title=title,
-            start_date=min(parsed_dates),
-            end_date=max(parsed_dates),
+            title=tab_name,
+            start_date=min(unique_dates),
+            end_date=max(unique_dates),
+            covered_dates=unique_dates,
+            label_score=label_score,
+            day_name_score=day_name_score,
         )
+
+    async def get_weekly_cash_tab_date_range(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+    ) -> TabDateRange | None:
+        preview_rows = await self.get_tab_values(
+            spreadsheet_id,
+            self.build_tab_range(tab_name, "A4:K20"),
+        )
+        return self._analyze_weekly_preview(tab_name, preview_rows)
 
     async def select_recent_weekly_tabs(
         self,
@@ -249,21 +312,38 @@ class GoogleSheetsClient:
 
         titles = await self.get_sheet_titles(spreadsheet_id)
 
-        matching_ranges: list[TabDateRange] = []
+        candidates: list[TabDateRange] = []
+        seen_signatures: set[tuple[str, ...]] = set()
 
         for title in titles:
-            tab_range = await self.get_weekly_tab_date_range(spreadsheet_id, title)
+            tab_range = await self.get_weekly_cash_tab_date_range(spreadsheet_id, title)
             if not tab_range:
                 continue
 
-            overlaps_window = (
-                tab_range.end_date >= start_date and tab_range.start_date <= end_date
-            )
-            if overlaps_window:
-                matching_ranges.append(tab_range)
+            overlapping_dates = [
+                d for d in tab_range.covered_dates if start_date <= d <= end_date
+            ]
+            if not overlapping_dates:
+                continue
 
-        matching_ranges.sort(key=lambda x: (x.start_date, x.end_date, x.title.lower()))
-        return [item.title for item in matching_ranges]
+            signature = tuple(d.isoformat() for d in tab_range.covered_dates)
+            if signature in seen_signatures:
+                continue
+
+            seen_signatures.add(signature)
+            candidates.append(tab_range)
+
+        candidates.sort(
+            key=lambda x: (
+                x.start_date,
+                x.end_date,
+                -x.label_score,
+                -x.day_name_score,
+                x.title.lower(),
+            )
+        )
+
+        return [item.title for item in candidates]
 
 
 def safe_decimal(value: str | None) -> float | None:
@@ -278,6 +358,7 @@ def safe_decimal(value: str | None) -> float | None:
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
 
+    # remove dollar sign if present
     text = text.replace("$", "").strip()
 
     if text == "":
@@ -374,7 +455,8 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
 
 
 def normalize_cash_balancing_rows(
-    tab_name: str, rows: list[list[str]]
+    tab_name: str,
+    rows: list[list[str]],
 ) -> list[NormalizedCashRow]:
     """
     Raw row staging parser.
