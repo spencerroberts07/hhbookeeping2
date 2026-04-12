@@ -85,6 +85,11 @@ class GoogleSheetsClient:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=headers, params=params)
+
+            print("GOOGLE SHEETS URL:", response.request.url)
+            print("GOOGLE SHEETS STATUS:", response.status_code)
+            print("GOOGLE SHEETS BODY:", response.text)
+
             response.raise_for_status()
             payload = response.json()
 
