@@ -100,13 +100,34 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         if not entity:
             raise HTTPException(status_code=404, detail="Entity not found")
 
+        integration = session.execute(
+            text(
+                """
+                SELECT spreadsheet_id
+                FROM entity_integrations
+                WHERE entity_id = :entity_id
+                  AND integration_type = 'google_sheets'
+                  AND integration_name = 'cash_balancing'
+                  AND is_active = TRUE
+                LIMIT 1
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
+        if not integration or not integration["spreadsheet_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail="No active Google Sheets cash balancing integration found for this entity",
+            )
+
         source = session.execute(
             text(
                 """
                 INSERT INTO cash_balancing_sources (
                     entity_id, source_name, spreadsheet_id, lookback_days
                 ) VALUES (
-                    :entity_id, 'Bridlewood Cash Balancing', :spreadsheet_id, :lookback_days
+                    :entity_id, 'Cash Balancing', :spreadsheet_id, :lookback_days
                 )
                 ON CONFLICT (entity_id, source_name)
                 DO UPDATE SET
@@ -118,7 +139,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
             ),
             {
                 "entity_id": entity["id"],
-                "spreadsheet_id": settings.google_sheets_spreadsheet_id,
+                "spreadsheet_id": integration["spreadsheet_id"],
                 "lookback_days": payload.lookback_days,
             },
         ).mappings().first()
