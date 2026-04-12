@@ -74,8 +74,10 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         updated = 0
 
         for tab_name in tabs:
-            raw_rows = await sheet_client.get_tab_values(source["spreadsheet_id"], tab_name)
-            normalized_rows = normalize_cash_balancing_rows(tab_name, raw_rows)
+            try:
+                raw_rows = await sheet_client.get_tab_values(source["spreadsheet_id"], tab_name)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
 
             for row in normalized_rows:
                 existing = session.execute(
