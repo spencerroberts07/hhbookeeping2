@@ -76,6 +76,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         for tab_name in tabs:
             try:
                 raw_rows = await sheet_client.get_tab_values(source["spreadsheet_id"], tab_name)
+                normalized_rows = normalize_cash_balancing_rows(tab_name, raw_rows)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
