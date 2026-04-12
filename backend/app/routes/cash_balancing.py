@@ -121,6 +121,26 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 detail="No active Google Sheets cash balancing integration found for this entity",
             )
 
+        mapping_rows = session.execute(
+            text(
+                """
+                SELECT source_key, mapped_account_code
+                FROM account_mapping_rules
+                WHERE entity_id = :entity_id
+                  AND source_type = 'cash_balancing_line_label'
+                  AND is_active = TRUE
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().all()
+
+        mapping_by_label: dict[str, str] = {}
+        for row in mapping_rows:
+            source_key = str(row["source_key"]).strip()
+            mapped_account_code = str(row["mapped_account_code"]).strip()
+            if source_key and mapped_account_code:
+                mapping_by_label[source_key] = mapped_account_code
+
         source = session.execute(
             text(
                 """
@@ -167,6 +187,9 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         raw_updated = 0
         day_upserted = 0
         line_inserted = 0
+        mapped_line_count = 0
+        unmapped_line_count = 0
+        unmapped_labels: set[str] = set()
         tabs_source = "manual" if selected_tabs else "auto"
 
         try:
@@ -365,6 +388,16 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                     )
 
                     for line in day_data["lines"]:
+                        normalized_label = str(line.line_label).strip()
+                        mapped_account_code = mapping_by_label.get(normalized_label)
+                        translation_status = "mapped" if mapped_account_code else "pending"
+
+                        if mapped_account_code:
+                            mapped_line_count += 1
+                        else:
+                            unmapped_line_count += 1
+                            unmapped_labels.add(normalized_label)
+
                         session.execute(
                             text(
                                 """
@@ -390,8 +423,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                 "line_code": line.account_code,
                                 "line_label": line.line_label,
                                 "amount": line.amount,
-                                "mapped_account_code": None,
-                                "translation_status": "pending",
+                                "mapped_account_code": mapped_account_code,
+                                "translation_status": translation_status,
                             },
                         )
                         line_inserted += 1
@@ -403,6 +436,9 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 "raw_updated": raw_updated,
                 "day_upserted": day_upserted,
                 "line_inserted": line_inserted,
+                "mapped_line_count": mapped_line_count,
+                "unmapped_line_count": unmapped_line_count,
+                "unmapped_labels": sorted(unmapped_labels),
                 "lookback_days": payload.lookback_days,
                 "excluded_labels": sorted(EXCLUDED_DAILY_LABELS),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -433,6 +469,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 "raw_updated_count": raw_updated,
                 "day_upserted_count": day_upserted,
                 "line_inserted_count": line_inserted,
+                "mapped_line_count": mapped_line_count,
+                "unmapped_line_count": unmapped_line_count,
                 "summary": summary,
             }
 
@@ -511,11 +549,39 @@ def cash_balancing_status(entity_code: str):
             {"entity_id": entity["id"]},
         ).mappings().first()
 
+        mapped_line_count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS mapped_line_count
+                FROM cash_balancing_lines l
+                JOIN cash_balancing_days d ON d.id = l.cash_balancing_day_id
+                WHERE d.entity_id = :entity_id
+                  AND l.translation_status = 'mapped'
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
+        pending_line_count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS pending_line_count
+                FROM cash_balancing_lines l
+                JOIN cash_balancing_days d ON d.id = l.cash_balancing_day_id
+                WHERE d.entity_id = :entity_id
+                  AND l.translation_status = 'pending'
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
         return {
             "entity_code": entity_code,
             "has_cash_balancing_rows": (row_count or {}).get("row_count", 0) > 0,
             "row_count": (row_count or {}).get("row_count", 0),
             "day_count": (day_count or {}).get("day_count", 0),
             "line_count": (line_count or {}).get("line_count", 0),
+            "mapped_line_count": (mapped_line_count or {}).get("mapped_line_count", 0),
+            "pending_line_count": (pending_line_count or {}).get("pending_line_count", 0),
             "latest_run": dict(latest_run) if latest_run else None,
         }
