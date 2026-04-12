@@ -12,6 +12,21 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_SHEETS_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
+# Lines that should never become daily bookkeeping lines
+EXCLUDED_DAILY_LABELS = {
+    "",
+    "Opening Cash",
+    "Total",
+    "Total PAID OUTS",
+    "Cash to Account for",
+    "Actual Cash count",
+    "Closing Cash",
+    "Weather",
+    "Customer count",
+    "PAID OUTS",
+    "Other info",
+}
+
 
 @dataclass
 class NormalizedCashRow:
@@ -30,6 +45,17 @@ class NormalizedCashRow:
     hst_amount: float | None
     over_short_amount: float | None
     raw_row_json: dict[str, Any]
+
+
+@dataclass
+class DailyCashLine:
+    source_tab_name: str
+    business_date: str
+    line_label: str
+    amount: float | None
+    account_code: str | None
+    day_name: str | None
+
 
 class GoogleSheetsClient:
     def __init__(self, service_account_email: str, private_key: str) -> None:
@@ -53,13 +79,20 @@ class GoogleSheetsClient:
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": assertion,
         }
-        async with httpx.AsyncClient(timeout=30) as client:
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(GOOGLE_TOKEN_URL, data=data)
-            response.raise_for_status()
+
+            if response.is_error:
+                raise RuntimeError(
+                    f"Google token error. STATUS={response.status_code} BODY={response.text}"
+                )
+
             return response.json()["access_token"]
 
     @staticmethod
     def normalize_sheet_range(tab_name: str) -> str:
+        # Allow caller to pass a full A1 range if they ever want to later
         if "!" in tab_name:
             return tab_name
 
@@ -73,21 +106,15 @@ class GoogleSheetsClient:
         encoded_range = quote(sheet_range, safe="!:")
 
         url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values/{encoded_range}"
-
         headers = {
             "Authorization": f"Bearer {access_token}",
         }
-
         params = {
             "majorDimension": "ROWS",
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=headers, params=params)
-
-            print("GOOGLE SHEETS URL:", str(response.request.url))
-            print("GOOGLE SHEETS STATUS:", response.status_code)
-            print("GOOGLE SHEETS BODY:", response.text)
 
             if response.is_error:
                 raise RuntimeError(
@@ -101,14 +128,55 @@ class GoogleSheetsClient:
 
         return payload.get("values", [])
 
+    async def get_sheet_titles(self, spreadsheet_id: str) -> list[str]:
+        access_token = await self._get_access_token()
+
+        url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+        params = {
+            "fields": "sheets.properties.title",
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers, params=params)
+
+            if response.is_error:
+                raise RuntimeError(
+                    f"Google Sheets metadata error. "
+                    f"URL={response.request.url} "
+                    f"STATUS={response.status_code} "
+                    f"BODY={response.text}"
+                )
+
+            payload = response.json()
+
+        return [
+            sheet["properties"]["title"]
+            for sheet in payload.get("sheets", [])
+            if "properties" in sheet and "title" in sheet["properties"]
+        ]
+
+
 def safe_decimal(value: str | None) -> float | None:
     if value is None:
         return None
+
     text = str(value).strip().replace(",", "")
+
     if text == "":
         return None
+
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
+
+    # remove dollar sign if present
+    text = text.replace("$", "").strip()
+
+    if text == "":
+        return None
+
     try:
         return float(text)
     except ValueError:
@@ -118,23 +186,35 @@ def safe_decimal(value: str | None) -> float | None:
 def guess_date(value: str | None) -> str | None:
     if not value:
         return None
+
     text = str(value).strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d", "%d-%b-%y", "%d-%b-%Y"):
+
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%Y/%m/%d",
+        "%d-%b-%y",
+        "%d-%b-%Y",
+    ):
         try:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
+
     return None
-@dataclass
-class DailyCashLine:
-    source_tab_name: str
-    business_date: str
-    line_label: str
-    amount: float | None
-    account_code: str | None
-    day_name: str | None
+
 
 def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyCashLine]:
+    """
+    Parses the Bridlewood weekly sideways cash balancing sheet into one line per day per label.
+
+    Expected weekly layout:
+    - row 4 (index 3): dates across columns 2 to 8
+    - row 5 (index 4): day names across columns 2 to 8
+    - row 6 onward: line labels in column 1 and daily values across columns 2 to 8
+    - account code is usually in column 11
+    """
     if not rows or len(rows) < 6:
         return []
 
@@ -143,19 +223,18 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
 
     daily_lines: list[DailyCashLine] = []
 
-    # dates are across columns 2 to 8 in your current sheet layout
     for row in rows[5:]:
         label = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
 
-        if label in {"", "PAID OUTS", "Other info", "Total", "Total PAID OUTS"}:
+        if label in EXCLUDED_DAILY_LABELS:
             continue
 
         account_code = str(row[10]).strip() if len(row) > 10 and row[10] is not None else None
+        if account_code == "":
+            account_code = None
 
+        # Daily values are in columns 2 to 8 => index 1 to 7
         for col_index in range(1, 8):
-            if col_index >= len(date_row):
-                continue
-
             raw_date = date_row[col_index] if col_index < len(date_row) else None
             raw_day = day_row[col_index] if col_index < len(day_row) else None
             raw_amount = row[col_index] if col_index < len(row) else None
@@ -164,6 +243,10 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
             amount = safe_decimal(raw_amount)
 
             if business_date is None:
+                continue
+
+            # Skip empty daily cells so we do not bloat daily lines with useless blanks
+            if amount is None:
                 continue
 
             daily_lines.append(
@@ -179,7 +262,12 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
 
     return daily_lines
 
+
 def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[NormalizedCashRow]:
+    """
+    Raw row staging parser.
+    Keeps the weekly sheet rows mostly as-is so the raw import table preserves source detail.
+    """
     if not rows:
         return []
 
@@ -204,7 +292,11 @@ def normalize_cash_balancing_rows(tab_name: str, rows: list[list[str]]) -> list[
     idx_over_short = find_index("over short", "cash over short")
 
     for row_number, row in enumerate(rows[1:], start=2):
-        raw = {f"col_{i+1}": row[i] if i < len(row) else None for i in range(max(len(header), len(row)))}
+        raw = {
+            f"col_{i+1}": row[i] if i < len(row) else None
+            for i in range(max(len(header), len(row)))
+        }
+
         business_date = guess_date(row[idx_date]) if idx_date is not None and idx_date < len(row) else None
         notes = row[idx_notes] if idx_notes is not None and idx_notes < len(row) else None
         row_key = f"{tab_name}|{business_date or 'no-date'}|{row_number}"
