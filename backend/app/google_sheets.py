@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -46,6 +47,12 @@ EXPECTED_WEEKLY_LABELS = {
     "Misc Cash Income",
     "Credit note issue",
     "Credit note redeemed",
+    "Coupons",
+    "Pre-pay Special Order",
+    "Pre-pay Special order applied",
+    "Purchases - Store use",
+    "Loyalty Redemption",
+    "Rounding",
 }
 
 EXPECTED_DAY_NAMES = {
@@ -57,6 +64,9 @@ EXPECTED_DAY_NAMES = {
     "friday",
     "saturday",
 }
+
+BATCH_PREVIEW_SIZE = 25
+MAX_RETRIES = 5
 
 
 @dataclass
@@ -152,6 +162,50 @@ class GoogleSheetsClient:
 
         return access_token
 
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        params: Any | None = None,
+        data: Any | None = None,
+    ) -> dict[str, Any]:
+        last_error_text = ""
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for attempt in range(MAX_RETRIES):
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    data=data,
+                )
+
+                if not response.is_error:
+                    return response.json()
+
+                last_error_text = (
+                    f"URL={response.request.url} "
+                    f"STATUS={response.status_code} "
+                    f"BODY={response.text}"
+                )
+
+                # retry on rate limits and transient Google/server errors
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < MAX_RETRIES - 1:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        sleep_seconds = int(retry_after)
+                    else:
+                        sleep_seconds = min(2 ** attempt, 20)
+                    await asyncio.sleep(sleep_seconds)
+                    continue
+
+                raise RuntimeError(f"Google Sheets API error. {last_error_text}")
+
+        raise RuntimeError(f"Google Sheets API error. {last_error_text}")
+
     @staticmethod
     def build_tab_range(tab_name: str, a1_range: str = "A:ZZ") -> str:
         escaped = tab_name.replace("'", "''")
@@ -159,7 +213,6 @@ class GoogleSheetsClient:
 
     @staticmethod
     def normalize_sheet_range(tab_name_or_range: str) -> str:
-        # Allow caller to pass a full A1 range if they ever want to later
         if "!" in tab_name_or_range:
             return tab_name_or_range
 
@@ -183,20 +236,46 @@ class GoogleSheetsClient:
             "majorDimension": "ROWS",
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, params=params)
-
-            if response.is_error:
-                raise RuntimeError(
-                    f"Google Sheets API error. "
-                    f"URL={response.request.url} "
-                    f"STATUS={response.status_code} "
-                    f"BODY={response.text}"
-                )
-
-            payload = response.json()
+        payload = await self._request_with_retry(
+            "GET",
+            url,
+            headers=headers,
+            params=params,
+        )
 
         return payload.get("values", [])
+
+    async def batch_get_ranges(
+        self,
+        spreadsheet_id: str,
+        ranges: list[str],
+    ) -> dict[str, list[list[str]]]:
+        if not ranges:
+            return {}
+
+        access_token = await self._get_access_token()
+
+        url = f"{GOOGLE_SHEETS_BASE_URL}/{spreadsheet_id}/values:batchGet"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+
+        params: list[tuple[str, str]] = [("majorDimension", "ROWS")]
+        for range_value in ranges:
+            params.append(("ranges", range_value))
+
+        payload = await self._request_with_retry(
+            "GET",
+            url,
+            headers=headers,
+            params=params,
+        )
+
+        results: dict[str, list[list[str]]] = {}
+        for item in payload.get("valueRanges", []):
+            results[item.get("range", "")] = item.get("values", [])
+
+        return results
 
     async def get_sheet_titles(self, spreadsheet_id: str) -> list[str]:
         access_token = await self._get_access_token()
@@ -209,18 +288,12 @@ class GoogleSheetsClient:
             "fields": "sheets.properties.title",
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, params=params)
-
-            if response.is_error:
-                raise RuntimeError(
-                    f"Google Sheets metadata error. "
-                    f"URL={response.request.url} "
-                    f"STATUS={response.status_code} "
-                    f"BODY={response.text}"
-                )
-
-            payload = response.json()
+        payload = await self._request_with_retry(
+            "GET",
+            url,
+            headers=headers,
+            params=params,
+        )
 
         return [
             sheet["properties"]["title"]
@@ -274,7 +347,6 @@ class GoogleSheetsClient:
             if str(raw_value).strip().lower() in EXPECTED_DAY_NAMES:
                 day_name_score += 1
 
-        # Require this to look enough like the known weekly cash balancing sheet
         if label_score < 2 and day_name_score < 5:
             return None
 
@@ -315,23 +387,37 @@ class GoogleSheetsClient:
         candidates: list[TabDateRange] = []
         seen_signatures: set[tuple[str, ...]] = set()
 
-        for title in titles:
-            tab_range = await self.get_weekly_cash_tab_date_range(spreadsheet_id, title)
-            if not tab_range:
-                continue
+        preview_ranges_by_title = {
+            title: self.build_tab_range(title, "A4:K20")
+            for title in titles
+        }
 
-            overlapping_dates = [
-                d for d in tab_range.covered_dates if start_date <= d <= end_date
-            ]
-            if not overlapping_dates:
-                continue
+        title_list = list(preview_ranges_by_title.keys())
 
-            signature = tuple(d.isoformat() for d in tab_range.covered_dates)
-            if signature in seen_signatures:
-                continue
+        for i in range(0, len(title_list), BATCH_PREVIEW_SIZE):
+            batch_titles = title_list[i:i + BATCH_PREVIEW_SIZE]
+            batch_ranges = [preview_ranges_by_title[title] for title in batch_titles]
+            batch_results = await self.batch_get_ranges(spreadsheet_id, batch_ranges)
 
-            seen_signatures.add(signature)
-            candidates.append(tab_range)
+            for title in batch_titles:
+                preview_range = preview_ranges_by_title[title]
+                preview_rows = batch_results.get(preview_range, [])
+                tab_range = self._analyze_weekly_preview(title, preview_rows)
+                if not tab_range:
+                    continue
+
+                overlapping_dates = [
+                    d for d in tab_range.covered_dates if start_date <= d <= end_date
+                ]
+                if not overlapping_dates:
+                    continue
+
+                signature = tuple(d.isoformat() for d in tab_range.covered_dates)
+                if signature in seen_signatures:
+                    continue
+
+                seen_signatures.add(signature)
+                candidates.append(tab_range)
 
         candidates.sort(
             key=lambda x: (
@@ -358,7 +444,6 @@ def safe_decimal(value: str | None) -> float | None:
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
 
-    # remove dollar sign if present
     text = text.replace("$", "").strip()
 
     if text == "":
@@ -424,7 +509,6 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
         if account_code == "":
             account_code = None
 
-        # Daily values are in columns 2 to 8 => index 1 to 7
         for col_index in range(1, 8):
             raw_date = date_row[col_index] if col_index < len(date_row) else None
             raw_day = day_row[col_index] if col_index < len(day_row) else None
@@ -436,7 +520,6 @@ def parse_weekly_cash_sheet(tab_name: str, rows: list[list[str]]) -> list[DailyC
             if business_date is None:
                 continue
 
-            # Skip empty daily cells so we do not bloat daily lines with useless blanks
             if amount is None:
                 continue
 
