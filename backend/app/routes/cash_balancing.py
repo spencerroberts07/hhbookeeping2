@@ -10,8 +10,10 @@ from ..db import db_session
 from ..google_sheets import (
     DailyCashLine,
     GoogleSheetsClient,
+    guess_date,
     normalize_cash_balancing_rows,
     parse_weekly_cash_sheet,
+    safe_decimal,
 )
 
 router = APIRouter(prefix="/api/cash-balancing", tags=["cash-balancing"])
@@ -31,6 +33,11 @@ EXCLUDED_DAILY_LABELS = {
     "Other info",
 }
 
+SPECIAL_DAY_VALUE_LABELS = {
+    "Opening Cash": "opening_cash",
+    "Closing Cash": "closing_cash",
+}
+
 
 class CashBalancingSyncRequest(BaseModel):
     entity_code: str = Field(..., examples=["1877-8"])
@@ -39,37 +46,6 @@ class CashBalancingSyncRequest(BaseModel):
         examples=[["Feb1-Feb7", "Feb8-Feb14"]],
     )
     lookback_days: int = Field(default=56, ge=1, le=365)
-
-
-def build_daily_groups(
-    daily_lines: list[DailyCashLine],
-) -> dict[str, dict]:
-    grouped: dict[str, dict] = {}
-
-    for line in daily_lines:
-        if line.line_label in EXCLUDED_DAILY_LABELS:
-            continue
-
-        if line.amount is None:
-            continue
-
-        if line.business_date not in grouped:
-            grouped[line.business_date] = {
-                "tab_name": line.source_tab_name,
-                "total_sales": None,
-                "total_hst": None,
-                "lines": [],
-            }
-
-        day_bucket = grouped[line.business_date]
-        day_bucket["lines"].append(line)
-
-        if line.line_label == "Item Sales":
-            day_bucket["total_sales"] = line.amount
-        elif line.line_label == "Tax - HST":
-            day_bucket["total_hst"] = line.amount
-
-    return grouped
 
 
 def dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -86,6 +62,90 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
         result.append(cleaned)
 
     return result
+
+
+def extract_special_day_values(rows: list[list[str]]) -> dict[str, dict[str, float | None]]:
+    """
+    Pull Opening Cash and Closing Cash by business date from the sideways weekly sheet.
+    """
+    if not rows or len(rows) < 6:
+        return {}
+
+    date_row = rows[3] if len(rows) > 3 else []
+    result: dict[str, dict[str, float | None]] = {}
+
+    for row in rows[5:]:
+        label = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+        target_key = SPECIAL_DAY_VALUE_LABELS.get(label)
+        if not target_key:
+            continue
+
+        for col_index in range(1, 8):
+            raw_date = date_row[col_index] if col_index < len(date_row) else None
+            raw_amount = row[col_index] if col_index < len(row) else None
+
+            business_date = guess_date(raw_date)
+            amount = safe_decimal(raw_amount)
+
+            if business_date is None:
+                continue
+
+            if business_date not in result:
+                result[business_date] = {
+                    "opening_cash": None,
+                    "closing_cash": None,
+                }
+
+            result[business_date][target_key] = amount
+
+    return result
+
+
+def build_daily_groups(
+    daily_lines: list[DailyCashLine],
+    special_day_values: dict[str, dict[str, float | None]],
+) -> dict[str, dict]:
+    grouped: dict[str, dict] = {}
+
+    for business_date, values in special_day_values.items():
+        grouped[business_date] = {
+            "tab_name": None,
+            "total_sales": None,
+            "total_hst": None,
+            "opening_cash": values.get("opening_cash"),
+            "closing_cash": values.get("closing_cash"),
+            "lines": [],
+        }
+
+    for line in daily_lines:
+        if line.line_label in EXCLUDED_DAILY_LABELS:
+            continue
+
+        if line.amount is None:
+            continue
+
+        if line.business_date not in grouped:
+            grouped[line.business_date] = {
+                "tab_name": line.source_tab_name,
+                "total_sales": None,
+                "total_hst": None,
+                "opening_cash": None,
+                "closing_cash": None,
+                "lines": [],
+            }
+
+        day_bucket = grouped[line.business_date]
+        if not day_bucket["tab_name"]:
+            day_bucket["tab_name"] = line.source_tab_name
+
+        day_bucket["lines"].append(line)
+
+        if line.line_label == "Item Sales":
+            day_bucket["total_sales"] = line.amount
+        elif line.line_label == "Tax - HST":
+            day_bucket["total_hst"] = line.amount
+
+    return grouped
 
 
 def get_accounting_period_for_date(session, entity_id: str, business_date: str):
@@ -214,6 +274,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
         line_inserted = 0
         mapped_line_count = 0
         unmapped_line_count = 0
+        special_value_day_count = 0
         unmapped_labels: set[str] = set()
         period_labels_touched: set[str] = set()
         tabs_source = "manual" if selected_tabs else "auto"
@@ -240,9 +301,9 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 )
                 normalized_rows = normalize_cash_balancing_rows(tab_name, raw_rows)
                 parsed_daily_lines = parse_weekly_cash_sheet(tab_name, raw_rows)
-                daily_groups = build_daily_groups(parsed_daily_lines)
+                special_day_values = extract_special_day_values(raw_rows)
+                daily_groups = build_daily_groups(parsed_daily_lines, special_day_values)
 
-                # 1) keep raw staging table logic
                 for row in normalized_rows:
                     existing = session.execute(
                         text(
@@ -333,7 +394,6 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                         )
                         raw_updated += 1
 
-                # 2) upsert daily headers and rebuild daily lines
                 for business_date, day_data in daily_groups.items():
                     accounting_period = get_accounting_period_for_date(
                         session=session,
@@ -342,6 +402,9 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                     )
                     accounting_period_id = accounting_period["id"]
                     period_labels_touched.add(str(accounting_period["period_label"]))
+
+                    if day_data.get("opening_cash") is not None or day_data.get("closing_cash") is not None:
+                        special_value_day_count += 1
 
                     existing_day = session.execute(
                         text(
@@ -362,6 +425,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                         "source_tab_name": day_data["tab_name"],
                         "line_count": len(day_data["lines"]),
                         "import_run_id": str(import_run["id"]),
+                        "opening_cash": day_data["opening_cash"],
+                        "closing_cash": day_data["closing_cash"],
                     }
 
                     if not existing_day:
@@ -373,6 +438,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                     accounting_period_id,
                                     business_date,
                                     tab_name,
+                                    opening_cash,
+                                    closing_cash,
                                     total_sales,
                                     total_hst,
                                     raw_json
@@ -381,6 +448,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                     :accounting_period_id,
                                     :business_date,
                                     :tab_name,
+                                    :opening_cash,
+                                    :closing_cash,
                                     :total_sales,
                                     :total_hst,
                                     CAST(:raw_json AS jsonb)
@@ -393,6 +462,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                 "accounting_period_id": accounting_period_id,
                                 "business_date": business_date,
                                 "tab_name": day_data["tab_name"],
+                                "opening_cash": day_data["opening_cash"],
+                                "closing_cash": day_data["closing_cash"],
                                 "total_sales": day_data["total_sales"],
                                 "total_hst": day_data["total_hst"],
                                 "raw_json": json.dumps(raw_json_payload),
@@ -407,6 +478,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                 UPDATE cash_balancing_days
                                 SET accounting_period_id = :accounting_period_id,
                                     tab_name = :tab_name,
+                                    opening_cash = :opening_cash,
+                                    closing_cash = :closing_cash,
                                     total_sales = :total_sales,
                                     total_hst = :total_hst,
                                     raw_json = CAST(:raw_json AS jsonb)
@@ -417,6 +490,8 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                                 "id": cash_balancing_day_id,
                                 "accounting_period_id": accounting_period_id,
                                 "tab_name": day_data["tab_name"],
+                                "opening_cash": day_data["opening_cash"],
+                                "closing_cash": day_data["closing_cash"],
                                 "total_sales": day_data["total_sales"],
                                 "total_hst": day_data["total_hst"],
                                 "raw_json": json.dumps(raw_json_payload),
@@ -425,7 +500,6 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
 
                     day_upserted += 1
 
-                    # delete and rebuild the lines for this day so reruns stay clean
                     session.execute(
                         text(
                             """
@@ -489,6 +563,7 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 "unmapped_line_count": unmapped_line_count,
                 "unmapped_labels": sorted(unmapped_labels),
                 "period_labels_touched": sorted(period_labels_touched),
+                "special_value_day_count": special_value_day_count,
                 "lookback_days": payload.lookback_days,
                 "excluded_labels": sorted(EXCLUDED_DAILY_LABELS),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -637,6 +712,30 @@ def cash_balancing_status(entity_code: str):
             {"entity_id": entity["id"]},
         ).mappings().first()
 
+        opening_cash_day_count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS opening_cash_day_count
+                FROM cash_balancing_days
+                WHERE entity_id = :entity_id
+                  AND opening_cash IS NOT NULL
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
+        closing_cash_day_count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS closing_cash_day_count
+                FROM cash_balancing_days
+                WHERE entity_id = :entity_id
+                  AND closing_cash IS NOT NULL
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+
         return {
             "entity_code": entity_code,
             "has_cash_balancing_rows": (row_count or {}).get("row_count", 0) > 0,
@@ -646,5 +745,7 @@ def cash_balancing_status(entity_code: str):
             "mapped_line_count": (mapped_line_count or {}).get("mapped_line_count", 0),
             "pending_line_count": (pending_line_count or {}).get("pending_line_count", 0),
             "period_linked_day_count": (period_linked_day_count or {}).get("period_linked_day_count", 0),
+            "opening_cash_day_count": (opening_cash_day_count or {}).get("opening_cash_day_count", 0),
+            "closing_cash_day_count": (closing_cash_day_count or {}).get("closing_cash_day_count", 0),
             "latest_run": dict(latest_run) if latest_run else None,
         }
