@@ -77,7 +77,22 @@ def parse_hh_short_date(value: str) -> date:
             status_code=400,
             detail=f"Invalid HH short date format: {value}",
         ) from exc
+        
 
+def extract_due_bucket_labels(summary_page_text: str) -> list[str]:
+    labels = re.findall(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
+        summary_page_text,
+    )
+
+    cleaned_labels: list[str] = []
+    for label in labels:
+        cleaned = re.sub(r"\s+", " ", label.strip())
+        if cleaned not in cleaned_labels:
+            cleaned_labels.append(cleaned)
+
+    return cleaned_labels
+    
 
 def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
     try:
@@ -197,30 +212,9 @@ def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
 
     if summary_page_1:
         amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_1)]
+        bucket_labels = extract_due_bucket_labels(summary_page_1)
 
-        if len(amounts) >= 25:
-            bucket_labels = [
-                "Mar. 04,2026",
-                "Mar. 11,2026",
-                "Mar. 18,2026",
-                "Mar. 25,2026",
-                "Apr. 01,2026",
-                "Apr. 08,2026",
-                "Apr. 15,2026",
-                "Apr. 22,2026",
-                "Apr. 29,2026",
-                "May. 06,2026",
-                "May. 13,2026",
-                "May. 27,2026",
-                "Jun. 10,2026",
-                "Jul. 08,2026",
-                "Jul. 15,2026",
-                "Jul. 29,2026",
-                "Aug. 05,2026",
-                "Aug. 12,2026",
-                "Sep. 09,2026",
-            ]
-
+        if len(amounts) >= 5:
             summary_balances = {
                 "opening_balance": float(amounts[0]),
                 "total_adjustments": float(amounts[1]),
@@ -229,8 +223,11 @@ def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
                 "balance_owing": float(amounts[4]),
             }
 
+            bucket_amounts = amounts[5 : 5 + len(bucket_labels)]
+
             for idx, label in enumerate(bucket_labels):
-                due_bucket_totals[label] = float(amounts[5 + idx])
+                if idx < len(bucket_amounts):
+                    due_bucket_totals[label] = float(bucket_amounts[idx])
 
     summary_page_2 = next(
         (
@@ -1514,24 +1511,42 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                 )
                 unmatched_remittance_count += 1
 
-        session.execute(
-            text(
-                """
-                UPDATE hh_ap_invoices
-                SET match_status = CASE
-                    WHEN id::text = ANY(:matched_invoice_ids) THEN 'matched'
-                    WHEN is_statement_only = TRUE THEN 'statement_only'
-                    ELSE 'unmatched'
-                END,
-                updated_at = NOW()
-                WHERE entity_id = :entity_id
-                """
-            ),
-            {
-                "entity_id": entity["id"],
-                "matched_invoice_ids": list(matched_invoice_ids),
-            },
-        )
+        if matched_invoice_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE hh_ap_invoices
+                    SET match_status = CASE
+                        WHEN id::text = ANY(:matched_invoice_ids) THEN 'matched'
+                        WHEN is_statement_only = TRUE THEN 'statement_only'
+                        ELSE 'unmatched'
+                    END,
+                    updated_at = NOW()
+                    WHERE entity_id = :entity_id
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "matched_invoice_ids": list(matched_invoice_ids),
+                },
+            )
+        else:
+            session.execute(
+                text(
+                    """
+                    UPDATE hh_ap_invoices
+                    SET match_status = CASE
+                        WHEN is_statement_only = TRUE THEN 'statement_only'
+                        ELSE 'unmatched'
+                    END,
+                    updated_at = NOW()
+                    WHERE entity_id = :entity_id
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                },
+            )
 
         return {
             "entity_code": entity["entity_code"],
