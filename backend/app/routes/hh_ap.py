@@ -1,7 +1,10 @@
 import hashlib
 import json
+import re
+from calendar import monthrange
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +54,235 @@ def normalize_optional_date_input(value: str | None) -> date | None:
             status_code=400,
             detail="document_date must be blank or in YYYY-MM-DD format",
         )
+
+def parse_hh_money(value: str) -> Decimal:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return Decimal("0.00")
+
+    cleaned = cleaned.replace(",", "").replace(" ", "")
+    return Decimal(cleaned)
+
+
+def parse_hh_short_date(value: str) -> date:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Missing statement date value")
+
+    try:
+        yy, mm, dd = cleaned.split("-")
+        return date(2000 + int(yy), int(mm), int(dd))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid HH short date format: {value}",
+        ) from exc
+
+
+def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF parsing support is not installed. Add pypdf to backend dependencies and redeploy.",
+        ) from exc
+
+    reader = PdfReader(BytesIO(file_bytes))
+    return [(page.extract_text() or "") for page in reader.pages]
+
+
+def parse_hh_statement_month_end(full_text: str) -> date:
+    match = re.search(r"\b(20\d{2})/(\d{2})\b", full_text)
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not find statement month in HH statement PDF",
+        )
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+    last_day = monthrange(year, month)[1]
+    return date(year, month, last_day)
+
+
+def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
+    pages = extract_pdf_pages_text(file_bytes)
+    full_text = "\n".join(pages)
+    statement_month_end = parse_hh_statement_month_end(full_text)
+
+    inv_pattern = re.compile(r"^\d{8}$")
+    ts_pattern = re.compile(r"^\d+$")
+    money_pattern = re.compile(r"^-?\s?[\d,]+\.\d{2}$")
+    short_date_pattern = re.compile(r"^\d{2}-\d{2}-\d{2}$")
+
+    detail_lines: list[dict[str, Any]] = []
+
+    for page_text in pages:
+        if "Summary Page" in page_text:
+            continue
+
+        lines = [line.rstrip() for line in page_text.splitlines()]
+        footer_idx = next(
+            (i for i, line in enumerate(lines) if "Inv Nbr T/S Invoice Amount" in line),
+            len(lines),
+        )
+        data_lines = lines[:footer_idx]
+
+        i = 0
+
+        invoice_numbers: list[str] = []
+        while i < len(data_lines) and inv_pattern.match(data_lines[i].strip()):
+            invoice_numbers.append(data_lines[i].strip())
+            i += 1
+
+        ts_codes: list[str] = []
+        while i < len(data_lines) and ts_pattern.match(data_lines[i].strip()):
+            ts_codes.append(data_lines[i].strip())
+            i += 1
+
+        invoice_amounts: list[Decimal] = []
+        while i < len(data_lines) and money_pattern.match(data_lines[i].strip()):
+            invoice_amounts.append(parse_hh_money(data_lines[i]))
+            i += 1
+
+        date_tokens: list[str] = []
+        while i < len(data_lines) and short_date_pattern.match(data_lines[i].strip()):
+            date_tokens.append(data_lines[i].strip())
+            i += 1
+
+        row_count = len(invoice_numbers)
+        invoice_dates = date_tokens[:row_count]
+        due_dates = date_tokens[row_count : row_count * 2]
+
+        usable_count = min(
+            len(invoice_numbers),
+            len(ts_codes),
+            len(invoice_amounts),
+            len(invoice_dates),
+            len(due_dates),
+        )
+
+        for idx in range(usable_count):
+            amount = invoice_amounts[idx]
+
+            detail_lines.append(
+                {
+                    "invoice_number": invoice_numbers[idx],
+                    "invoice_type": None,
+                    "invoice_date": parse_hh_short_date(invoice_dates[idx]),
+                    "due_date": parse_hh_short_date(due_dates[idx]),
+                    "invoice_amount": amount,
+                    "open_amount": amount,
+                    "current_amount": None,
+                    "past_due_amount": None,
+                    "raw_json": {
+                        "statement_ts_code": ts_codes[idx],
+                    },
+                }
+            )
+
+    summary_balances: dict[str, Any] = {}
+    due_bucket_totals: dict[str, float] = {}
+    summary_components: dict[str, Any] = {}
+
+    summary_page_1 = next(
+        (
+            page_text
+            for page_text in pages
+            if "Opening Balance" in page_text and "Balance Owing" in page_text
+        ),
+        "",
+    )
+
+    if summary_page_1:
+        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_1)]
+
+        if len(amounts) >= 25:
+            bucket_labels = [
+                "Mar. 04,2026",
+                "Mar. 11,2026",
+                "Mar. 18,2026",
+                "Mar. 25,2026",
+                "Apr. 01,2026",
+                "Apr. 08,2026",
+                "Apr. 15,2026",
+                "Apr. 22,2026",
+                "Apr. 29,2026",
+                "May. 06,2026",
+                "May. 13,2026",
+                "May. 27,2026",
+                "Jun. 10,2026",
+                "Jul. 08,2026",
+                "Jul. 15,2026",
+                "Jul. 29,2026",
+                "Aug. 05,2026",
+                "Aug. 12,2026",
+                "Sep. 09,2026",
+            ]
+
+            summary_balances = {
+                "opening_balance": float(amounts[0]),
+                "total_adjustments": float(amounts[1]),
+                "total_purchases_this_month": float(amounts[2]),
+                "total_payments_this_month": float(amounts[3]),
+                "balance_owing": float(amounts[4]),
+            }
+
+            for idx, label in enumerate(bucket_labels):
+                due_bucket_totals[label] = float(amounts[5 + idx])
+
+    summary_page_2 = next(
+        (
+            page_text
+            for page_text in pages
+            if "This Month" in page_text and "Total Purchases" in page_text
+        ),
+        "",
+    )
+
+    if summary_page_2:
+        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_2)]
+
+        metric_labels = [
+            "GST/HST",
+            "Enviro Amount",
+            "Special Shares - Subscribed For",
+            "Five Yr Notes - Subscribed For",
+            "Service [D. C. Freight]",
+            "Total Surcharges",
+            "Advertising",
+            "Warehouse",
+            "Direct",
+            "Disc and Promo",
+            "Building Supply",
+            "Service [T/S 7 Expense]",
+            "Red Sur Prom",
+            "Total Purchases",
+        ]
+
+        if len(amounts) >= len(metric_labels) * 4:
+            for idx, label in enumerate(metric_labels):
+                summary_components[label] = {
+                    "this_month": float(amounts[idx]),
+                    "same_month_last_year": float(amounts[idx + 14]),
+                    "this_year_to_date": float(amounts[idx + 28]),
+                    "last_year_to_date": float(amounts[idx + 42]),
+                }
+
+    total_open_balance = summary_balances.get("balance_owing")
+    if total_open_balance is None:
+        total_open_balance = float(sum(line["open_amount"] for line in detail_lines))
+
+    return {
+        "statement_month_end": statement_month_end,
+        "total_open_balance": total_open_balance,
+        "statement_line_count": len(detail_lines),
+        "summary_balances": summary_balances,
+        "due_bucket_totals": due_bucket_totals,
+        "summary_components": summary_components,
+        "lines": detail_lines,
+    }
 
 
 def build_source_hash(file_bytes: bytes) -> str:
@@ -164,6 +396,10 @@ class HHAPInvoiceInput(BaseModel):
     is_statement_only: bool = False
     notes: str | None = None
     raw_json: dict[str, Any] = Field(default_factory=dict)
+
+class HHAPParseStatementDocumentRequest(BaseModel):
+    entity_code: str
+    document_id: str | None = None
 
 
 class HHAPInvoiceUpsertRequest(BaseModel):
@@ -873,6 +1109,255 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
             "statement_id": str(statement_row["id"]),
             "statement_line_count": inserted_lines,
             "statement_month_end": str(payload.statement_month_end),
+        }
+
+
+@router.post("/statements/parse-document")
+def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
+    with db_session() as session:
+        entity = get_entity(session, payload.entity_code)
+
+        if payload.document_id:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND id = :document_id
+                      AND document_type = 'hh_statement'
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "document_id": payload.document_id,
+                },
+            ).mappings().first()
+        else:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND document_type = 'hh_statement'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"entity_id": entity["id"]},
+            ).mappings().first()
+
+        if not document:
+            raise HTTPException(
+                status_code=404,
+                detail="No HH statement document found for this entity",
+            )
+
+        if not document["file_bytes"]:
+            raise HTTPException(
+                status_code=400,
+                detail="This HH statement document has no stored file bytes to parse",
+            )
+
+        parsed = parse_hh_statement_document(document["file_bytes"])
+        statement_month_end = parsed["statement_month_end"]
+        statement_date = document["document_date"] or statement_month_end
+
+        existing_statement = session.execute(
+            text(
+                """
+                SELECT id
+                FROM hh_ap_statements
+                WHERE entity_id = :entity_id
+                  AND (
+                        document_id = :document_id
+                        OR statement_month_end = :statement_month_end
+                  )
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "document_id": document["id"],
+                "statement_month_end": statement_month_end,
+            },
+        ).mappings().first()
+
+        statement_raw_json = {
+            "source_filename": document["source_filename"],
+            "summary_balances": parsed["summary_balances"],
+            "due_bucket_totals": parsed["due_bucket_totals"],
+            "summary_components": parsed["summary_components"],
+        }
+
+        if existing_statement:
+            statement_row = session.execute(
+                text(
+                    """
+                    UPDATE hh_ap_statements
+                    SET document_id = :document_id,
+                        statement_date = :statement_date,
+                        statement_month_end = :statement_month_end,
+                        total_open_balance = :total_open_balance,
+                        raw_json = CAST(:raw_json AS jsonb),
+                        updated_at = NOW()
+                    WHERE id = :id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": existing_statement["id"],
+                    "document_id": document["id"],
+                    "statement_date": statement_date,
+                    "statement_month_end": statement_month_end,
+                    "total_open_balance": parsed["total_open_balance"],
+                    "raw_json": json.dumps(statement_raw_json),
+                },
+            ).mappings().first()
+        else:
+            statement_row = session.execute(
+                text(
+                    """
+                    INSERT INTO hh_ap_statements (
+                        entity_id,
+                        document_id,
+                        statement_date,
+                        statement_month_end,
+                        total_open_balance,
+                        raw_json
+                    ) VALUES (
+                        :entity_id,
+                        :document_id,
+                        :statement_date,
+                        :statement_month_end,
+                        :total_open_balance,
+                        CAST(:raw_json AS jsonb)
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "document_id": document["id"],
+                    "statement_date": statement_date,
+                    "statement_month_end": statement_month_end,
+                    "total_open_balance": parsed["total_open_balance"],
+                    "raw_json": json.dumps(statement_raw_json),
+                },
+            ).mappings().first()
+
+        session.execute(
+            text(
+                """
+                DELETE FROM hh_ap_statement_lines
+                WHERE statement_id = :statement_id
+                """
+            ),
+            {"statement_id": statement_row["id"]},
+        )
+
+        inserted_lines = 0
+        for line in parsed["lines"]:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO hh_ap_statement_lines (
+                        statement_id,
+                        entity_id,
+                        invoice_number,
+                        invoice_type,
+                        invoice_date,
+                        due_date,
+                        invoice_amount,
+                        open_amount,
+                        current_amount,
+                        past_due_amount,
+                        matched_invoice_id,
+                        match_status,
+                        is_missing_download,
+                        raw_json
+                    ) VALUES (
+                        :statement_id,
+                        :entity_id,
+                        :invoice_number,
+                        :invoice_type,
+                        :invoice_date,
+                        :due_date,
+                        :invoice_amount,
+                        :open_amount,
+                        :current_amount,
+                        :past_due_amount,
+                        NULL,
+                        'unmatched',
+                        FALSE,
+                        CAST(:raw_json AS jsonb)
+                    )
+                    """
+                ),
+                {
+                    "statement_id": statement_row["id"],
+                    "entity_id": entity["id"],
+                    "invoice_number": normalize_invoice_number(line["invoice_number"]),
+                    "invoice_type": line["invoice_type"],
+                    "invoice_date": line["invoice_date"],
+                    "due_date": line["due_date"],
+                    "invoice_amount": line["invoice_amount"],
+                    "open_amount": line["open_amount"],
+                    "current_amount": line["current_amount"],
+                    "past_due_amount": line["past_due_amount"],
+                    "raw_json": json.dumps(line["raw_json"] or {}),
+                },
+            )
+            inserted_lines += 1
+
+        session.execute(
+            text(
+                """
+                UPDATE hh_ap_documents
+                SET processing_status = 'parsed_statement',
+                    raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": document["id"],
+                "parser_json": json.dumps(
+                    {
+                        "parsed_as": "hh_statement",
+                        "parsed_statement_month_end": str(statement_month_end),
+                        "parsed_statement_line_count": inserted_lines,
+                    }
+                ),
+            },
+        )
+
+        return {
+            "entity_code": entity["entity_code"],
+            "document_id": str(document["id"]),
+            "statement_id": str(statement_row["id"]),
+            "statement_month_end": str(statement_month_end),
+            "statement_line_count": inserted_lines,
+            "total_open_balance": parsed["total_open_balance"],
+            "summary_balances": parsed["summary_balances"],
+            "summary_components": parsed["summary_components"],
         }
 
 
