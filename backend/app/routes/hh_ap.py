@@ -230,6 +230,7 @@ async def hh_ap_upload_documents(
         normalized_document_date = normalize_optional_date_input(document_date)
 
         inserted_documents: list[dict] = []
+        updated_documents: list[dict] = []
         duplicate_documents: list[dict] = []
 
         for upload in files:
@@ -247,7 +248,12 @@ async def hh_ap_upload_documents(
             existing = session.execute(
                 text(
                     """
-                    SELECT id, source_filename, document_type
+                    SELECT
+                        id,
+                        source_filename,
+                        document_type,
+                        extracted_text,
+                        file_size_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND document_type = :document_type
@@ -262,19 +268,71 @@ async def hh_ap_upload_documents(
                 },
             ).mappings().first()
 
-            if existing:
-                duplicate_documents.append(
-                    {
-                        "id": str(existing["id"]),
-                        "source_filename": existing["source_filename"],
-                        "document_type": existing["document_type"],
-                    }
-                )
-                continue
-
             processing_status = (
                 "uploaded_text_ready" if extracted_text else "uploaded_pending_parse"
             )
+
+            if existing:
+                needs_upgrade = (
+                    existing.get("file_size_bytes") in (None, 0)
+                    or (
+                        extracted_text is not None
+                        and not existing.get("extracted_text")
+                    )
+                )
+
+                if needs_upgrade:
+                    updated_row = session.execute(
+                        text(
+                            """
+                            UPDATE hh_ap_documents
+                            SET document_date = COALESCE(:document_date, document_date),
+                                content_type = :content_type,
+                                file_size_bytes = :file_size_bytes,
+                                file_bytes = :file_bytes,
+                                extracted_text = COALESCE(:extracted_text, extracted_text),
+                                processing_status = :processing_status,
+                                raw_json = CAST(:raw_json AS jsonb),
+                                updated_at = NOW()
+                            WHERE id = :id
+                            RETURNING id, updated_at
+                            """
+                        ),
+                        {
+                            "id": existing["id"],
+                            "document_date": normalized_document_date,
+                            "content_type": upload.content_type,
+                            "file_size_bytes": len(file_bytes),
+                            "file_bytes": file_bytes,
+                            "extracted_text": extracted_text,
+                            "processing_status": processing_status,
+                            "raw_json": json.dumps(
+                                {
+                                    "content_type": upload.content_type,
+                                    "file_size_bytes": len(file_bytes),
+                                }
+                            ),
+                        },
+                    ).mappings().first()
+
+                    updated_documents.append(
+                        {
+                            "id": str(updated_row["id"]),
+                            "source_filename": existing["source_filename"],
+                            "document_type": existing["document_type"],
+                            "processing_status": processing_status,
+                            "updated_at": updated_row["updated_at"].isoformat() if updated_row["updated_at"] else None,
+                        }
+                    )
+                else:
+                    duplicate_documents.append(
+                        {
+                            "id": str(existing["id"]),
+                            "source_filename": existing["source_filename"],
+                            "document_type": existing["document_type"],
+                        }
+                    )
+                continue
 
             doc_row = session.execute(
                 text(
@@ -287,6 +345,9 @@ async def hh_ap_upload_documents(
                         document_date,
                         upload_source,
                         processing_status,
+                        content_type,
+                        file_size_bytes,
+                        file_bytes,
                         extracted_text,
                         raw_json
                     ) VALUES (
@@ -297,6 +358,9 @@ async def hh_ap_upload_documents(
                         :document_date,
                         'manual_upload',
                         :processing_status,
+                        :content_type,
+                        :file_size_bytes,
+                        :file_bytes,
                         :extracted_text,
                         CAST(:raw_json AS jsonb)
                     )
@@ -310,6 +374,9 @@ async def hh_ap_upload_documents(
                     "source_hash": source_hash,
                     "document_date": normalized_document_date,
                     "processing_status": processing_status,
+                    "content_type": upload.content_type,
+                    "file_size_bytes": len(file_bytes),
+                    "file_bytes": file_bytes,
                     "extracted_text": extracted_text,
                     "raw_json": json.dumps(
                         {
@@ -334,11 +401,12 @@ async def hh_ap_upload_documents(
             "entity_code": entity["entity_code"],
             "document_type": document_type,
             "inserted_count": len(inserted_documents),
+            "updated_count": len(updated_documents),
             "duplicate_count": len(duplicate_documents),
             "inserted_documents": inserted_documents,
+            "updated_documents": updated_documents,
             "duplicate_documents": duplicate_documents,
         }
-
 
 @router.post("/invoices/upsert")
 def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
