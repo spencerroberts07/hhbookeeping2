@@ -998,3 +998,171 @@ def review_manual_month_end_journal(
                 for row in lines
             ],
         }
+
+
+
+@router.get("/combined/review")
+def review_combined_month_end(
+    entity_code: str,
+    period_end: str,
+    manual_batch_label: str = MANUAL_MONTH_END_BATCH_LABEL,
+):
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        period = get_accounting_period(session, entity["id"], period_end)
+
+        batch_rows = session.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    entity_id,
+                    accounting_period_id,
+                    source_module,
+                    batch_label,
+                    status,
+                    total_debits,
+                    total_credits,
+                    summary_json,
+                    created_at,
+                    updated_at
+                FROM journal_batches
+                WHERE entity_id = :entity_id
+                  AND accounting_period_id = :accounting_period_id
+                  AND (
+                        (
+                            source_module = :cash_source_module
+                            AND batch_label = :cash_batch_label
+                        )
+                        OR
+                        (
+                            source_module = :manual_source_module
+                            AND batch_label = :manual_batch_label
+                        )
+                  )
+                ORDER BY created_at ASC
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "accounting_period_id": period["id"],
+                "cash_source_module": CASH_BALANCING_SOURCE_MODULE,
+                "cash_batch_label": CASH_BALANCING_BATCH_LABEL,
+                "manual_source_module": MANUAL_MONTH_END_SOURCE_MODULE,
+                "manual_batch_label": manual_batch_label,
+            },
+        ).mappings().all()
+
+        if not batch_rows:
+            raise HTTPException(
+                status_code=404,
+                detail="No cash balancing or manual month-end draft batches found for this accounting period",
+            )
+
+        combined_debits = Decimal("0.00")
+        combined_credits = Decimal("0.00")
+        combined_lines: list[dict] = []
+
+        cash_balancing_result = None
+        manual_month_end_result = None
+
+        for batch in batch_rows:
+            lines = session.execute(
+                text(
+                    """
+                    SELECT
+                        line_number,
+                        account_code,
+                        debit_amount,
+                        credit_amount,
+                        memo,
+                        source_json
+                    FROM journal_lines
+                    WHERE journal_batch_id = :journal_batch_id
+                    ORDER BY line_number
+                    """
+                ),
+                {"journal_batch_id": batch["id"]},
+            ).mappings().all()
+
+            batch_total_debits = money(batch["total_debits"])
+            batch_total_credits = money(batch["total_credits"])
+            batch_balance_difference = batch_total_debits - batch_total_credits
+
+            combined_debits += batch_total_debits
+            combined_credits += batch_total_credits
+
+            response_lines = [
+                {
+                    "line_number": row["line_number"],
+                    "account_code": row["account_code"],
+                    "debit_amount": money_float(money(row["debit_amount"])),
+                    "credit_amount": money_float(money(row["credit_amount"])),
+                    "memo": row["memo"],
+                    "source_json": row["source_json"],
+                }
+                for row in lines
+            ]
+
+            for row in response_lines:
+                combined_lines.append(
+                    {
+                        "source_module": batch["source_module"],
+                        "batch_label": batch["batch_label"],
+                        "line_number": row["line_number"],
+                        "account_code": row["account_code"],
+                        "debit_amount": row["debit_amount"],
+                        "credit_amount": row["credit_amount"],
+                        "memo": row["memo"],
+                        "source_json": row["source_json"],
+                    }
+                )
+
+            batch_payload = {
+                "journal_batch": {
+                    "id": str(batch["id"]),
+                    "source_module": batch["source_module"],
+                    "batch_label": batch["batch_label"],
+                    "status": batch["status"],
+                    "total_debits": money_float(batch_total_debits),
+                    "total_credits": money_float(batch_total_credits),
+                    "balance_difference": money_float(batch_balance_difference),
+                    "is_balanced": batch_balance_difference == Decimal("0.00"),
+                    "summary_json": batch["summary_json"],
+                    "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
+                    "updated_at": batch["updated_at"].isoformat() if batch["updated_at"] else None,
+                },
+                "journal_lines": response_lines,
+            }
+
+            if batch["source_module"] == CASH_BALANCING_SOURCE_MODULE:
+                cash_balancing_result = batch_payload
+            elif batch["source_module"] == MANUAL_MONTH_END_SOURCE_MODULE:
+                manual_month_end_result = batch_payload
+
+        combined_balance_difference = combined_debits - combined_credits
+
+        return {
+            "entity_code": entity["entity_code"],
+            "accounting_period": {
+                "id": str(period["id"]),
+                "period_label": period["period_label"],
+                "period_start": str(period["period_start"]),
+                "period_end": str(period["period_end"]),
+                "fiscal_year": period["fiscal_year"],
+                "fiscal_period_number": period["fiscal_period_number"],
+            },
+            "modules": {
+                "cash_balancing": cash_balancing_result,
+                "manual_month_end": manual_month_end_result,
+            },
+            "combined_summary": {
+                "total_debits": money_float(combined_debits),
+                "total_credits": money_float(combined_credits),
+                "balance_difference": money_float(combined_balance_difference),
+                "is_balanced": combined_balance_difference == Decimal("0.00"),
+                "module_count": len(batch_rows),
+                "journal_line_count": len(combined_lines),
+            },
+            "combined_lines": combined_lines,
+        }
