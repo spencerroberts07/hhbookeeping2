@@ -727,6 +727,245 @@ def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[s
     )
 
 
+def parse_hh_flexible_date(value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    normalized = re.sub(r"\s+", " ", cleaned.replace(" ,", ",")).strip()
+
+    for fmt in (
+        "%Y-%b-%d",
+        "%Y-%B-%d",
+        "%b. %d,%Y",
+        "%b. %d, %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m%d%Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt).date()
+        except ValueError:
+            continue
+
+    if re.fullmatch(r"\d{2}-\d{2}-\d{2}", normalized):
+        return parse_hh_short_date(normalized)
+
+    return None
+
+
+def extract_date_tokens_from_line(line: str) -> list[str]:
+    patterns = [
+        r"\b20\d{2}-[A-Za-z]{3}-\d{2}\b",
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
+        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{2},\s*\d{4}\b",
+        r"\b\d{2}-\d{2}-\d{2}\b",
+        r"\b\d{8}\b",
+        r"\b\d{2}/\d{2}/\d{4}\b",
+        r"\b\d{2}/\d{2}/\d{2}\b",
+    ]
+
+    tokens: list[str] = []
+    for pattern in patterns:
+        tokens.extend(re.findall(pattern, line))
+
+    unique_tokens: list[str] = []
+    for token in tokens:
+        if token not in unique_tokens:
+            unique_tokens.append(token)
+
+    return unique_tokens
+
+
+def find_first_parsed_date_in_line(line: str) -> date | None:
+    for token in extract_date_tokens_from_line(line):
+        parsed = parse_hh_flexible_date(token)
+        if parsed:
+            return parsed
+    return None
+
+
+def choose_remittance_filename_fallbacks(source_filename: str) -> dict[str, Any]:
+    tokens = extract_filename_8digit_tokens(source_filename)
+
+    likely_date = None
+    for token in reversed(tokens):
+        parsed = parse_hh_mmddyyyy(token)
+        if parsed:
+            likely_date = parsed
+            break
+
+    return {
+        "remittance_reference": Path(source_filename).stem,
+        "remittance_date": likely_date,
+        "withdrawal_date": likely_date,
+    }
+
+
+def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    pages = extract_pdf_pages_text(file_bytes)
+    full_text = "\n".join(pages)
+    fallbacks = choose_remittance_filename_fallbacks(source_filename)
+
+    all_lines: list[str] = []
+    for page_text in pages:
+        all_lines.extend([line.rstrip() for line in page_text.splitlines()])
+
+    money_token_pattern = re.compile(r"-?[\d,]*\.?\d+(?:CR)?")
+    invoice_number_pattern = re.compile(r"\b\d{8}\b")
+
+    remittance_reference = fallbacks["remittance_reference"]
+    remittance_date = fallbacks["remittance_date"]
+    withdrawal_date = fallbacks["withdrawal_date"]
+    total_amount = None
+
+    for raw_line in all_lines:
+        line = normalize_text(raw_line)
+        if not line:
+            continue
+
+        upper_line = line.upper()
+
+        if remittance_date is None and any(
+            keyword in upper_line
+            for keyword in ("REMITTANCE DATE", "DATE OF REMITTANCE", "REMIT DATE")
+        ):
+            remittance_date = find_first_parsed_date_in_line(line) or remittance_date
+
+        if withdrawal_date is None and any(
+            keyword in upper_line
+            for keyword in ("WITHDRAWAL DATE", "PAYMENT DATE", "DEBIT DATE", "DUE DATE")
+        ):
+            withdrawal_date = find_first_parsed_date_in_line(line) or withdrawal_date
+
+        if total_amount is None and any(
+            keyword in upper_line
+            for keyword in ("PLEASE PAY", "TOTAL REMITTANCE", "TOTAL PAYMENT", "AMOUNT DUE", "TOTAL DUE")
+        ):
+            money_tokens = [
+                token for token in money_token_pattern.findall(line)
+                if "." in token or token.endswith("CR")
+            ]
+            if money_tokens:
+                total_amount = parse_hh_signed_money(money_tokens[-1])
+
+    parsed_lines: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str | None, str | None, str]] = set()
+
+    for raw_line in all_lines:
+        line = normalize_text(raw_line)
+        if not line:
+            continue
+
+        upper_line = line.upper()
+        if any(
+            skip_word in upper_line
+            for skip_word in (
+                "TOTAL REMITTANCE",
+                "PLEASE PAY",
+                "AMOUNT DUE",
+                "TOTAL DUE",
+                "OPENING BALANCE",
+                "BALANCE OWING",
+            )
+        ):
+            continue
+
+        invoice_numbers = invoice_number_pattern.findall(line)
+        money_tokens = [
+            token for token in money_token_pattern.findall(line)
+            if "." in token or token.endswith("CR")
+        ]
+
+        if not money_tokens:
+            continue
+
+        line_amount = parse_hh_signed_money(money_tokens[-1])
+        line_due_date = find_first_parsed_date_in_line(line)
+
+        if invoice_numbers:
+            invoice_number = invoice_numbers[0]
+            key = (
+                invoice_number,
+                line_due_date.isoformat() if line_due_date else None,
+                str(line_amount),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            parsed_lines.append(
+                {
+                    "invoice_number": invoice_number,
+                    "line_description": line,
+                    "due_date": line_due_date,
+                    "line_amount": line_amount,
+                    "raw_json": {
+                        "source_filename": source_filename,
+                        "raw_line": line,
+                        "parser_version": "remittance_v1",
+                    },
+                }
+            )
+        else:
+            if any(
+                keyword in upper_line
+                for keyword in ("ADJUST", "SERVICE", "SURCHARGE", "ADVERT", "SHARE", "NOTE")
+            ):
+                key = (
+                    None,
+                    line_due_date.isoformat() if line_due_date else None,
+                    f"{line}|{line_amount}",
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                parsed_lines.append(
+                    {
+                        "invoice_number": None,
+                        "line_description": line,
+                        "due_date": line_due_date,
+                        "line_amount": line_amount,
+                        "raw_json": {
+                            "source_filename": source_filename,
+                            "raw_line": line,
+                            "parser_version": "remittance_v1",
+                            "non_invoice_line": True,
+                        },
+                    }
+                )
+
+    if not parsed_lines:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not parse any remittance lines from document: {source_filename}",
+        )
+
+    if total_amount is None:
+        total_amount = sum((line["line_amount"] for line in parsed_lines), Decimal("0.00"))
+
+    if remittance_date is None:
+        remittance_date = withdrawal_date
+
+    return {
+        "document_type": "hh_remittance",
+        "remittance_reference": remittance_reference,
+        "remittance_date": remittance_date,
+        "withdrawal_date": withdrawal_date,
+        "total_amount": total_amount,
+        "line_count": len(parsed_lines),
+        "lines": parsed_lines,
+        "raw_json": {
+            "parser_version": "remittance_v1",
+            "source_filename": source_filename,
+            "page_count": len(pages),
+        },
+    }
+
+
 def build_source_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -840,6 +1079,11 @@ class HHAPInvoiceInput(BaseModel):
     raw_json: dict[str, Any] = Field(default_factory=dict)
 
 class HHAPParseStatementDocumentRequest(BaseModel):
+    entity_code: str
+    document_id: str | None = None
+
+
+class HHAPParseRemittanceDocumentRequest(BaseModel):
     entity_code: str
     document_id: str | None = None
 
@@ -2027,7 +2271,257 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             "vendor_invoice_number": parsed["vendor_invoice_number"],
             "raw_json": parsed["raw_json"],
         }
-        
+
+
+@router.post("/remittances/parse-document")
+def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest):
+    with db_session() as session:
+        entity = get_entity(session, payload.entity_code)
+
+        allowed_document_types = (
+            "hh_remittance",
+            "hh_document",
+        )
+
+        if payload.document_id:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND id = :document_id
+                      AND document_type = ANY(:allowed_document_types)
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "document_id": payload.document_id,
+                    "allowed_document_types": list(allowed_document_types),
+                },
+            ).mappings().first()
+        else:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND document_type = ANY(:allowed_document_types)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "allowed_document_types": list(allowed_document_types),
+                },
+            ).mappings().first()
+
+        if not document:
+            raise HTTPException(
+                status_code=404,
+                detail="No HH remittance document found for this entity",
+            )
+
+        if not document["file_bytes"]:
+            raise HTTPException(
+                status_code=400,
+                detail="This HH remittance document has no stored file bytes to parse",
+            )
+
+        parsed = parse_hh_remittance_document(
+            file_bytes=document["file_bytes"],
+            source_filename=document["source_filename"],
+        )
+
+        existing_remittance = session.execute(
+            text(
+                """
+                SELECT id
+                FROM hh_ap_remittances
+                WHERE entity_id = :entity_id
+                  AND (
+                        document_id = :document_id
+                        OR (
+                            COALESCE(remittance_reference, '') = COALESCE(:remittance_reference, '')
+                            AND withdrawal_date IS NOT DISTINCT FROM :withdrawal_date
+                        )
+                  )
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "document_id": document["id"],
+                "remittance_reference": parsed["remittance_reference"],
+                "withdrawal_date": parsed["withdrawal_date"],
+            },
+        ).mappings().first()
+
+        if existing_remittance:
+            remittance_row = session.execute(
+                text(
+                    """
+                    UPDATE hh_ap_remittances
+                    SET document_id = :document_id,
+                        remittance_reference = :remittance_reference,
+                        remittance_date = :remittance_date,
+                        withdrawal_date = :withdrawal_date,
+                        total_amount = :total_amount,
+                        raw_json = CAST(:raw_json AS jsonb),
+                        updated_at = NOW()
+                    WHERE id = :id
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": existing_remittance["id"],
+                    "document_id": document["id"],
+                    "remittance_reference": parsed["remittance_reference"],
+                    "remittance_date": parsed["remittance_date"],
+                    "withdrawal_date": parsed["withdrawal_date"],
+                    "total_amount": parsed["total_amount"],
+                    "raw_json": json.dumps(parsed["raw_json"] or {}),
+                },
+            ).mappings().first()
+        else:
+            remittance_row = session.execute(
+                text(
+                    """
+                    INSERT INTO hh_ap_remittances (
+                        entity_id,
+                        document_id,
+                        remittance_reference,
+                        remittance_date,
+                        withdrawal_date,
+                        total_amount,
+                        raw_json
+                    ) VALUES (
+                        :entity_id,
+                        :document_id,
+                        :remittance_reference,
+                        :remittance_date,
+                        :withdrawal_date,
+                        :total_amount,
+                        CAST(:raw_json AS jsonb)
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "document_id": document["id"],
+                    "remittance_reference": parsed["remittance_reference"],
+                    "remittance_date": parsed["remittance_date"],
+                    "withdrawal_date": parsed["withdrawal_date"],
+                    "total_amount": parsed["total_amount"],
+                    "raw_json": json.dumps(parsed["raw_json"] or {}),
+                },
+            ).mappings().first()
+
+        session.execute(
+            text(
+                """
+                DELETE FROM hh_ap_remittance_lines
+                WHERE remittance_id = :remittance_id
+                """
+            ),
+            {"remittance_id": remittance_row["id"]},
+        )
+
+        inserted_lines = 0
+        for line in parsed["lines"]:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO hh_ap_remittance_lines (
+                        remittance_id,
+                        entity_id,
+                        invoice_number,
+                        line_description,
+                        due_date,
+                        line_amount,
+                        matched_invoice_id,
+                        match_status,
+                        raw_json
+                    ) VALUES (
+                        :remittance_id,
+                        :entity_id,
+                        :invoice_number,
+                        :line_description,
+                        :due_date,
+                        :line_amount,
+                        NULL,
+                        'unmatched',
+                        CAST(:raw_json AS jsonb)
+                    )
+                    """
+                ),
+                {
+                    "remittance_id": remittance_row["id"],
+                    "entity_id": entity["id"],
+                    "invoice_number": normalize_invoice_number(line["invoice_number"]),
+                    "line_description": normalize_text(line["line_description"]),
+                    "due_date": line["due_date"],
+                    "line_amount": line["line_amount"],
+                    "raw_json": json.dumps(line["raw_json"] or {}),
+                },
+            )
+            inserted_lines += 1
+
+        session.execute(
+            text(
+                """
+                UPDATE hh_ap_documents
+                SET document_type = :document_type,
+                    processing_status = 'parsed_remittance',
+                    raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": document["id"],
+                "document_type": parsed["document_type"],
+                "parser_json": json.dumps(
+                    {
+                        "parsed_as": parsed["document_type"],
+                        "parsed_remittance_reference": parsed["remittance_reference"],
+                        "parsed_remittance_line_count": inserted_lines,
+                    }
+                ),
+            },
+        )
+
+        return {
+            "entity_code": entity["entity_code"],
+            "document_id": str(document["id"]),
+            "remittance_id": str(remittance_row["id"]),
+            "remittance_reference": parsed["remittance_reference"],
+            "remittance_date": str(parsed["remittance_date"]) if parsed["remittance_date"] else None,
+            "withdrawal_date": str(parsed["withdrawal_date"]) if parsed["withdrawal_date"] else None,
+            "total_amount": money_float(parsed["total_amount"]),
+            "remittance_line_count": inserted_lines,
+            "raw_json": parsed["raw_json"],
+        }
+
 
 @router.post("/match/run")
 def hh_ap_match_run(payload: HHAPMatchRunRequest):
