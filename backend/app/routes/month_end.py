@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -14,10 +15,28 @@ CASH_BALANCING_SOURCE_MODULE = "cash_balancing"
 CASH_BALANCING_BATCH_LABEL = "cash_balancing_month_end"
 CASH_FLOAT_SOURCE_KEY = "Cash Float Movement"
 
+MANUAL_MONTH_END_SOURCE_MODULE = "manual_month_end"
+MANUAL_MONTH_END_BATCH_LABEL = "manual_month_end"
+
 
 class BuildCashBalancingJournalRequest(BaseModel):
     entity_code: str = Field(..., examples=["1877-8"])
     period_end: str = Field(..., examples=["2026-03-31"])
+
+class ManualMonthEndLineInput(BaseModel):
+    account_code: str = Field(..., examples=["6699"])
+    debit_amount: Decimal | None = Field(default=None, examples=[233.00])
+    credit_amount: Decimal | None = Field(default=None, examples=[233.00])
+    memo: str | None = Field(default=None, examples=["Loyalty month-end true-up"])
+    source_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class BuildManualMonthEndJournalRequest(BaseModel):
+    entity_code: str = Field(..., examples=["1877-8"])
+    period_end: str = Field(..., examples=["2026-02-28"])
+    lines: list[ManualMonthEndLineInput] = Field(default_factory=list)
+    batch_label: str = Field(default=MANUAL_MONTH_END_BATCH_LABEL)
+    batch_memo: str | None = Field(default=None, examples=["February manual adjustments"])
 
 
 def money(value) -> Decimal:
@@ -323,6 +342,8 @@ def upsert_journal_batch(
     session,
     entity_id: str,
     accounting_period_id: str,
+    source_module: str,
+    batch_label: str,
     status: str,
     total_debits: Decimal,
     total_credits: Decimal,
@@ -363,8 +384,8 @@ def upsert_journal_batch(
         {
             "entity_id": entity_id,
             "accounting_period_id": accounting_period_id,
-            "source_module": CASH_BALANCING_SOURCE_MODULE,
-            "batch_label": CASH_BALANCING_BATCH_LABEL,
+            "source_module": source_module,
+            "batch_label": batch_label,
             "status": status,
             "total_debits": total_debits,
             "total_credits": total_credits,
