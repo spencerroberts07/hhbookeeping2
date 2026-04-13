@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 from calendar import monthrange
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -282,6 +282,451 @@ def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def parse_hh_signed_money(value: str | None) -> Decimal:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return Decimal("0.00")
+
+    cleaned = cleaned.replace(",", "").replace(" ", "")
+    is_credit = cleaned.endswith("CR")
+    if is_credit:
+        cleaned = cleaned[:-2]
+
+    if cleaned.startswith("."):
+        cleaned = f"0{cleaned}"
+
+    if cleaned in {"", ".", "-.", "-0", "-0.00"}:
+        cleaned = "0.00"
+
+    amount = Decimal(cleaned)
+    return -amount if is_credit else amount
+
+
+def parse_hh_iso_word_date(value: str | None) -> date:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Missing HH invoice date value")
+
+    for fmt in ("%Y-%b-%d", "%Y-%B-%d"):
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid HH invoice date format: {value}",
+    )
+
+
+def parse_hh_mmddyyyy(value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    try:
+        return datetime.strptime(cleaned, "%m%d%Y").date()
+    except ValueError:
+        return None
+
+
+def extract_filename_8digit_tokens(source_filename: str) -> list[str]:
+    return re.findall(r"(\d{8})", Path(source_filename).name)
+
+
+def choose_invoice_filename_fallbacks(source_filename: str) -> dict[str, Any]:
+    tokens = extract_filename_8digit_tokens(source_filename)
+
+    invoice_date = parse_hh_mmddyyyy(tokens[0]) if len(tokens) >= 1 else None
+    invoice_number = tokens[-2] if len(tokens) >= 2 else None
+    remittance_due_date = parse_hh_mmddyyyy(tokens[-1]) if len(tokens) >= 3 else None
+
+    return {
+        "invoice_date": invoice_date,
+        "invoice_number": invoice_number,
+        "remittance_due_date": remittance_due_date,
+    }
+
+
+def find_first_page_lines(file_bytes: bytes) -> list[str]:
+    pages = extract_pdf_pages_text(file_bytes)
+    if not pages:
+        raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+    return [line.rstrip() for line in pages[0].splitlines()]
+
+
+def find_pure_money_line_after(lines: list[str], start_index: int) -> str | None:
+    for idx in range(start_index + 1, len(lines)):
+        cleaned = normalize_text(lines[idx])
+        if cleaned and re.fullmatch(r"[\d,]*\.?\d+(?:CR)?", cleaned):
+            return cleaned
+    return None
+
+
+def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    lines = find_first_page_lines(file_bytes)
+    fallbacks = choose_invoice_filename_fallbacks(source_filename)
+
+    invoice_meta_line = next(
+        (
+            line
+            for line in lines
+            if re.search(r"\b20\d{2}-[A-Za-z]{3}-\d{2}\s+\d{8}\b", line)
+        ),
+        "",
+    )
+    invoice_meta_match = re.search(
+        r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b",
+        invoice_meta_line,
+    )
+
+    invoice_date = (
+        parse_hh_iso_word_date(invoice_meta_match.group(1))
+        if invoice_meta_match
+        else fallbacks["invoice_date"]
+    )
+    invoice_number = (
+        invoice_meta_match.group(2)
+        if invoice_meta_match
+        else fallbacks["invoice_number"]
+    )
+
+    due_line = next(
+        (
+            normalize_text(line)
+            for line in lines
+            if re.fullmatch(r"20\d{2}-[A-Za-z]{3}-\d{2}", normalize_text(line) or "")
+        ),
+        None,
+    )
+    remittance_due_date = (
+        parse_hh_iso_word_date(due_line)
+        if due_line
+        else fallbacks["remittance_due_date"]
+    )
+
+    vendor_line = next(
+        (
+            line
+            for line in lines
+            if "Invoice Dt:" not in line and re.search(r"\s+D\s+", line)
+        ),
+        "",
+    )
+    vendor_name = normalize_text(re.split(r"\s+D\s+", vendor_line)[0]) if vendor_line else None
+
+    vendor_meta_line = next(
+        (
+            line
+            for line in lines
+            if "Invoice Dt:" in line and "Invoice Nbr:" in line
+        ),
+        "",
+    )
+    vendor_meta_match = re.search(
+        r"Invoice Dt:\s*(20\d{2}-[A-Za-z]{3}-\d{2})\s+Invoice Nbr:\s*(\S+)",
+        vendor_meta_line,
+    )
+
+    vendor_invoice_number = vendor_meta_match.group(2) if vendor_meta_match else None
+    vendor_invoice_date = (
+        parse_hh_iso_word_date(vendor_meta_match.group(1))
+        if vendor_meta_match
+        else None
+    )
+
+    top_amount_line = next(
+        (
+            line
+            for line in lines
+            if re.match(r"^\s*\d+\s+[\d,\.CR]+\s+[\d,\.CR]+", line)
+        ),
+        "",
+    )
+    top_money_tokens = [
+        token
+        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", top_amount_line)
+        if "." in token or token.endswith("CR")
+    ]
+
+    subtotal = parse_hh_signed_money(top_money_tokens[0]) if len(top_money_tokens) >= 1 else Decimal("0.00")
+    hst_amount = parse_hh_signed_money(top_money_tokens[1]) if len(top_money_tokens) >= 2 else Decimal("0.00")
+    pst_amount = parse_hh_signed_money(top_money_tokens[2]) if len(top_money_tokens) >= 3 else Decimal("0.00")
+
+    component_line_candidates = [
+        line
+        for line in lines
+        if len([
+            token
+            for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", line)
+            if "." in token or token.endswith("CR")
+        ]) >= 8
+        and "LESS" not in line
+        and "---" not in line
+    ]
+
+    if not component_line_candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not find component totals line in direct invoice PDF: {source_filename}",
+        )
+
+    component_tokens = [
+        token
+        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", component_line_candidates[-1])
+        if "." in token or token.endswith("CR")
+    ][-8:]
+
+    c_list_total = parse_hh_signed_money(component_tokens[0])
+    discount_amount = parse_hh_signed_money(component_tokens[1])
+    promo_discount_amount = parse_hh_signed_money(component_tokens[2])
+    surcharge_amount = parse_hh_signed_money(component_tokens[3])
+    subscribed_shares_amount = parse_hh_signed_money(component_tokens[4])
+    five_year_note_amount = parse_hh_signed_money(component_tokens[5])
+    advertising_amount = parse_hh_signed_money(component_tokens[6])
+    pre_tax_total = parse_hh_signed_money(component_tokens[7])
+
+    service_charge_line = next((line for line in lines if "Service Charges" in line), "")
+    enviro_fee_line = next((line for line in lines if "Enviro Fee Amount" in line), "")
+
+    service_charges = parse_hh_signed_money(
+        re.findall(r"[\d,]*\.?\d+(?:CR)?", service_charge_line)[0]
+    ) if service_charge_line else Decimal("0.00")
+
+    enviro_fee_amount = parse_hh_signed_money(
+        re.findall(r"[\d,]*\.?\d+(?:CR)?", enviro_fee_line)[0]
+    ) if enviro_fee_line else Decimal("0.00")
+
+    sold_to_idx = next((idx for idx, line in enumerate(lines) if normalize_text(line) == "Sold To:"), -1)
+    total_pay_line = find_pure_money_line_after(lines, sold_to_idx) if sold_to_idx >= 0 else None
+    total_amount = (
+        parse_hh_signed_money(total_pay_line)
+        if total_pay_line
+        else subtotal + hst_amount + pst_amount
+    )
+
+    if not invoice_number or not invoice_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not determine invoice number/date for direct invoice: {source_filename}",
+        )
+
+    return {
+        "document_type": "hh_invoice_direct",
+        "invoice_type": "vendor_direct",
+        "invoice_number": invoice_number,
+        "vendor_name": vendor_name,
+        "vendor_invoice_number": vendor_invoice_number,
+        "po_number": None,
+        "invoice_date": invoice_date,
+        "due_date": remittance_due_date,
+        "remittance_due_date": remittance_due_date,
+        "currency_code": "CAD",
+        "subtotal": subtotal,
+        "hst_amount": hst_amount,
+        "surcharge_amount": surcharge_amount,
+        "advertising_amount": advertising_amount,
+        "subscribed_shares_amount": subscribed_shares_amount,
+        "five_year_note_amount": five_year_note_amount,
+        "total_amount": total_amount,
+        "is_statement_only": False,
+        "notes": None,
+        "raw_json": {
+            "parser_version": "invoice_v1",
+            "invoice_source_type": "vendor_direct",
+            "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
+            "pst_amount": money_float(pst_amount),
+            "c_list_total": money_float(c_list_total),
+            "discount_amount": money_float(discount_amount),
+            "promo_discount_amount": money_float(promo_discount_amount),
+            "pre_tax_total": money_float(pre_tax_total),
+            "service_charges": money_float(service_charges),
+            "enviro_fee_amount": money_float(enviro_fee_amount),
+            "source_filename": source_filename,
+        },
+    }
+
+
+def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    lines = find_first_page_lines(file_bytes)
+    fallbacks = choose_invoice_filename_fallbacks(source_filename)
+
+    due_total_line = next(
+        (
+            normalize_text(line)
+            for line in lines
+            if re.fullmatch(
+                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR)?",
+                normalize_text(line) or "",
+            )
+        ),
+        None,
+    )
+    due_total_match = re.match(
+        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR)?)",
+        due_total_line or "",
+    )
+
+    remittance_due_date = (
+        parse_hh_iso_word_date(due_total_match.group(1))
+        if due_total_match
+        else fallbacks["remittance_due_date"]
+    )
+    total_amount = (
+        parse_hh_signed_money(due_total_match.group(2))
+        if due_total_match
+        else Decimal("0.00")
+    )
+
+    invoice_meta_line = next(
+        (
+            line
+            for line in lines
+            if re.search(r"\b20\d{2}-[A-Za-z]{3}-\d{2}\s+\d{8}\b", line)
+        ),
+        "",
+    )
+    invoice_meta_match = re.search(
+        r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b",
+        invoice_meta_line,
+    )
+
+    invoice_date = (
+        parse_hh_iso_word_date(invoice_meta_match.group(1))
+        if invoice_meta_match
+        else fallbacks["invoice_date"]
+    )
+    invoice_number = (
+        invoice_meta_match.group(2)
+        if invoice_meta_match
+        else fallbacks["invoice_number"]
+    )
+
+    component_line_candidates = [
+        line
+        for line in lines
+        if len([
+            token
+            for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", line)
+            if "." in token or token.endswith("CR")
+        ]) >= 8
+        and "LESS" not in line
+        and "---" not in line
+    ]
+
+    if not component_line_candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not find component totals line in warehouse invoice PDF: {source_filename}",
+        )
+
+    component_tokens = [
+        token
+        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", component_line_candidates[-1])
+        if "." in token or token.endswith("CR")
+    ][-8:]
+
+    c_list_total = parse_hh_signed_money(component_tokens[0])
+    discount_amount = parse_hh_signed_money(component_tokens[1])
+    promo_discount_amount = parse_hh_signed_money(component_tokens[2])
+    surcharge_amount = parse_hh_signed_money(component_tokens[3])
+    subscribed_shares_amount = parse_hh_signed_money(component_tokens[4])
+    five_year_note_amount = parse_hh_signed_money(component_tokens[5])
+    advertising_amount = parse_hh_signed_money(component_tokens[6])
+    pre_service_pre_tax_total = parse_hh_signed_money(component_tokens[7])
+
+    service_charge_line = next((line for line in lines if "Service Charges" in line), "")
+    enviro_fee_line = next((line for line in lines if "Enviro Fee Amount" in line), "")
+
+    service_charges = parse_hh_signed_money(
+        re.findall(r"[\d,]*\.?\d+(?:CR)?", service_charge_line)[0]
+    ) if service_charge_line else Decimal("0.00")
+
+    enviro_fee_amount = parse_hh_signed_money(
+        re.findall(r"[\d,]*\.?\d+(?:CR)?", enviro_fee_line)[0]
+    ) if enviro_fee_line else Decimal("0.00")
+
+    lower_summary_line = next(
+        (
+            line
+            for line in lines
+            if re.match(
+                r"^\s*[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s*$",
+                line,
+            )
+        ),
+        "",
+    )
+    lower_summary_tokens = [
+        token
+        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", lower_summary_line)
+        if "." in token or token.endswith("CR")
+    ]
+
+    subtotal = parse_hh_signed_money(lower_summary_tokens[-3]) if len(lower_summary_tokens) >= 3 else Decimal("0.00")
+    hst_amount = parse_hh_signed_money(lower_summary_tokens[-2]) if len(lower_summary_tokens) >= 2 else Decimal("0.00")
+    pst_amount = parse_hh_signed_money(lower_summary_tokens[-1]) if len(lower_summary_tokens) >= 1 else Decimal("0.00")
+
+    if total_amount == Decimal("0.00"):
+        total_amount = subtotal + hst_amount + pst_amount
+
+    if not invoice_number or not invoice_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not determine invoice number/date for warehouse invoice: {source_filename}",
+        )
+
+    return {
+        "document_type": "hh_invoice_warehouse",
+        "invoice_type": "warehouse",
+        "invoice_number": invoice_number,
+        "vendor_name": "Home Hardware Stores Limited",
+        "vendor_invoice_number": None,
+        "po_number": None,
+        "invoice_date": invoice_date,
+        "due_date": remittance_due_date,
+        "remittance_due_date": remittance_due_date,
+        "currency_code": "CAD",
+        "subtotal": subtotal,
+        "hst_amount": hst_amount,
+        "surcharge_amount": surcharge_amount,
+        "advertising_amount": advertising_amount,
+        "subscribed_shares_amount": subscribed_shares_amount,
+        "five_year_note_amount": five_year_note_amount,
+        "total_amount": total_amount,
+        "is_statement_only": False,
+        "notes": None,
+        "raw_json": {
+            "parser_version": "invoice_v1",
+            "invoice_source_type": "warehouse",
+            "pst_amount": money_float(pst_amount),
+            "c_list_total": money_float(c_list_total),
+            "discount_amount": money_float(discount_amount),
+            "promo_discount_amount": money_float(promo_discount_amount),
+            "pre_service_pre_tax_total": money_float(pre_service_pre_tax_total),
+            "service_charges": money_float(service_charges),
+            "enviro_fee_amount": money_float(enviro_fee_amount),
+            "source_filename": source_filename,
+        },
+    }
+
+
+def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    first_page_text = (extract_pdf_pages_text(file_bytes)[0] if extract_pdf_pages_text(file_bytes) else "")
+    source_name_upper = Path(source_filename).name.upper()
+
+    if "DIRECT INVOICE" in first_page_text.upper() or "INV0150E" in source_name_upper:
+        return parse_hh_direct_invoice_document(file_bytes, source_filename)
+
+    if "INV0670R" in source_name_upper or "PLEASE PAY THIS AMOUNT:" in first_page_text.upper():
+        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not determine HH invoice type for document: {source_filename}",
+    )
+
+
 def build_source_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -423,6 +868,9 @@ class HHAPRemittanceUpsertRequest(BaseModel):
     raw_json: dict[str, Any] = Field(default_factory=dict)
     lines: list[HHAPRemittanceLineInput] = Field(default_factory=list)
 
+class HHAPParseInvoiceDocumentRequest(BaseModel):
+    entity_code: str
+    document_id: str | None = None
 
 class HHAPStatementLineInput(BaseModel):
     invoice_number: str | None = None
@@ -1357,6 +1805,229 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
             "summary_components": parsed["summary_components"],
         }
 
+
+@router.post("/invoices/parse-document")
+def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
+    with db_session() as session:
+        entity = get_entity(session, payload.entity_code)
+
+        allowed_document_types = (
+            "hh_invoice",
+            "hh_invoice_direct",
+            "hh_invoice_warehouse",
+            "hh_document",
+        )
+
+        if payload.document_id:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND id = :document_id
+                      AND document_type = ANY(:allowed_document_types)
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "document_id": payload.document_id,
+                    "allowed_document_types": list(allowed_document_types),
+                },
+            ).mappings().first()
+        else:
+            document = session.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        document_type,
+                        source_filename,
+                        document_date,
+                        processing_status,
+                        raw_json,
+                        file_bytes
+                    FROM hh_ap_documents
+                    WHERE entity_id = :entity_id
+                      AND document_type = ANY(:allowed_document_types)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "allowed_document_types": list(allowed_document_types),
+                },
+            ).mappings().first()
+
+        if not document:
+            raise HTTPException(
+                status_code=404,
+                detail="No HH invoice document found for this entity",
+            )
+
+        if not document["file_bytes"]:
+            raise HTTPException(
+                status_code=400,
+                detail="This HH invoice document has no stored file bytes to parse",
+            )
+
+        parsed = parse_hh_invoice_document(
+            file_bytes=document["file_bytes"],
+            source_filename=document["source_filename"],
+        )
+
+        invoice_row = session.execute(
+            text(
+                """
+                INSERT INTO hh_ap_invoices (
+                    entity_id,
+                    document_id,
+                    invoice_number,
+                    invoice_type,
+                    vendor_name,
+                    vendor_invoice_number,
+                    po_number,
+                    invoice_date,
+                    due_date,
+                    remittance_due_date,
+                    currency_code,
+                    subtotal,
+                    hst_amount,
+                    surcharge_amount,
+                    advertising_amount,
+                    subscribed_shares_amount,
+                    five_year_note_amount,
+                    total_amount,
+                    match_status,
+                    is_statement_only,
+                    notes,
+                    raw_json
+                ) VALUES (
+                    :entity_id,
+                    :document_id,
+                    :invoice_number,
+                    :invoice_type,
+                    :vendor_name,
+                    :vendor_invoice_number,
+                    :po_number,
+                    :invoice_date,
+                    :due_date,
+                    :remittance_due_date,
+                    :currency_code,
+                    :subtotal,
+                    :hst_amount,
+                    :surcharge_amount,
+                    :advertising_amount,
+                    :subscribed_shares_amount,
+                    :five_year_note_amount,
+                    :total_amount,
+                    'unmatched',
+                    :is_statement_only,
+                    :notes,
+                    CAST(:raw_json AS jsonb)
+                )
+                ON CONFLICT (entity_id, invoice_number, invoice_type)
+                DO UPDATE SET
+                    document_id = EXCLUDED.document_id,
+                    vendor_name = EXCLUDED.vendor_name,
+                    vendor_invoice_number = EXCLUDED.vendor_invoice_number,
+                    po_number = EXCLUDED.po_number,
+                    invoice_date = EXCLUDED.invoice_date,
+                    due_date = EXCLUDED.due_date,
+                    remittance_due_date = EXCLUDED.remittance_due_date,
+                    currency_code = EXCLUDED.currency_code,
+                    subtotal = EXCLUDED.subtotal,
+                    hst_amount = EXCLUDED.hst_amount,
+                    surcharge_amount = EXCLUDED.surcharge_amount,
+                    advertising_amount = EXCLUDED.advertising_amount,
+                    subscribed_shares_amount = EXCLUDED.subscribed_shares_amount,
+                    five_year_note_amount = EXCLUDED.five_year_note_amount,
+                    total_amount = EXCLUDED.total_amount,
+                    is_statement_only = EXCLUDED.is_statement_only,
+                    notes = EXCLUDED.notes,
+                    raw_json = EXCLUDED.raw_json,
+                    updated_at = NOW()
+                RETURNING id, invoice_number, invoice_type, updated_at
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "document_id": document["id"],
+                "invoice_number": parsed["invoice_number"],
+                "invoice_type": parsed["invoice_type"],
+                "vendor_name": parsed["vendor_name"],
+                "vendor_invoice_number": parsed["vendor_invoice_number"],
+                "po_number": parsed["po_number"],
+                "invoice_date": parsed["invoice_date"],
+                "due_date": parsed["due_date"],
+                "remittance_due_date": parsed["remittance_due_date"],
+                "currency_code": parsed["currency_code"],
+                "subtotal": parsed["subtotal"],
+                "hst_amount": parsed["hst_amount"],
+                "surcharge_amount": parsed["surcharge_amount"],
+                "advertising_amount": parsed["advertising_amount"],
+                "subscribed_shares_amount": parsed["subscribed_shares_amount"],
+                "five_year_note_amount": parsed["five_year_note_amount"],
+                "total_amount": parsed["total_amount"],
+                "is_statement_only": parsed["is_statement_only"],
+                "notes": parsed["notes"],
+                "raw_json": json.dumps(parsed["raw_json"] or {}),
+            },
+        ).mappings().first()
+
+        session.execute(
+            text(
+                """
+                UPDATE hh_ap_documents
+                SET document_type = :document_type,
+                    processing_status = 'parsed_invoice',
+                    raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": document["id"],
+                "document_type": parsed["document_type"],
+                "parser_json": json.dumps(
+                    {
+                        "parsed_as": parsed["document_type"],
+                        "parsed_invoice_number": parsed["invoice_number"],
+                        "parsed_invoice_type": parsed["invoice_type"],
+                    }
+                ),
+            },
+        )
+
+        return {
+            "entity_code": entity["entity_code"],
+            "document_id": str(document["id"]),
+            "invoice_id": str(invoice_row["id"]),
+            "invoice_number": parsed["invoice_number"],
+            "invoice_type": parsed["invoice_type"],
+            "invoice_date": str(parsed["invoice_date"]) if parsed["invoice_date"] else None,
+            "remittance_due_date": str(parsed["remittance_due_date"]) if parsed["remittance_due_date"] else None,
+            "subtotal": money_float(parsed["subtotal"]),
+            "hst_amount": money_float(parsed["hst_amount"]),
+            "surcharge_amount": money_float(parsed["surcharge_amount"]),
+            "advertising_amount": money_float(parsed["advertising_amount"]),
+            "subscribed_shares_amount": money_float(parsed["subscribed_shares_amount"]),
+            "five_year_note_amount": money_float(parsed["five_year_note_amount"]),
+            "total_amount": money_float(parsed["total_amount"]),
+            "vendor_name": parsed["vendor_name"],
+            "vendor_invoice_number": parsed["vendor_invoice_number"],
+            "raw_json": parsed["raw_json"],
+        }
+        
 
 @router.post("/match/run")
 def hh_ap_match_run(payload: HHAPMatchRunRequest):
