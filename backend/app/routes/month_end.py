@@ -23,6 +23,7 @@ class BuildCashBalancingJournalRequest(BaseModel):
     entity_code: str = Field(..., examples=["1877-8"])
     period_end: str = Field(..., examples=["2026-03-31"])
 
+
 class ManualMonthEndLineInput(BaseModel):
     account_code: str = Field(..., examples=["6699"])
     debit_amount: Decimal | None = Field(default=None, examples=[233.00])
@@ -442,6 +443,70 @@ def rebuild_journal_lines(session, journal_batch_id: str, lines: list[dict]):
         )
 
 
+def normalize_manual_month_end_lines(
+    lines: list[ManualMonthEndLineInput],
+    period_label: str,
+) -> tuple[list[dict], Decimal, Decimal]:
+    if not lines:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one manual month-end line is required",
+        )
+
+    normalized_lines: list[dict] = []
+    total_debits = Decimal("0.00")
+    total_credits = Decimal("0.00")
+
+    for idx, raw_line in enumerate(lines, start=1):
+        account_code = str(raw_line.account_code).strip()
+        if not account_code:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Line {idx} is missing account_code",
+            )
+
+        debit_amount = money(raw_line.debit_amount)
+        credit_amount = money(raw_line.credit_amount)
+
+        if debit_amount > Decimal("0.00") and credit_amount > Decimal("0.00"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Line {idx} cannot have both debit_amount and credit_amount",
+            )
+
+        if debit_amount == Decimal("0.00") and credit_amount == Decimal("0.00"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Line {idx} must have either debit_amount or credit_amount",
+            )
+
+        memo_text = (
+            str(raw_line.memo).strip()
+            if raw_line.memo and str(raw_line.memo).strip()
+            else f"Manual month-end {period_label}"
+        )
+
+        total_debits += debit_amount
+        total_credits += credit_amount
+
+        normalized_lines.append(
+            {
+                "line_number": idx,
+                "account_code": account_code,
+                "debit_amount": debit_amount,
+                "credit_amount": credit_amount,
+                "memo": memo_text,
+                "source_json": {
+                    "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
+                    "period_label": period_label,
+                    "user_source_json": raw_line.source_json or {},
+                },
+            }
+        )
+
+    return normalized_lines, total_debits, total_credits
+
+
 @router.post("/cash-balancing/build")
 def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalRequest):
     with db_session() as session:
@@ -637,6 +702,96 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
         }
 
 
+@router.post("/manual/build")
+def build_manual_month_end_journal(payload: BuildManualMonthEndJournalRequest):
+    with db_session() as session:
+        entity = get_entity(session, payload.entity_code)
+        period = get_accounting_period(session, entity["id"], payload.period_end)
+
+        batch_label = str(payload.batch_label).strip() or MANUAL_MONTH_END_BATCH_LABEL
+
+        journal_lines, total_debits, total_credits = normalize_manual_month_end_lines(
+            payload.lines,
+            period["period_label"],
+        )
+
+        balance_difference = total_debits - total_credits
+        is_balanced = balance_difference == Decimal("0.00")
+        batch_status = "draft" if is_balanced else "draft_unbalanced"
+
+        summary_json = {
+            "entity_code": entity["entity_code"],
+            "entity_name": entity.get("entity_name"),
+            "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
+            "batch_label": batch_label,
+            "period_label": period["period_label"],
+            "period_start": str(period["period_start"]),
+            "period_end": str(period["period_end"]),
+            "fiscal_year": period["fiscal_year"],
+            "fiscal_period_number": period["fiscal_period_number"],
+            "batch_memo": payload.batch_memo,
+            "journal_line_count": len(journal_lines),
+            "total_debits": money_float(total_debits),
+            "total_credits": money_float(total_credits),
+            "balance_difference": money_float(balance_difference),
+            "is_balanced": is_balanced,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        batch = upsert_journal_batch(
+            session=session,
+            entity_id=entity["id"],
+            accounting_period_id=period["id"],
+            source_module=MANUAL_MONTH_END_SOURCE_MODULE,
+            batch_label=batch_label,
+            status=batch_status,
+            total_debits=total_debits,
+            total_credits=total_credits,
+            summary_json=summary_json,
+        )
+
+        rebuild_journal_lines(
+            session=session,
+            journal_batch_id=batch["id"],
+            lines=journal_lines,
+        )
+
+        response_lines = [
+            {
+                "line_number": line["line_number"],
+                "account_code": line["account_code"],
+                "debit_amount": money_float(line["debit_amount"]),
+                "credit_amount": money_float(line["credit_amount"]),
+                "memo": line["memo"],
+                "source_json": line["source_json"],
+            }
+            for line in journal_lines
+        ]
+
+        return {
+            "entity_code": entity["entity_code"],
+            "accounting_period": {
+                "id": str(period["id"]),
+                "period_label": period["period_label"],
+                "period_start": str(period["period_start"]),
+                "period_end": str(period["period_end"]),
+                "fiscal_year": period["fiscal_year"],
+                "fiscal_period_number": period["fiscal_period_number"],
+            },
+            "journal_batch": {
+                "id": str(batch["id"]),
+                "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
+                "batch_label": batch_label,
+                "status": batch_status,
+                "total_debits": money_float(total_debits),
+                "total_credits": money_float(total_credits),
+                "balance_difference": money_float(balance_difference),
+                "is_balanced": is_balanced,
+            },
+            "journal_lines": response_lines,
+        }
+
+
 @router.get("/cash-balancing/review")
 def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
     with db_session() as session:
@@ -678,6 +833,112 @@ def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
             raise HTTPException(
                 status_code=404,
                 detail="No draft cash balancing journal batch found for this accounting period",
+            )
+
+        lines = session.execute(
+            text(
+                """
+                SELECT
+                    line_number,
+                    account_code,
+                    debit_amount,
+                    credit_amount,
+                    memo,
+                    source_json
+                FROM journal_lines
+                WHERE journal_batch_id = :journal_batch_id
+                ORDER BY line_number
+                """
+            ),
+            {"journal_batch_id": batch["id"]},
+        ).mappings().all()
+
+        total_debits = money(batch["total_debits"])
+        total_credits = money(batch["total_credits"])
+        balance_difference = total_debits - total_credits
+
+        return {
+            "entity_code": entity["entity_code"],
+            "accounting_period": {
+                "id": str(period["id"]),
+                "period_label": period["period_label"],
+                "period_start": str(period["period_start"]),
+                "period_end": str(period["period_end"]),
+                "fiscal_year": period["fiscal_year"],
+                "fiscal_period_number": period["fiscal_period_number"],
+            },
+            "journal_batch": {
+                "id": str(batch["id"]),
+                "source_module": batch["source_module"],
+                "batch_label": batch["batch_label"],
+                "status": batch["status"],
+                "total_debits": money_float(total_debits),
+                "total_credits": money_float(total_credits),
+                "balance_difference": money_float(balance_difference),
+                "is_balanced": balance_difference == Decimal("0.00"),
+                "summary_json": batch["summary_json"],
+                "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
+                "updated_at": batch["updated_at"].isoformat() if batch["updated_at"] else None,
+            },
+            "journal_lines": [
+                {
+                    "line_number": row["line_number"],
+                    "account_code": row["account_code"],
+                    "debit_amount": money_float(money(row["debit_amount"])),
+                    "credit_amount": money_float(money(row["credit_amount"])),
+                    "memo": row["memo"],
+                    "source_json": row["source_json"],
+                }
+                for row in lines
+            ],
+        }
+
+
+@router.get("/manual/review")
+def review_manual_month_end_journal(
+    entity_code: str,
+    period_end: str,
+    batch_label: str = MANUAL_MONTH_END_BATCH_LABEL,
+):
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        period = get_accounting_period(session, entity["id"], period_end)
+
+        batch = session.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    entity_id,
+                    accounting_period_id,
+                    source_module,
+                    batch_label,
+                    status,
+                    total_debits,
+                    total_credits,
+                    summary_json,
+                    created_at,
+                    updated_at
+                FROM journal_batches
+                WHERE entity_id = :entity_id
+                  AND accounting_period_id = :accounting_period_id
+                  AND source_module = :source_module
+                  AND batch_label = :batch_label
+                LIMIT 1
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "accounting_period_id": period["id"],
+                "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
+                "batch_label": batch_label,
+            },
+        ).mappings().first()
+
+        if not batch:
+            raise HTTPException(
+                status_code=404,
+                detail="No draft manual month-end journal batch found for this accounting period",
             )
 
         lines = session.execute(
