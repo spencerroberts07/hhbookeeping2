@@ -39,6 +39,19 @@ def normalize_invoice_number(value: str | None) -> str | None:
         return None
     return cleaned.upper()
 
+def normalize_optional_date_input(value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    try:
+        return date.fromisoformat(cleaned)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="document_date must be blank or in YYYY-MM-DD format",
+        )
+
 
 def build_source_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
@@ -214,6 +227,7 @@ async def hh_ap_upload_documents(
 ):
     with db_session() as session:
         entity = get_entity(session, entity_code)
+        normalized_document_date = normalize_optional_date_input(document_date)
 
         inserted_documents: list[dict] = []
         duplicate_documents: list[dict] = []
@@ -294,7 +308,7 @@ async def hh_ap_upload_documents(
                     "document_type": document_type,
                     "source_filename": upload.filename or "unknown",
                     "source_hash": source_hash,
-                    "document_date": document_date,
+                    "document_date": normalized_document_date,
                     "processing_status": processing_status,
                     "extracted_text": extracted_text,
                     "raw_json": json.dumps(
