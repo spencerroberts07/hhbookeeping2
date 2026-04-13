@@ -579,6 +579,8 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
             session=session,
             entity_id=entity["id"],
             accounting_period_id=period["id"],
+            source_module=CASH_BALANCING_SOURCE_MODULE,
+            batch_label=CASH_BALANCING_BATCH_LABEL,
             status=batch_status,
             total_debits=total_debits,
             total_credits=total_credits,
