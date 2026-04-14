@@ -1408,6 +1408,364 @@ async def hh_ap_upload_documents(
             "duplicate_documents": duplicate_documents,
         }
 
+@router.post("/invoices/upload-and-parse-batch")
+async def hh_ap_upload_and_parse_invoices_batch(
+    entity_code: str = Form(...),
+    document_date: str | None = Form(default=None),
+    files: list[UploadFile] = File(...),
+):
+    normalized_document_date = normalize_optional_date_input(document_date)
+
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+
+    invoice_document_types = [
+        "hh_invoice",
+        "hh_invoice_direct",
+        "hh_invoice_warehouse",
+        "hh_document",
+    ]
+
+    processed_files: list[dict[str, Any]] = []
+    failed_files: list[dict[str, Any]] = []
+
+    for upload in files:
+        filename = upload.filename or "unknown"
+
+        try:
+            file_bytes = await upload.read()
+
+            if not file_bytes:
+                failed_files.append(
+                    {
+                        "source_filename": filename,
+                        "error": "File was empty",
+                    }
+                )
+                continue
+
+            with db_session() as session:
+                entity = get_entity(session, entity_code)
+
+                source_hash = build_source_hash(file_bytes)
+                extracted_text = try_extract_text(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    content_type=upload.content_type,
+                )
+
+                existing_document = session.execute(
+                    text(
+                        """
+                        SELECT
+                            id,
+                            source_filename,
+                            document_type,
+                            extracted_text,
+                            file_size_bytes
+                        FROM hh_ap_documents
+                        WHERE entity_id = :entity_id
+                          AND source_hash = :source_hash
+                          AND document_type = ANY(:invoice_document_types)
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {
+                        "entity_id": entity["id"],
+                        "source_hash": source_hash,
+                        "invoice_document_types": invoice_document_types,
+                    },
+                ).mappings().first()
+
+                initial_processing_status = (
+                    "uploaded_text_ready" if extracted_text else "uploaded_pending_parse"
+                )
+
+                if existing_document:
+                    document_id = existing_document["id"]
+
+                    needs_upgrade = (
+                        existing_document.get("file_size_bytes") in (None, 0)
+                        or (
+                            extracted_text is not None
+                            and not existing_document.get("extracted_text")
+                        )
+                    )
+
+                    if needs_upgrade:
+                        session.execute(
+                            text(
+                                """
+                                UPDATE hh_ap_documents
+                                SET document_date = COALESCE(:document_date, document_date),
+                                    content_type = :content_type,
+                                    file_size_bytes = :file_size_bytes,
+                                    file_bytes = :file_bytes,
+                                    extracted_text = COALESCE(:extracted_text, extracted_text),
+                                    processing_status = :processing_status,
+                                    raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:raw_json AS jsonb),
+                                    updated_at = NOW()
+                                WHERE id = :id
+                                """
+                            ),
+                            {
+                                "id": document_id,
+                                "document_date": normalized_document_date,
+                                "content_type": upload.content_type,
+                                "file_size_bytes": len(file_bytes),
+                                "file_bytes": file_bytes,
+                                "extracted_text": extracted_text,
+                                "processing_status": initial_processing_status,
+                                "raw_json": json.dumps(
+                                    {
+                                        "content_type": upload.content_type,
+                                        "file_size_bytes": len(file_bytes),
+                                    }
+                                ),
+                            },
+                        )
+                else:
+                    inserted_document = session.execute(
+                        text(
+                            """
+                            INSERT INTO hh_ap_documents (
+                                entity_id,
+                                document_type,
+                                source_filename,
+                                source_hash,
+                                document_date,
+                                upload_source,
+                                processing_status,
+                                content_type,
+                                file_size_bytes,
+                                file_bytes,
+                                extracted_text,
+                                raw_json
+                            ) VALUES (
+                                :entity_id,
+                                'hh_invoice',
+                                :source_filename,
+                                :source_hash,
+                                :document_date,
+                                'manual_upload',
+                                :processing_status,
+                                :content_type,
+                                :file_size_bytes,
+                                :file_bytes,
+                                :extracted_text,
+                                CAST(:raw_json AS jsonb)
+                            )
+                            RETURNING id
+                            """
+                        ),
+                        {
+                            "entity_id": entity["id"],
+                            "source_filename": filename,
+                            "source_hash": source_hash,
+                            "document_date": normalized_document_date,
+                            "processing_status": initial_processing_status,
+                            "content_type": upload.content_type,
+                            "file_size_bytes": len(file_bytes),
+                            "file_bytes": file_bytes,
+                            "extracted_text": extracted_text,
+                            "raw_json": json.dumps(
+                                {
+                                    "content_type": upload.content_type,
+                                    "file_size_bytes": len(file_bytes),
+                                }
+                            ),
+                        },
+                    ).mappings().first()
+
+                    document_id = inserted_document["id"]
+
+                try:
+                    parsed = parse_hh_invoice_document(
+                        file_bytes=file_bytes,
+                        source_filename=filename,
+                    )
+
+                    invoice_row = session.execute(
+                        text(
+                            """
+                            INSERT INTO hh_ap_invoices (
+                                entity_id,
+                                document_id,
+                                invoice_number,
+                                invoice_type,
+                                vendor_name,
+                                vendor_invoice_number,
+                                po_number,
+                                invoice_date,
+                                due_date,
+                                remittance_due_date,
+                                currency_code,
+                                subtotal,
+                                hst_amount,
+                                surcharge_amount,
+                                advertising_amount,
+                                subscribed_shares_amount,
+                                five_year_note_amount,
+                                total_amount,
+                                match_status,
+                                is_statement_only,
+                                notes,
+                                raw_json
+                            ) VALUES (
+                                :entity_id,
+                                :document_id,
+                                :invoice_number,
+                                :invoice_type,
+                                :vendor_name,
+                                :vendor_invoice_number,
+                                :po_number,
+                                :invoice_date,
+                                :due_date,
+                                :remittance_due_date,
+                                :currency_code,
+                                :subtotal,
+                                :hst_amount,
+                                :surcharge_amount,
+                                :advertising_amount,
+                                :subscribed_shares_amount,
+                                :five_year_note_amount,
+                                :total_amount,
+                                'unmatched',
+                                :is_statement_only,
+                                :notes,
+                                CAST(:raw_json AS jsonb)
+                            )
+                            ON CONFLICT (entity_id, invoice_number, invoice_type)
+                            DO UPDATE SET
+                                document_id = EXCLUDED.document_id,
+                                vendor_name = EXCLUDED.vendor_name,
+                                vendor_invoice_number = EXCLUDED.vendor_invoice_number,
+                                po_number = EXCLUDED.po_number,
+                                invoice_date = EXCLUDED.invoice_date,
+                                due_date = EXCLUDED.due_date,
+                                remittance_due_date = EXCLUDED.remittance_due_date,
+                                currency_code = EXCLUDED.currency_code,
+                                subtotal = EXCLUDED.subtotal,
+                                hst_amount = EXCLUDED.hst_amount,
+                                surcharge_amount = EXCLUDED.surcharge_amount,
+                                advertising_amount = EXCLUDED.advertising_amount,
+                                subscribed_shares_amount = EXCLUDED.subscribed_shares_amount,
+                                five_year_note_amount = EXCLUDED.five_year_note_amount,
+                                total_amount = EXCLUDED.total_amount,
+                                is_statement_only = EXCLUDED.is_statement_only,
+                                notes = EXCLUDED.notes,
+                                raw_json = EXCLUDED.raw_json,
+                                updated_at = NOW()
+                            RETURNING id, invoice_number, invoice_type
+                            """
+                        ),
+                        {
+                            "entity_id": entity["id"],
+                            "document_id": document_id,
+                            "invoice_number": parsed["invoice_number"],
+                            "invoice_type": parsed["invoice_type"],
+                            "vendor_name": parsed["vendor_name"],
+                            "vendor_invoice_number": parsed["vendor_invoice_number"],
+                            "po_number": parsed["po_number"],
+                            "invoice_date": parsed["invoice_date"],
+                            "due_date": parsed["due_date"],
+                            "remittance_due_date": parsed["remittance_due_date"],
+                            "currency_code": parsed["currency_code"],
+                            "subtotal": parsed["subtotal"],
+                            "hst_amount": parsed["hst_amount"],
+                            "surcharge_amount": parsed["surcharge_amount"],
+                            "advertising_amount": parsed["advertising_amount"],
+                            "subscribed_shares_amount": parsed["subscribed_shares_amount"],
+                            "five_year_note_amount": parsed["five_year_note_amount"],
+                            "total_amount": parsed["total_amount"],
+                            "is_statement_only": parsed["is_statement_only"],
+                            "notes": parsed["notes"],
+                            "raw_json": json.dumps(parsed["raw_json"] or {}),
+                        },
+                    ).mappings().first()
+
+                    session.execute(
+                        text(
+                            """
+                            UPDATE hh_ap_documents
+                            SET processing_status = 'parsed_invoice',
+                                raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
+                                updated_at = NOW()
+                            WHERE id = :id
+                            """
+                        ),
+                        {
+                            "id": document_id,
+                            "parser_json": json.dumps(
+                                {
+                                    "parsed_as": parsed["document_type"],
+                                    "parsed_invoice_number": parsed["invoice_number"],
+                                    "parsed_invoice_type": parsed["invoice_type"],
+                                }
+                            ),
+                        },
+                    )
+
+                    processed_files.append(
+                        {
+                            "source_filename": filename,
+                            "document_id": str(document_id),
+                            "invoice_id": str(invoice_row["id"]),
+                            "invoice_number": invoice_row["invoice_number"],
+                            "invoice_type": invoice_row["invoice_type"],
+                            "status": "parsed",
+                        }
+                    )
+
+                except HTTPException as exc:
+                    session.execute(
+                        text(
+                            """
+                            UPDATE hh_ap_documents
+                            SET processing_status = 'parse_failed_invoice',
+                                raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
+                                updated_at = NOW()
+                            WHERE id = :id
+                            """
+                        ),
+                        {
+                            "id": document_id,
+                            "parser_json": json.dumps(
+                                {
+                                    "parse_failed_as": "invoice",
+                                    "parse_error": exc.detail,
+                                }
+                            ),
+                        },
+                    )
+
+                    failed_files.append(
+                        {
+                            "source_filename": filename,
+                            "document_id": str(document_id),
+                            "error": exc.detail,
+                        }
+                    )
+
+        except Exception as exc:
+            failed_files.append(
+                {
+                    "source_filename": filename,
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "entity_code": entity_code,
+        "file_count": len(files),
+        "parsed_count": len(processed_files),
+        "failed_count": len(failed_files),
+        "parsed_files": processed_files,
+        "failed_files": failed_files,
+    }
+
+
 @router.post("/invoices/upsert")
 def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
     if not payload.invoices:
