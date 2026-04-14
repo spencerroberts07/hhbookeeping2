@@ -2284,12 +2284,11 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             },
         ).mappings().first()
 
-        session.execute(
+              session.execute(
             text(
                 """
                 UPDATE hh_ap_documents
-                SET document_type = :document_type,
-                    processing_status = 'parsed_invoice',
+                SET processing_status = 'parsed_invoice',
                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -2297,7 +2296,6 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             ),
             {
                 "id": document["id"],
-                "document_type": parsed["document_type"],
                 "parser_json": json.dumps(
                     {
                         "parsed_as": parsed["document_type"],
@@ -2546,8 +2544,7 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
             text(
                 """
                 UPDATE hh_ap_documents
-                SET document_type = :document_type,
-                    processing_status = 'parsed_remittance',
+                SET processing_status = 'parsed_remittance',
                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -2555,7 +2552,6 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
             ),
             {
                 "id": document["id"],
-                "document_type": parsed["document_type"],
                 "parser_json": json.dumps(
                     {
                         "parsed_as": parsed["document_type"],
