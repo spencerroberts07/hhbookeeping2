@@ -2284,7 +2284,7 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             },
         ).mappings().first()
 
-              session.execute(
+        session.execute(
             text(
                 """
                 UPDATE hh_ap_documents
