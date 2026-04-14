@@ -804,6 +804,28 @@ def choose_remittance_filename_fallbacks(source_filename: str) -> dict[str, Any]
     }
 
 
+def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF parsing support is not installed. Add pypdf to backend dependencies and redeploy.",
+        ) from exc
+
+    reader = PdfReader(BytesIO(file_bytes))
+    page_texts: list[str] = []
+
+    for page in reader.pages:
+        try:
+            text_value = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:
+            text_value = page.extract_text() or ""
+        page_texts.append(text_value)
+
+    return page_texts
+    
+
 def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     pages = extract_pdf_pages_layout_text(file_bytes)
     full_text = "\n".join(pages)
