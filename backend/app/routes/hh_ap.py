@@ -723,18 +723,55 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
 
 
 def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    first_page_text = (extract_pdf_pages_text(file_bytes)[0] if extract_pdf_pages_text(file_bytes) else "")
+    pages = extract_pdf_pages_text(file_bytes)
+    first_page_text = pages[0] if pages else ""
+    first_page_upper = first_page_text.upper()
     source_name_upper = Path(source_filename).name.upper()
 
-    if "DIRECT INVOICE" in first_page_text.upper() or "INV0150E" in source_name_upper:
+    direct_filename_markers = (
+        "INV0120E",
+        "INV0150E",
+    )
+
+    warehouse_filename_markers = (
+        "INV0670R",
+    )
+
+    # Strong text clues first
+    if "DIRECT INVOICE" in first_page_upper:
         return parse_hh_direct_invoice_document(file_bytes, source_filename)
 
-    if "INV0670R" in source_name_upper or "PLEASE PAY THIS AMOUNT:" in first_page_text.upper():
+    if "PLEASE PAY THIS AMOUNT:" in first_page_upper:
         return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+
+    # Filename clues second
+    if any(marker in source_name_upper for marker in direct_filename_markers):
+        return parse_hh_direct_invoice_document(file_bytes, source_filename)
+
+    if any(marker in source_name_upper for marker in warehouse_filename_markers):
+        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+
+    # Fallback: try both parsers and keep the one that succeeds
+    direct_error = None
+    warehouse_error = None
+
+    try:
+        return parse_hh_direct_invoice_document(file_bytes, source_filename)
+    except HTTPException as exc:
+        direct_error = exc.detail
+
+    try:
+        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+    except HTTPException as exc:
+        warehouse_error = exc.detail
 
     raise HTTPException(
         status_code=400,
-        detail=f"Could not determine HH invoice type for document: {source_filename}",
+        detail=(
+            f"Could not determine HH invoice type for document: {source_filename}. "
+            f"Direct parser error: {direct_error}. "
+            f"Warehouse parser error: {warehouse_error}."
+        ),
     )
 
 
