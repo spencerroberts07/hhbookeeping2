@@ -805,166 +805,95 @@ def choose_remittance_filename_fallbacks(source_filename: str) -> dict[str, Any]
 
 
 def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    pages = extract_pdf_pages_text(file_bytes)
+    pages = extract_pdf_pages_layout_text(file_bytes)
     full_text = "\n".join(pages)
-    fallbacks = choose_remittance_filename_fallbacks(source_filename)
 
-    all_lines: list[str] = []
-    for page_text in pages:
-        all_lines.extend([line.rstrip() for line in page_text.splitlines()])
+    remittance_reference = Path(source_filename).stem
+    due_date = extract_due_date_from_remittance_text(full_text)
+    fallback_date = extract_filename_date_fallback(source_filename)
 
-    money_token_pattern = re.compile(r"-?[\d,]*\.?\d+(?:CR)?")
-    invoice_number_pattern = re.compile(r"\b\d{8}\b")
+    remittance_date = due_date or fallback_date
+    withdrawal_date = due_date or fallback_date
 
-    remittance_reference = fallbacks["remittance_reference"]
-    remittance_date = fallbacks["remittance_date"]
-    withdrawal_date = fallbacks["withdrawal_date"]
-    total_amount = None
-
-    for raw_line in all_lines:
-        line = normalize_text(raw_line)
-        if not line:
-            continue
-
-        upper_line = line.upper()
-
-        if remittance_date is None and any(
-            keyword in upper_line
-            for keyword in ("REMITTANCE DATE", "DATE OF REMITTANCE", "REMIT DATE")
-        ):
-            remittance_date = find_first_parsed_date_in_line(line) or remittance_date
-
-        if withdrawal_date is None and any(
-            keyword in upper_line
-            for keyword in ("WITHDRAWAL DATE", "PAYMENT DATE", "DEBIT DATE", "DUE DATE")
-        ):
-            withdrawal_date = find_first_parsed_date_in_line(line) or withdrawal_date
-
-        if total_amount is None and any(
-            keyword in upper_line
-            for keyword in ("PLEASE PAY", "TOTAL REMITTANCE", "TOTAL PAYMENT", "AMOUNT DUE", "TOTAL DUE")
-        ):
-            money_tokens = [
-                token for token in money_token_pattern.findall(line)
-                if "." in token or token.endswith("CR")
-            ]
-            if money_tokens:
-                total_amount = parse_hh_signed_money(money_tokens[-1])
+    pay_this_amount = find_money_after_label(full_text, "Pay This Amount")
+    total_purchases_due = find_money_after_label(full_text, "Total Purchases Due")
+    total_service_expense = find_money_after_label(full_text, "Total Service Expense")
 
     parsed_lines: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str | None, str | None, str]] = set()
+    seen_keys: set[tuple[str, str]] = set()
 
-    for raw_line in all_lines:
-        line = normalize_text(raw_line)
-        if not line:
-            continue
-
-        upper_line = line.upper()
-        if any(
-            skip_word in upper_line
-            for skip_word in (
-                "TOTAL REMITTANCE",
-                "PLEASE PAY",
-                "AMOUNT DUE",
-                "TOTAL DUE",
-                "OPENING BALANCE",
-                "BALANCE OWING",
-            )
-        ):
-            continue
-
-        invoice_numbers = invoice_number_pattern.findall(line)
-        money_tokens = [
-            token for token in money_token_pattern.findall(line)
-            if "." in token or token.endswith("CR")
-        ]
-
-        if not money_tokens:
-            continue
-
-        line_amount = parse_hh_signed_money(money_tokens[-1])
-        line_due_date = find_first_parsed_date_in_line(line)
-
-        if invoice_numbers:
-            invoice_number = invoice_numbers[0]
-            key = (
-                invoice_number,
-                line_due_date.isoformat() if line_due_date else None,
-                str(line_amount),
-            )
-            if key in seen_keys:
+    for page_text in pages:
+        for raw_line in page_text.splitlines():
+            line = normalize_text(raw_line)
+            if not line:
                 continue
-            seen_keys.add(key)
 
-            parsed_lines.append(
-                {
-                    "invoice_number": invoice_number,
-                    "line_description": line,
-                    "due_date": line_due_date,
-                    "line_amount": line_amount,
-                    "raw_json": {
-                        "source_filename": source_filename,
-                        "raw_line": line,
-                        "parser_version": "remittance_v1",
-                    },
-                }
-            )
-        else:
-            if any(
-                keyword in upper_line
-                for keyword in ("ADJUST", "SERVICE", "SURCHARGE", "ADVERT", "SHARE", "NOTE")
+            upper_line = line.upper()
+            if (
+                "INVOICE NUMBER" in upper_line
+                or "THE FOLLOWING ARE DUE ON" in upper_line
+                or "TOTAL SERVICE EXPENSE" in upper_line
+                or "PAY THIS AMOUNT" in upper_line
+                or "TOTAL PURCHASES DUE" in upper_line
             ):
+                continue
+
+            if not re.search(r"\d{8}", line):
+                continue
+
+            entries = parse_remittance_entries_from_layout_line(
+                line=line,
+                common_due_date=due_date or fallback_date,
+                source_filename=source_filename,
+            )
+
+            for entry in entries:
                 key = (
-                    None,
-                    line_due_date.isoformat() if line_due_date else None,
-                    f"{line}|{line_amount}",
+                    entry["invoice_number"],
+                    str(entry["line_amount"]),
                 )
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-
-                parsed_lines.append(
-                    {
-                        "invoice_number": None,
-                        "line_description": line,
-                        "due_date": line_due_date,
-                        "line_amount": line_amount,
-                        "raw_json": {
-                            "source_filename": source_filename,
-                            "raw_line": line,
-                            "parser_version": "remittance_v1",
-                            "non_invoice_line": True,
-                        },
-                    }
-                )
+                parsed_lines.append(entry)
 
     if not parsed_lines:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not parse any remittance lines from document: {source_filename}",
+            detail=f"Could not parse any remittance invoice lines from document: {source_filename}",
         )
 
-    if total_amount is None:
-        total_amount = sum((line["line_amount"] for line in parsed_lines), Decimal("0.00"))
+    detail_line_total = sum((line["line_amount"] for line in parsed_lines), Decimal("0.00"))
 
-    if remittance_date is None:
-        remittance_date = withdrawal_date
+    warnings: list[str] = []
+
+    if total_service_expense is not None and abs(detail_line_total - total_service_expense) > Decimal("0.05"):
+        warnings.append(
+            f"Parsed invoice line total {detail_line_total} does not tie to Total Service Expense {total_service_expense}"
+        )
+
+    # Bank tie amount should be the footer payment amount first, then purchases due, then detail subtotal fallback
+    bank_total_amount = pay_this_amount or total_purchases_due or detail_line_total
 
     return {
         "document_type": "hh_remittance",
         "remittance_reference": remittance_reference,
         "remittance_date": remittance_date,
         "withdrawal_date": withdrawal_date,
-        "total_amount": total_amount,
+        "total_amount": bank_total_amount,
         "line_count": len(parsed_lines),
         "lines": parsed_lines,
         "raw_json": {
-            "parser_version": "remittance_v1",
+            "parser_version": "remittance_v2",
             "source_filename": source_filename,
             "page_count": len(pages),
+            "pay_this_amount": money_float(pay_this_amount) if pay_this_amount is not None else None,
+            "total_purchases_due": money_float(total_purchases_due) if total_purchases_due is not None else None,
+            "total_service_expense": money_float(total_service_expense) if total_service_expense is not None else None,
+            "detail_line_total": money_float(detail_line_total),
+            "warnings": warnings,
         },
     }
-
 
 def build_source_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
