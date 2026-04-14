@@ -994,12 +994,20 @@ def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dic
 
     warnings: list[str] = []
 
-    if total_service_expense is not None and abs(detail_line_total - total_service_expense) > Decimal("0.05"):
+    if pay_this_amount is not None and abs(detail_line_total - pay_this_amount) <= Decimal("0.05"):
+        pass
+    elif total_purchases_due is not None and abs(detail_line_total - total_purchases_due) <= Decimal("0.05"):
+        pass
+    elif total_service_expense is not None and abs(detail_line_total - total_service_expense) <= Decimal("0.05"):
         warnings.append(
-            f"Parsed invoice line total {detail_line_total} does not tie to Total Service Expense {total_service_expense}"
+            "Parsed invoice line total ties to Total Service Expense, not the full remittance amount"
+        )
+    else:
+        warnings.append(
+            f"Parsed invoice line total {detail_line_total} does not tie to Pay This Amount "
+            f"{pay_this_amount} or Total Purchases Due {total_purchases_due}"
         )
 
-    # Bank tie amount should be the footer payment amount first, then purchases due, then detail subtotal fallback
     bank_total_amount = pay_this_amount or total_purchases_due or detail_line_total
 
     return {
