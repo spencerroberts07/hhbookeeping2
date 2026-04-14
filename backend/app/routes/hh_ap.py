@@ -824,7 +824,112 @@ def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
         page_texts.append(text_value)
 
     return page_texts
-    
+
+
+def extract_due_date_from_remittance_text(full_text: str) -> date | None:
+    lines = [normalize_text(line) for line in full_text.splitlines()]
+    lines = [line for line in lines if line]
+
+    for idx, line in enumerate(lines):
+        if "THE FOLLOWING ARE DUE ON" not in line.upper():
+            continue
+
+        candidates = [line] + lines[idx + 1 : idx + 3]
+
+        for candidate in candidates:
+            parsed = find_first_parsed_date_in_line(candidate)
+            if parsed:
+                return parsed
+
+        trailing = re.split(
+            r"THE FOLLOWING ARE DUE ON",
+            line,
+            flags=re.IGNORECASE,
+        )[-1].strip()
+        parsed = parse_hh_flexible_date(trailing)
+        if parsed:
+            return parsed
+
+    return None
+
+
+def extract_filename_date_fallback(source_filename: str) -> date | None:
+    fallbacks = choose_remittance_filename_fallbacks(source_filename)
+    return fallbacks["withdrawal_date"]
+
+
+def find_money_after_label(full_text: str, label: str) -> Decimal | None:
+    money_pattern = r"-?[\d,]+\.\d{2}(?:CR)?"
+
+    same_line_match = re.search(
+        rf"{re.escape(label)}\s*[:\-]?\s*({money_pattern})",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if same_line_match:
+        return parse_hh_signed_money(same_line_match.group(1))
+
+    lines = full_text.splitlines()
+    for idx, raw_line in enumerate(lines):
+        line = normalize_text(raw_line)
+        if not line or label.upper() not in line.upper():
+            continue
+
+        for look_ahead in range(idx, min(idx + 3, len(lines))):
+            candidate = normalize_text(lines[look_ahead])
+            if not candidate:
+                continue
+
+            match = re.search(money_pattern, candidate)
+            if match:
+                return parse_hh_signed_money(match.group(0))
+
+    return None
+
+
+def parse_remittance_entries_from_layout_line(
+    line: str,
+    common_due_date: date | None,
+    source_filename: str,
+) -> list[dict[str, Any]]:
+    cleaned = normalize_text(line)
+    if not cleaned:
+        return []
+
+    token_pattern = r"\b\d{8}\b|-?[\d,]+\.\d{2}(?:CR)?"
+    tokens = re.findall(token_pattern, cleaned)
+
+    entries: list[dict[str, Any]] = []
+    pending_invoice: str | None = None
+
+    for token in tokens:
+        if re.fullmatch(r"\d{8}", token):
+            pending_invoice = token
+            continue
+
+        if pending_invoice is None:
+            continue
+
+        amount = parse_hh_signed_money(token)
+
+        entries.append(
+            {
+                "invoice_number": pending_invoice,
+                "line_description": None,
+                "due_date": common_due_date,
+                "line_amount": amount,
+                "raw_json": {
+                    "parser_version": "remittance_v2",
+                    "source_filename": source_filename,
+                    "source_line": cleaned,
+                },
+            }
+        )
+
+        pending_invoice = None
+
+    return entries
+
 
 def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     pages = extract_pdf_pages_layout_text(file_bytes)
