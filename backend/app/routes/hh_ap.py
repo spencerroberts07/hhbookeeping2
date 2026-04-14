@@ -288,18 +288,29 @@ def parse_hh_signed_money(value: str | None) -> Decimal:
         return Decimal("0.00")
 
     cleaned = cleaned.replace(",", "").replace(" ", "")
-    is_credit = cleaned.endswith("CR")
-    if is_credit:
+
+    is_negative = False
+
+    if cleaned.endswith("CR"):
+        is_negative = True
         cleaned = cleaned[:-2]
+
+    if cleaned.endswith("-"):
+        is_negative = True
+        cleaned = cleaned[:-1]
+
+    if cleaned.startswith("-"):
+        is_negative = True
+        cleaned = cleaned[1:]
 
     if cleaned.startswith("."):
         cleaned = f"0{cleaned}"
 
-    if cleaned in {"", ".", "-.", "-0", "-0.00"}:
+    if cleaned in {"", ".", "0", "0.00"}:
         cleaned = "0.00"
 
     amount = Decimal(cleaned)
-    return -amount if is_credit else amount
+    return -amount if is_negative else amount
 
 
 def parse_hh_iso_word_date(value: str | None) -> date:
@@ -859,7 +870,7 @@ def extract_filename_date_fallback(source_filename: str) -> date | None:
 
 
 def find_money_after_label(full_text: str, label: str) -> Decimal | None:
-    money_pattern = r"-?[\d,]+\.\d{2}(?:CR)?"
+    money_pattern = r"-?[\d,]+\.\d{2}(?:CR|-)?"
 
     same_line_match = re.search(
         rf"{re.escape(label)}\s*[:\-]?\s*({money_pattern})",
@@ -896,7 +907,7 @@ def parse_remittance_entries_from_layout_line(
     if not cleaned:
         return []
 
-    token_pattern = r"\b\d{8}\b|-?[\d,]+\.\d{2}(?:CR)?"
+    token_pattern = r"\b\d{8}\b|-?[\d,]+\.\d{2}(?:CR|-)?"
     tokens = re.findall(token_pattern, cleaned)
 
     entries: list[dict[str, Any]] = []
