@@ -16,6 +16,10 @@ from ..db import db_session
 
 router = APIRouter(prefix="/api/hh-ap", tags=["hh-ap"])
 
+# =========================
+# Constants
+# =========================
+
 INVOICE_TYPE_VENDOR_DIRECT = "vendor_direct"
 INVOICE_TYPE_HH_DIRECT = "hh_direct"
 INVOICE_TYPE_WAREHOUSE = "warehouse"
@@ -25,6 +29,22 @@ DOCUMENT_TYPE_HH_INVOICE_DIRECT = "hh_invoice_direct"
 DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT = "hh_invoice_hh_direct"
 DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE = "hh_invoice_warehouse"
 DOCUMENT_TYPE_HH_DOCUMENT = "hh_document"
+DOCUMENT_TYPE_HH_STATEMENT = "hh_statement"
+DOCUMENT_TYPE_HH_REMITTANCE = "hh_remittance"
+
+PROCESSING_STATUS_UPLOADED_TEXT_READY = "uploaded_text_ready"
+PROCESSING_STATUS_UPLOADED_PENDING_PARSE = "uploaded_pending_parse"
+PROCESSING_STATUS_PARSED_INVOICE = "parsed_invoice"
+PROCESSING_STATUS_PARSED_STATEMENT = "parsed_statement"
+PROCESSING_STATUS_PARSED_REMITTANCE = "parsed_remittance"
+PROCESSING_STATUS_PARSE_FAILED_INVOICE = "parse_failed_invoice"
+
+MATCH_STATUS_MATCHED = "matched"
+MATCH_STATUS_UNMATCHED = "unmatched"
+MATCH_STATUS_MISSING_DOWNLOAD = "missing_download"
+MATCH_STATUS_STATEMENT_ONLY = "statement_only"
+
+DEFAULT_CURRENCY_CODE = "CAD"
 
 VENDOR_DIRECT_FILENAME_MARKERS = (
     "INV0120E",
@@ -42,6 +62,9 @@ WAREHOUSE_FILENAME_MARKERS = (
     "INV0670R",
 )
 
+MONEY_TOKEN_PATTERN = r"-?[\d,]*\.?\d+(?:CR|C|-)?"
+EIGHT_DIGIT_TOKEN_PATTERN = r"\b\d{8}\b"
+
 
 def get_allowed_invoice_document_types() -> list[str]:
     return [
@@ -53,7 +76,7 @@ def get_allowed_invoice_document_types() -> list[str]:
     ]
 
 
-def money(value) -> Decimal:
+def money(value: Any) -> Decimal:
     if value is None:
         return Decimal("0.00")
     return Decimal(str(value)).quantize(Decimal("0.01"))
@@ -72,250 +95,38 @@ def normalize_text(value: str | None) -> str | None:
     return cleaned or None
 
 
+def normalize_upper_space_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value).strip().upper()
+
+
 def normalize_invoice_number(value: str | None) -> str | None:
     cleaned = normalize_text(value)
     if not cleaned:
         return None
     return cleaned.upper()
 
+
 def normalize_optional_date_input(value: str | None) -> date | None:
     cleaned = normalize_text(value)
     if not cleaned:
         return None
-
     try:
         return date.fromisoformat(cleaned)
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail="document_date must be blank or in YYYY-MM-DD format",
-        )
+        ) from exc
+
 
 def parse_hh_money(value: str) -> Decimal:
     cleaned = normalize_text(value)
     if not cleaned:
         return Decimal("0.00")
-
     cleaned = cleaned.replace(",", "").replace(" ", "")
     return Decimal(cleaned)
-
-
-def parse_hh_short_date(value: str) -> date:
-    cleaned = normalize_text(value)
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="Missing statement date value")
-
-    try:
-        yy, mm, dd = cleaned.split("-")
-        return date(2000 + int(yy), int(mm), int(dd))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid HH short date format: {value}",
-        ) from exc
-        
-
-def extract_due_bucket_labels(summary_page_text: str) -> list[str]:
-    labels = re.findall(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
-        summary_page_text,
-    )
-
-    cleaned_labels: list[str] = []
-    for label in labels:
-        cleaned = re.sub(r"\s+", " ", label.strip())
-        if cleaned not in cleaned_labels:
-            cleaned_labels.append(cleaned)
-
-    return cleaned_labels
-    
-
-def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="PDF parsing support is not installed. Add pypdf to backend dependencies and redeploy.",
-        ) from exc
-
-    reader = PdfReader(BytesIO(file_bytes))
-    return [(page.extract_text() or "") for page in reader.pages]
-
-
-def parse_hh_statement_month_end(full_text: str) -> date:
-    match = re.search(r"\b(20\d{2})/(\d{2})\b", full_text)
-    if not match:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not find statement month in HH statement PDF",
-        )
-
-    year = int(match.group(1))
-    month = int(match.group(2))
-    last_day = monthrange(year, month)[1]
-    return date(year, month, last_day)
-
-
-def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
-    pages = extract_pdf_pages_text(file_bytes)
-    full_text = "\n".join(pages)
-    statement_month_end = parse_hh_statement_month_end(full_text)
-
-    inv_pattern = re.compile(r"^\d{8}$")
-    ts_pattern = re.compile(r"^\d+$")
-    money_pattern = re.compile(r"^-?\s?[\d,]+\.\d{2}$")
-    short_date_pattern = re.compile(r"^\d{2}-\d{2}-\d{2}$")
-
-    detail_lines: list[dict[str, Any]] = []
-
-    for page_text in pages:
-        if "Summary Page" in page_text:
-            continue
-
-        lines = [line.rstrip() for line in page_text.splitlines()]
-        footer_idx = next(
-            (i for i, line in enumerate(lines) if "Inv Nbr T/S Invoice Amount" in line),
-            len(lines),
-        )
-        data_lines = lines[:footer_idx]
-
-        i = 0
-
-        invoice_numbers: list[str] = []
-        while i < len(data_lines) and inv_pattern.match(data_lines[i].strip()):
-            invoice_numbers.append(data_lines[i].strip())
-            i += 1
-
-        ts_codes: list[str] = []
-        while i < len(data_lines) and ts_pattern.match(data_lines[i].strip()):
-            ts_codes.append(data_lines[i].strip())
-            i += 1
-
-        invoice_amounts: list[Decimal] = []
-        while i < len(data_lines) and money_pattern.match(data_lines[i].strip()):
-            invoice_amounts.append(parse_hh_money(data_lines[i]))
-            i += 1
-
-        date_tokens: list[str] = []
-        while i < len(data_lines) and short_date_pattern.match(data_lines[i].strip()):
-            date_tokens.append(data_lines[i].strip())
-            i += 1
-
-        row_count = len(invoice_numbers)
-        invoice_dates = date_tokens[:row_count]
-        due_dates = date_tokens[row_count : row_count * 2]
-
-        usable_count = min(
-            len(invoice_numbers),
-            len(ts_codes),
-            len(invoice_amounts),
-            len(invoice_dates),
-            len(due_dates),
-        )
-
-        for idx in range(usable_count):
-            amount = invoice_amounts[idx]
-
-            detail_lines.append(
-                {
-                    "invoice_number": invoice_numbers[idx],
-                    "invoice_type": None,
-                    "invoice_date": parse_hh_short_date(invoice_dates[idx]),
-                    "due_date": parse_hh_short_date(due_dates[idx]),
-                    "invoice_amount": amount,
-                    "open_amount": amount,
-                    "current_amount": None,
-                    "past_due_amount": None,
-                    "raw_json": {
-                        "statement_ts_code": ts_codes[idx],
-                    },
-                }
-            )
-
-    summary_balances: dict[str, Any] = {}
-    due_bucket_totals: dict[str, float] = {}
-    summary_components: dict[str, Any] = {}
-
-    summary_page_1 = next(
-        (
-            page_text
-            for page_text in pages
-            if "Opening Balance" in page_text and "Balance Owing" in page_text
-        ),
-        "",
-    )
-
-    if summary_page_1:
-        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_1)]
-        bucket_labels = extract_due_bucket_labels(summary_page_1)
-
-        if len(amounts) >= 5:
-            summary_balances = {
-                "opening_balance": float(amounts[0]),
-                "total_adjustments": float(amounts[1]),
-                "total_purchases_this_month": float(amounts[2]),
-                "total_payments_this_month": float(amounts[3]),
-                "balance_owing": float(amounts[4]),
-            }
-
-            bucket_amounts = amounts[5 : 5 + len(bucket_labels)]
-
-            for idx, label in enumerate(bucket_labels):
-                if idx < len(bucket_amounts):
-                    due_bucket_totals[label] = float(bucket_amounts[idx])
-
-    summary_page_2 = next(
-        (
-            page_text
-            for page_text in pages
-            if "This Month" in page_text and "Total Purchases" in page_text
-        ),
-        "",
-    )
-
-    if summary_page_2:
-        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_2)]
-
-        metric_labels = [
-            "GST/HST",
-            "Enviro Amount",
-            "Special Shares - Subscribed For",
-            "Five Yr Notes - Subscribed For",
-            "Service [D. C. Freight]",
-            "Total Surcharges",
-            "Advertising",
-            "Warehouse",
-            "Direct",
-            "Disc and Promo",
-            "Building Supply",
-            "Service [T/S 7 Expense]",
-            "Red Sur Prom",
-            "Total Purchases",
-        ]
-
-        if len(amounts) >= len(metric_labels) * 4:
-            for idx, label in enumerate(metric_labels):
-                summary_components[label] = {
-                    "this_month": float(amounts[idx]),
-                    "same_month_last_year": float(amounts[idx + 14]),
-                    "this_year_to_date": float(amounts[idx + 28]),
-                    "last_year_to_date": float(amounts[idx + 42]),
-                }
-
-    total_open_balance = summary_balances.get("balance_owing")
-    if total_open_balance is None:
-        total_open_balance = float(sum(line["open_amount"] for line in detail_lines))
-
-    return {
-        "statement_month_end": statement_month_end,
-        "total_open_balance": total_open_balance,
-        "statement_line_count": len(detail_lines),
-        "summary_balances": summary_balances,
-        "due_bucket_totals": due_bucket_totals,
-        "summary_components": summary_components,
-        "lines": detail_lines,
-    }
 
 
 def parse_hh_signed_money(value: str | None) -> Decimal:
@@ -360,861 +171,8 @@ def parse_hh_signed_money(value: str | None) -> Decimal:
     return -amount if is_negative else amount
 
 
-def parse_hh_iso_word_date(value: str | None) -> date:
-    cleaned = normalize_text(value)
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="Missing HH invoice date value")
-
-    for fmt in ("%Y-%b-%d", "%Y-%B-%d"):
-        try:
-            return datetime.strptime(cleaned, fmt).date()
-        except ValueError:
-            continue
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"Invalid HH invoice date format: {value}",
-    )
-
-
-def parse_hh_mmddyyyy(value: str | None) -> date | None:
-    cleaned = normalize_text(value)
-    if not cleaned:
-        return None
-
-    try:
-        return datetime.strptime(cleaned, "%m%d%Y").date()
-    except ValueError:
-        return None
-
-
-def extract_filename_8digit_tokens(source_filename: str) -> list[str]:
-    return re.findall(r"(\d{8})", Path(source_filename).name)
-
-
-def choose_invoice_filename_fallbacks(source_filename: str) -> dict[str, Any]:
-    tokens = extract_filename_8digit_tokens(source_filename)
-
-    invoice_date = parse_hh_mmddyyyy(tokens[0]) if len(tokens) >= 1 else None
-    invoice_number = tokens[-2] if len(tokens) >= 2 else None
-    remittance_due_date = parse_hh_mmddyyyy(tokens[-1]) if len(tokens) >= 3 else None
-
-    return {
-        "invoice_date": invoice_date,
-        "invoice_number": invoice_number,
-        "remittance_due_date": remittance_due_date,
-    }
-
-
-def normalize_upper_space_text(value: str | None) -> str:
-    if not value:
-        return ""
-    return re.sub(r"\s+", " ", value).strip().upper()
-
-
-def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> list[str]:
-    standard_pages = extract_pdf_pages_text(file_bytes)
-    layout_pages = extract_pdf_pages_layout_text(file_bytes)
-
-    page_count = max(len(standard_pages), len(layout_pages))
-    merged_pages: list[str] = []
-
-    for idx in range(page_count):
-        standard_text = standard_pages[idx] if idx < len(standard_pages) else ""
-        layout_text = layout_pages[idx] if idx < len(layout_pages) else ""
-
-        chosen = layout_text if len(layout_text.strip()) >= len(standard_text.strip()) else standard_text
-        merged_pages.append(chosen or layout_text or standard_text or "")
-
-    return merged_pages
-
-
-def find_first_page_lines(file_bytes: bytes) -> list[str]:
-    pages = extract_pdf_pages_best_effort_text(file_bytes)
-    if not pages or not any(normalize_text(page) for page in pages):
-        raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
-    return [line.rstrip() for line in pages[0].splitlines()]
-
-
-def extract_money_tokens(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return re.findall(r"-?[\d,]*\.?\d+(?:CR|C|-)?", value, flags=re.IGNORECASE)
-
-
-def extract_invoice_meta_from_text(full_text: str, source_filename: str) -> tuple[date | None, str | None]:
-    fallbacks = choose_invoice_filename_fallbacks(source_filename)
-
-    invoice_meta_match = re.search(
-        r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b",
-        full_text,
-    )
-
-    invoice_date = (
-        parse_hh_iso_word_date(invoice_meta_match.group(1))
-        if invoice_meta_match
-        else fallbacks["invoice_date"]
-    )
-    invoice_number = (
-        invoice_meta_match.group(2)
-        if invoice_meta_match
-        else fallbacks["invoice_number"]
-    )
-
-    return invoice_date, invoice_number
-
-
-def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | None, Decimal | None]:
-    cleaned_lines = [normalize_text(line) for line in lines]
-    cleaned_lines = [line for line in cleaned_lines if line]
-
-    for idx in range(len(cleaned_lines)):
-        window_lines = cleaned_lines[idx : idx + 6]
-        if not window_lines:
-            continue
-
-        window_text = " ".join(window_lines)
-        upper_window = window_text.upper()
-
-        if (
-            "REMITTANCE DUE" not in upper_window
-            and "PLEASE APPLY THIS AMOUNT TO YOUR" not in upper_window
-        ):
-            continue
-
-        due_date = find_first_parsed_date_in_line(window_text)
-
-        money_tokens = extract_money_tokens(window_text)
-        total_amount = parse_hh_signed_money(money_tokens[-1]) if money_tokens else None
-
-        return due_date, total_amount
-
-    return None, None
-
-
-def extract_terms_summary_amounts(lines: list[str]) -> tuple[Decimal, Decimal, Decimal]:
-    for raw_line in reversed(lines):
-        cleaned = normalize_text(raw_line)
-        if not cleaned:
-            continue
-
-        upper_cleaned = cleaned.upper()
-        if "SUB TOTAL" in upper_cleaned or "GST/HST" in upper_cleaned:
-            continue
-
-        money_tokens = extract_money_tokens(cleaned)
-        if len(money_tokens) >= 3 and re.match(r"^\d{2}\b", cleaned):
-            subtotal = parse_hh_signed_money(money_tokens[0])
-            hst_amount = parse_hh_signed_money(money_tokens[1])
-            pst_amount = parse_hh_signed_money(money_tokens[2])
-            return subtotal, hst_amount, pst_amount
-
-    return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
-
-
-def extract_component_totals_tokens(
-    lines: list[str],
-    source_filename: str,
-    parser_label: str,
-) -> list[str]:
-    candidates: list[list[str]] = []
-
-    for raw_line in lines:
-        cleaned = normalize_text(raw_line)
-        if not cleaned:
-            continue
-
-        upper_cleaned = cleaned.upper()
-        if "LESS" in upper_cleaned:
-            continue
-        if "---" in cleaned:
-            continue
-        if "PLEASE APPLY THIS AMOUNT TO YOUR" in upper_cleaned:
-            continue
-
-        money_tokens = [
-            token
-            for token in extract_money_tokens(cleaned)
-            if "." in token or token.upper().endswith("CR") or token.upper().endswith("C")
-        ]
-
-        if len(money_tokens) >= 8:
-            candidates.append(money_tokens[-8:])
-
-    if not candidates:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not find component totals line in {parser_label} invoice PDF: {source_filename}",
-        )
-
-    return candidates[-1]
-
-
-def extract_labeled_money_from_lines(lines: list[str], label: str) -> Decimal:
-    upper_label = label.upper()
-
-    for idx, raw_line in enumerate(lines):
-        cleaned = normalize_text(raw_line)
-        if not cleaned:
-            continue
-
-        if upper_label not in cleaned.upper():
-            continue
-
-        same_line_tokens = extract_money_tokens(cleaned)
-        if same_line_tokens:
-            return parse_hh_signed_money(same_line_tokens[-1])
-
-        for look_ahead in range(idx + 1, min(idx + 3, len(lines))):
-            next_line = normalize_text(lines[look_ahead])
-            if not next_line:
-                continue
-
-            next_tokens = extract_money_tokens(next_line)
-            if next_tokens:
-                return parse_hh_signed_money(next_tokens[0])
-
-    return Decimal("0.00")
-
-
-def extract_vendor_direct_metadata(lines: list[str]) -> dict[str, Any]:
-    vendor_name = None
-    vendor_invoice_number = None
-    vendor_invoice_date = None
-
-    for idx, raw_line in enumerate(lines):
-        cleaned = normalize_text(raw_line)
-        if not cleaned:
-            continue
-
-        upper_cleaned = cleaned.upper()
-        if "INVOICE DT:" not in upper_cleaned or "INVOICE NBR:" not in upper_cleaned:
-            continue
-
-        match = re.search(
-            r"Invoice Dt:\s*(20\d{2}-[A-Za-z]{3}-\d{2})\s+Invoice Nbr:\s*(\S+)",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            vendor_invoice_date = parse_hh_iso_word_date(match.group(1))
-            vendor_invoice_number = match.group(2)
-
-        for prev_idx in range(idx - 1, -1, -1):
-            prev_line = normalize_text(lines[prev_idx])
-            if prev_line:
-                vendor_name = prev_line
-                break
-
-        break
-
-    return {
-        "vendor_name": vendor_name,
-        "vendor_invoice_number": vendor_invoice_number,
-        "vendor_invoice_date": vendor_invoice_date,
-    }
-
-
-def detect_hh_invoice_family(file_bytes: bytes, source_filename: str) -> str:
-    pages = extract_pdf_pages_best_effort_text(file_bytes)
-    full_text_upper = normalize_upper_space_text("\n".join(pages))
-    source_name_upper = Path(source_filename).name.upper()
-
-    if (
-        "PLEASE PAY THIS AMOUNT:" in full_text_upper
-        or any(marker in source_name_upper for marker in WAREHOUSE_FILENAME_MARKERS)
-    ):
-        return INVOICE_TYPE_WAREHOUSE
-
-    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
-        return INVOICE_TYPE_VENDOR_DIRECT
-
-    if any(marker in source_name_upper for marker in HH_DIRECT_FILENAME_MARKERS):
-        return INVOICE_TYPE_HH_DIRECT
-
-    if "E DIRECT INVOICE" in full_text_upper:
-        return INVOICE_TYPE_VENDOR_DIRECT
-
-    if (
-        "DIRECT INVOICE" in full_text_upper
-        and "INVOICE DT:" in full_text_upper
-        and "INVOICE NBR:" in full_text_upper
-    ):
-        return INVOICE_TYPE_VENDOR_DIRECT
-
-    if "DIRECT INVOICE" in full_text_upper:
-        return INVOICE_TYPE_HH_DIRECT
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"Could not determine HH invoice family for document: {source_filename}",
-    )
-
-
-def find_pure_money_line_after(lines: list[str], start_index: int) -> str | None:
-    for idx in range(start_index + 1, len(lines)):
-        cleaned = normalize_text(lines[idx])
-        if cleaned and re.fullmatch(r"[\d,]*\.?\d+(?:CR)?", cleaned):
-            return cleaned
-    return None
-
-
-def parse_hh_direct_family_invoice_document(
-    file_bytes: bytes,
-    source_filename: str,
-    invoice_type: str,
-    document_type: str,
-) -> dict[str, Any]:
-    lines = find_first_page_lines(file_bytes)
-    full_text = "\n".join(lines)
-
-    invoice_date, invoice_number = extract_invoice_meta_from_text(
-        full_text=full_text,
-        source_filename=source_filename,
-    )
-
-    remittance_due_date, total_amount = extract_invoice_remittance_due_and_total(lines)
-
-    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(lines)
-
-    component_tokens = extract_component_totals_tokens(
-        lines=lines,
-        source_filename=source_filename,
-        parser_label="direct-family",
-    )
-
-    c_list_total = parse_hh_signed_money(component_tokens[0])
-    discount_amount = parse_hh_signed_money(component_tokens[1])
-    promo_discount_amount = parse_hh_signed_money(component_tokens[2])
-    surcharge_amount = parse_hh_signed_money(component_tokens[3])
-    subscribed_shares_amount = parse_hh_signed_money(component_tokens[4])
-    five_year_note_amount = parse_hh_signed_money(component_tokens[5])
-    advertising_amount = parse_hh_signed_money(component_tokens[6])
-    pre_tax_total = parse_hh_signed_money(component_tokens[7])
-
-    service_charges = extract_labeled_money_from_lines(lines, "Service Charges")
-    enviro_fee_amount = extract_labeled_money_from_lines(lines, "Enviro Fee Amount")
-
-    vendor_name = None
-    vendor_invoice_number = None
-    vendor_invoice_date = None
-
-    if invoice_type == INVOICE_TYPE_VENDOR_DIRECT:
-        vendor_meta = extract_vendor_direct_metadata(lines)
-        vendor_name = vendor_meta["vendor_name"]
-        vendor_invoice_number = vendor_meta["vendor_invoice_number"]
-        vendor_invoice_date = vendor_meta["vendor_invoice_date"]
-    else:
-        vendor_name = "Home Hardware Stores Limited"
-
-    if total_amount is None:
-        total_amount = subtotal + hst_amount + pst_amount
-
-    if not invoice_number or not invoice_date:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not determine invoice number/date for direct-family invoice: {source_filename}",
-        )
-
-    return {
-        "document_type": document_type,
-        "invoice_type": invoice_type,
-        "invoice_number": invoice_number,
-        "vendor_name": vendor_name,
-        "vendor_invoice_number": vendor_invoice_number,
-        "po_number": None,
-        "invoice_date": invoice_date,
-        "due_date": remittance_due_date,
-        "remittance_due_date": remittance_due_date,
-        "currency_code": "CAD",
-        "subtotal": subtotal,
-        "hst_amount": hst_amount,
-        "surcharge_amount": surcharge_amount,
-        "advertising_amount": advertising_amount,
-        "subscribed_shares_amount": subscribed_shares_amount,
-        "five_year_note_amount": five_year_note_amount,
-        "total_amount": total_amount,
-        "is_statement_only": False,
-        "notes": None,
-        "raw_json": {
-            "parser_version": "invoice_v2",
-            "invoice_source_type": invoice_type,
-            "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
-            "pst_amount": money_float(pst_amount),
-            "c_list_total": money_float(c_list_total),
-            "discount_amount": money_float(discount_amount),
-            "promo_discount_amount": money_float(promo_discount_amount),
-            "pre_tax_total": money_float(pre_tax_total),
-            "service_charges": money_float(service_charges),
-            "enviro_fee_amount": money_float(enviro_fee_amount),
-            "source_filename": source_filename,
-        },
-    }
-
-
-def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    return parse_hh_direct_family_invoice_document(
-        file_bytes=file_bytes,
-        source_filename=source_filename,
-        invoice_type=INVOICE_TYPE_VENDOR_DIRECT,
-        document_type=DOCUMENT_TYPE_HH_INVOICE_DIRECT,
-    )
-
-
-def parse_hh_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    return parse_hh_direct_family_invoice_document(
-        file_bytes=file_bytes,
-        source_filename=source_filename,
-        invoice_type=INVOICE_TYPE_HH_DIRECT,
-        document_type=DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT,
-    )
-
-
-def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    lines = find_first_page_lines(file_bytes)
-    full_text = "\n".join(lines)
-    fallbacks = choose_invoice_filename_fallbacks(source_filename)
-
-    due_total_line = next(
-        (
-            normalize_text(line)
-            for line in lines
-            if re.fullmatch(
-                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?",
-                normalize_text(line) or "",
-            )
-        ),
-        None,
-    )
-    due_total_match = re.match(
-        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)",
-        due_total_line or "",
-    )
-
-    remittance_due_date = (
-        parse_hh_iso_word_date(due_total_match.group(1))
-        if due_total_match
-        else fallbacks["remittance_due_date"]
-    )
-    total_amount = (
-        parse_hh_signed_money(due_total_match.group(2))
-        if due_total_match
-        else None
-    )
-
-    invoice_date, invoice_number = extract_invoice_meta_from_text(
-        full_text=full_text,
-        source_filename=source_filename,
-    )
-
-    component_tokens = extract_component_totals_tokens(
-        lines=lines,
-        source_filename=source_filename,
-        parser_label="warehouse",
-    )
-
-    c_list_total = parse_hh_signed_money(component_tokens[0])
-    discount_amount = parse_hh_signed_money(component_tokens[1])
-    promo_discount_amount = parse_hh_signed_money(component_tokens[2])
-    surcharge_amount = parse_hh_signed_money(component_tokens[3])
-    subscribed_shares_amount = parse_hh_signed_money(component_tokens[4])
-    five_year_note_amount = parse_hh_signed_money(component_tokens[5])
-    advertising_amount = parse_hh_signed_money(component_tokens[6])
-    pre_service_pre_tax_total = parse_hh_signed_money(component_tokens[7])
-
-    service_charges = extract_labeled_money_from_lines(lines, "Service Charges")
-    enviro_fee_amount = extract_labeled_money_from_lines(lines, "Enviro Fee Amount")
-
-    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(lines)
-
-    if total_amount is None:
-        total_amount = subtotal + hst_amount + pst_amount
-
-    if not invoice_number or not invoice_date:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not determine invoice number/date for warehouse invoice: {source_filename}",
-        )
-
-    return {
-        "document_type": DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
-        "invoice_type": INVOICE_TYPE_WAREHOUSE,
-        "invoice_number": invoice_number,
-        "vendor_name": "Home Hardware Stores Limited",
-        "vendor_invoice_number": None,
-        "po_number": None,
-        "invoice_date": invoice_date,
-        "due_date": remittance_due_date,
-        "remittance_due_date": remittance_due_date,
-        "currency_code": "CAD",
-        "subtotal": subtotal,
-        "hst_amount": hst_amount,
-        "surcharge_amount": surcharge_amount,
-        "advertising_amount": advertising_amount,
-        "subscribed_shares_amount": subscribed_shares_amount,
-        "five_year_note_amount": five_year_note_amount,
-        "total_amount": total_amount,
-        "is_statement_only": False,
-        "notes": None,
-        "raw_json": {
-            "parser_version": "invoice_v2",
-            "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
-            "pst_amount": money_float(pst_amount),
-            "c_list_total": money_float(c_list_total),
-            "discount_amount": money_float(discount_amount),
-            "promo_discount_amount": money_float(promo_discount_amount),
-            "pre_service_pre_tax_total": money_float(pre_service_pre_tax_total),
-            "service_charges": money_float(service_charges),
-            "enviro_fee_amount": money_float(enviro_fee_amount),
-            "source_filename": source_filename,
-        },
-    }
-
-def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    invoice_family = detect_hh_invoice_family(
-        file_bytes=file_bytes,
-        source_filename=source_filename,
-    )
-
-    if invoice_family == INVOICE_TYPE_WAREHOUSE:
-        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
-
-    if invoice_family == INVOICE_TYPE_VENDOR_DIRECT:
-        return parse_hh_direct_invoice_document(file_bytes, source_filename)
-
-    if invoice_family == INVOICE_TYPE_HH_DIRECT:
-        return parse_hh_hh_direct_invoice_document(file_bytes, source_filename)
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"Unsupported HH invoice family for document: {source_filename}",
-    )
-
-def parse_hh_flexible_date(value: str | None) -> date | None:
-    cleaned = normalize_text(value)
-    if not cleaned:
-        return None
-
-    normalized = re.sub(r"\s+", " ", cleaned.replace(" ,", ",")).strip()
-
-    for fmt in (
-        "%Y-%b-%d",
-        "%Y-%B-%d",
-        "%b. %d,%Y",
-        "%b. %d, %Y",
-        "%b %d, %Y",
-        "%B %d, %Y",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%m%d%Y",
-    ):
-        try:
-            return datetime.strptime(normalized, fmt).date()
-        except ValueError:
-            continue
-
-    if re.fullmatch(r"\d{2}-\d{2}-\d{2}", normalized):
-        return parse_hh_short_date(normalized)
-
-    return None
-
-
-def extract_date_tokens_from_line(line: str) -> list[str]:
-    patterns = [
-        r"\b20\d{2}-[A-Za-z]{3}-\d{2}\b",
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
-        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{2},\s*\d{4}\b",
-        r"\b\d{2}-\d{2}-\d{2}\b",
-        r"\b\d{8}\b",
-        r"\b\d{2}/\d{2}/\d{4}\b",
-        r"\b\d{2}/\d{2}/\d{2}\b",
-    ]
-
-    tokens: list[str] = []
-    for pattern in patterns:
-        tokens.extend(re.findall(pattern, line))
-
-    unique_tokens: list[str] = []
-    for token in tokens:
-        if token not in unique_tokens:
-            unique_tokens.append(token)
-
-    return unique_tokens
-
-
-def find_first_parsed_date_in_line(line: str) -> date | None:
-    for token in extract_date_tokens_from_line(line):
-        parsed = parse_hh_flexible_date(token)
-        if parsed:
-            return parsed
-    return None
-
-
-def choose_remittance_filename_fallbacks(source_filename: str) -> dict[str, Any]:
-    tokens = extract_filename_8digit_tokens(source_filename)
-
-    likely_date = None
-    for token in reversed(tokens):
-        parsed = parse_hh_mmddyyyy(token)
-        if parsed:
-            likely_date = parsed
-            break
-
-    return {
-        "remittance_reference": Path(source_filename).stem,
-        "remittance_date": likely_date,
-        "withdrawal_date": likely_date,
-    }
-
-
-def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="PDF parsing support is not installed. Add pypdf to backend dependencies and redeploy.",
-        ) from exc
-
-    reader = PdfReader(BytesIO(file_bytes))
-    page_texts: list[str] = []
-
-    for page in reader.pages:
-        try:
-            text_value = page.extract_text(extraction_mode="layout") or ""
-        except TypeError:
-            text_value = page.extract_text() or ""
-        page_texts.append(text_value)
-
-    return page_texts
-
-
-def extract_due_date_from_remittance_text(full_text: str) -> date | None:
-    lines = [normalize_text(line) for line in full_text.splitlines()]
-    lines = [line for line in lines if line]
-
-    for idx, line in enumerate(lines):
-        if "THE FOLLOWING ARE DUE ON" not in line.upper():
-            continue
-
-        candidates = [line] + lines[idx + 1 : idx + 3]
-
-        for candidate in candidates:
-            parsed = find_first_parsed_date_in_line(candidate)
-            if parsed:
-                return parsed
-
-        trailing = re.split(
-            r"THE FOLLOWING ARE DUE ON",
-            line,
-            flags=re.IGNORECASE,
-        )[-1].strip()
-        parsed = parse_hh_flexible_date(trailing)
-        if parsed:
-            return parsed
-
-    return None
-
-
-def extract_filename_date_fallback(source_filename: str) -> date | None:
-    fallbacks = choose_remittance_filename_fallbacks(source_filename)
-    return fallbacks["withdrawal_date"]
-
-
-def find_money_after_label(full_text: str, label: str) -> Decimal | None:
-    money_pattern = r"-?[\d,]+\.\d{2}(?:CR|-)?"
-
-    same_line_match = re.search(
-        rf"{re.escape(label)}\s*[:\-]?\s*({money_pattern})",
-        full_text,
-        flags=re.IGNORECASE,
-    )
-    if same_line_match:
-        return parse_hh_signed_money(same_line_match.group(1))
-
-    lines = full_text.splitlines()
-    for idx, raw_line in enumerate(lines):
-        line = normalize_text(raw_line)
-        if not line or label.upper() not in line.upper():
-            continue
-
-        for look_ahead in range(idx, min(idx + 3, len(lines))):
-            candidate = normalize_text(lines[look_ahead])
-            if not candidate:
-                continue
-
-            match = re.search(money_pattern, candidate)
-            if match:
-                return parse_hh_signed_money(match.group(0))
-
-    return None
-
-
-def parse_remittance_entries_from_layout_line(
-    line: str,
-    common_due_date: date | None,
-    source_filename: str,
-) -> list[dict[str, Any]]:
-    cleaned = normalize_text(line)
-    if not cleaned:
-        return []
-
-    token_pattern = r"\b\d{8}\b|-?[\d,]+\.\d{2}(?:CR|-)?"
-    tokens = re.findall(token_pattern, cleaned)
-
-    entries: list[dict[str, Any]] = []
-    pending_invoice: str | None = None
-
-    for token in tokens:
-        if re.fullmatch(r"\d{8}", token):
-            pending_invoice = token
-            continue
-
-        if pending_invoice is None:
-            continue
-
-        amount = parse_hh_signed_money(token)
-
-        entries.append(
-            {
-                "invoice_number": pending_invoice,
-                "line_description": None,
-                "due_date": common_due_date,
-                "line_amount": amount,
-                "raw_json": {
-                    "parser_version": "remittance_v2",
-                    "source_filename": source_filename,
-                    "source_line": cleaned,
-                },
-            }
-        )
-
-        pending_invoice = None
-
-    return entries
-
-
-def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    pages = extract_pdf_pages_layout_text(file_bytes)
-    full_text = "\n".join(pages)
-
-    remittance_reference = Path(source_filename).stem
-    due_date = extract_due_date_from_remittance_text(full_text)
-    fallback_date = extract_filename_date_fallback(source_filename)
-
-    remittance_date = due_date or fallback_date
-    withdrawal_date = due_date or fallback_date
-
-    pay_this_amount = find_money_after_label(full_text, "Pay This Amount")
-    total_purchases_due = find_money_after_label(full_text, "Total Purchases Due")
-    total_service_expense = find_money_after_label(full_text, "Total Service Expense")
-
-    parsed_lines: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str]] = set()
-
-    for page_text in pages:
-        for raw_line in page_text.splitlines():
-            line = normalize_text(raw_line)
-            if not line:
-                continue
-
-            upper_line = line.upper()
-            if (
-                "INVOICE NUMBER" in upper_line
-                or "THE FOLLOWING ARE DUE ON" in upper_line
-                or "TOTAL SERVICE EXPENSE" in upper_line
-                or "PAY THIS AMOUNT" in upper_line
-                or "TOTAL PURCHASES DUE" in upper_line
-            ):
-                continue
-
-            if not re.search(r"\d{8}", line):
-                continue
-
-            entries = parse_remittance_entries_from_layout_line(
-                line=line,
-                common_due_date=due_date or fallback_date,
-                source_filename=source_filename,
-            )
-
-            for entry in entries:
-                key = (
-                    entry["invoice_number"],
-                    str(entry["line_amount"]),
-                )
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                parsed_lines.append(entry)
-
-    if not parsed_lines:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not parse any remittance invoice lines from document: {source_filename}",
-        )
-
-    detail_line_total = sum((line["line_amount"] for line in parsed_lines), Decimal("0.00"))
-
-    warnings: list[str] = []
-
-    if pay_this_amount is not None and abs(detail_line_total - pay_this_amount) <= Decimal("0.05"):
-        pass
-    elif total_purchases_due is not None and abs(detail_line_total - total_purchases_due) <= Decimal("0.05"):
-        pass
-    elif total_service_expense is not None and abs(detail_line_total - total_service_expense) <= Decimal("0.05"):
-        warnings.append(
-            "Parsed invoice line total ties to Total Service Expense, not the full remittance amount"
-        )
-    else:
-        warnings.append(
-            f"Parsed invoice line total {detail_line_total} does not tie to Pay This Amount "
-            f"{pay_this_amount} or Total Purchases Due {total_purchases_due}"
-        )
-
-    bank_total_amount = pay_this_amount or total_purchases_due or detail_line_total
-
-    return {
-        "document_type": "hh_remittance",
-        "remittance_reference": remittance_reference,
-        "remittance_date": remittance_date,
-        "withdrawal_date": withdrawal_date,
-        "total_amount": bank_total_amount,
-        "line_count": len(parsed_lines),
-        "lines": parsed_lines,
-        "raw_json": {
-            "parser_version": "remittance_v2",
-            "source_filename": source_filename,
-            "page_count": len(pages),
-            "pay_this_amount": money_float(pay_this_amount) if pay_this_amount is not None else None,
-            "total_purchases_due": money_float(total_purchases_due) if total_purchases_due is not None else None,
-            "total_service_expense": money_float(total_service_expense) if total_service_expense is not None else None,
-            "detail_line_total": money_float(detail_line_total),
-            "warnings": warnings,
-        },
-    }
-
-def build_source_hash(file_bytes: bytes) -> str:
-    return hashlib.sha256(file_bytes).hexdigest()
-
-
-def try_extract_text(file_bytes: bytes, filename: str, content_type: str | None) -> str | None:
-    suffix = Path(filename).suffix.lower()
-    is_text_like = (
-        suffix in {".txt", ".csv", ".json", ".xml"}
-        or (content_type or "").startswith("text/")
-    )
-
-    if not is_text_like:
-        return None
-
-    for encoding in ("utf-8", "utf-16", "latin-1"):
-        try:
-            text_value = file_bytes.decode(encoding)
-            return text_value[:200000]
-        except Exception:
-            continue
-
-    return None
+def json_dumps(value: Any) -> str:
+    return json.dumps(value or {})
 
 
 def get_entity(session, entity_code: str):
@@ -1284,6 +242,956 @@ def get_statement_by_month_end(session, entity_id: str, statement_month_end: str
     return statement
 
 
+def build_source_hash(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def try_extract_text(file_bytes: bytes, filename: str, content_type: str | None) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    is_text_like = suffix in {".txt", ".csv", ".json", ".xml"} or (content_type or "").startswith("text/")
+
+    if not is_text_like:
+        return None
+
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            text_value = file_bytes.decode(encoding)
+            return text_value[:200000]
+        except Exception:
+            continue
+
+    return None
+
+
+def _get_pdf_reader(file_bytes: bytes):
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF parsing support is not installed. Add pypdf to backend dependencies and redeploy.",
+        ) from exc
+
+    return PdfReader(BytesIO(file_bytes))
+
+
+def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
+    reader = _get_pdf_reader(file_bytes)
+    return [(page.extract_text() or "") for page in reader.pages]
+
+
+def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
+    reader = _get_pdf_reader(file_bytes)
+    page_texts: list[str] = []
+
+    for page in reader.pages:
+        try:
+            text_value = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:
+            text_value = page.extract_text() or ""
+        page_texts.append(text_value)
+
+    return page_texts
+
+
+def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> list[str]:
+    standard_pages = extract_pdf_pages_text(file_bytes)
+    layout_pages = extract_pdf_pages_layout_text(file_bytes)
+
+    page_count = max(len(standard_pages), len(layout_pages))
+    merged_pages: list[str] = []
+
+    for idx in range(page_count):
+        standard_text = standard_pages[idx] if idx < len(standard_pages) else ""
+        layout_text = layout_pages[idx] if idx < len(layout_pages) else ""
+        chosen = layout_text if len(layout_text.strip()) >= len(standard_text.strip()) else standard_text
+        merged_pages.append(chosen or layout_text or standard_text or "")
+
+    return merged_pages
+
+
+def extract_invoice_parser_context(file_bytes: bytes) -> dict[str, Any]:
+    pages = extract_pdf_pages_best_effort_text(file_bytes)
+
+    if not pages or not any(normalize_text(page) for page in pages):
+        raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+
+    all_lines: list[str] = []
+    for page in pages:
+        all_lines.extend([line.rstrip() for line in page.splitlines()])
+
+    full_text = "\n".join(pages)
+    return {
+        "pages": pages,
+        "all_lines": all_lines,
+        "full_text": full_text,
+        "full_text_upper": normalize_upper_space_text(full_text),
+    }
+
+
+def parse_hh_short_date(value: str) -> date:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Missing statement date value")
+
+    try:
+        yy, mm, dd = cleaned.split("-")
+        return date(2000 + int(yy), int(mm), int(dd))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid HH short date format: {value}",
+        ) from exc
+
+
+def parse_hh_iso_word_date(value: str | None) -> date:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Missing HH invoice date value")
+
+    for fmt in ("%Y-%b-%d", "%Y-%B-%d"):
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid HH invoice date format: {value}",
+    )
+
+
+def parse_hh_mmddyyyy(value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    try:
+        return datetime.strptime(cleaned, "%m%d%Y").date()
+    except ValueError:
+        return None
+
+
+def parse_hh_flexible_date(value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    normalized = re.sub(r"\s+", " ", cleaned.replace(" ,", ",")).strip()
+
+    for fmt in (
+        "%Y-%b-%d",
+        "%Y-%B-%d",
+        "%b. %d,%Y",
+        "%b. %d, %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m%d%Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt).date()
+        except ValueError:
+            continue
+
+    if re.fullmatch(r"\d{2}-\d{2}-\d{2}", normalized):
+        return parse_hh_short_date(normalized)
+
+    return None
+
+
+def extract_date_tokens_from_line(line: str) -> list[str]:
+    patterns = [
+        r"\b20\d{2}-[A-Za-z]{3}-\d{2}\b",
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
+        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{2},\s*\d{4}\b",
+        r"\b\d{2}-\d{2}-\d{2}\b",
+        r"\b\d{8}\b",
+        r"\b\d{2}/\d{2}/\d{4}\b",
+        r"\b\d{2}/\d{2}/\d{2}\b",
+    ]
+
+    tokens: list[str] = []
+    for pattern in patterns:
+        tokens.extend(re.findall(pattern, line))
+
+    unique_tokens: list[str] = []
+    for token in tokens:
+        if token not in unique_tokens:
+            unique_tokens.append(token)
+
+    return unique_tokens
+
+
+def find_first_parsed_date_in_line(line: str) -> date | None:
+    for token in extract_date_tokens_from_line(line):
+        parsed = parse_hh_flexible_date(token)
+        if parsed:
+            return parsed
+    return None
+
+
+def extract_filename_8digit_tokens(source_filename: str) -> list[str]:
+    return re.findall(r"(\d{8})", Path(source_filename).name)
+
+
+def choose_invoice_filename_fallbacks(source_filename: str) -> dict[str, Any]:
+    tokens = extract_filename_8digit_tokens(source_filename)
+    invoice_date = parse_hh_mmddyyyy(tokens[0]) if len(tokens) >= 1 else None
+    invoice_number = tokens[-2] if len(tokens) >= 2 else None
+    remittance_due_date = parse_hh_mmddyyyy(tokens[-1]) if len(tokens) >= 3 else None
+
+    return {
+        "invoice_date": invoice_date,
+        "invoice_number": invoice_number,
+        "remittance_due_date": remittance_due_date,
+    }
+
+
+def choose_remittance_filename_fallbacks(source_filename: str) -> dict[str, Any]:
+    tokens = extract_filename_8digit_tokens(source_filename)
+
+    likely_date = None
+    for token in reversed(tokens):
+        parsed = parse_hh_mmddyyyy(token)
+        if parsed:
+            likely_date = parsed
+            break
+
+    return {
+        "remittance_reference": Path(source_filename).stem,
+        "remittance_date": likely_date,
+        "withdrawal_date": likely_date,
+    }
+
+
+def extract_due_bucket_labels(summary_page_text: str) -> list[str]:
+    labels = re.findall(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s*\d{2},\d{4}\b",
+        summary_page_text,
+    )
+
+    cleaned_labels: list[str] = []
+    for label in labels:
+        cleaned = re.sub(r"\s+", " ", label.strip())
+        if cleaned not in cleaned_labels:
+            cleaned_labels.append(cleaned)
+
+    return cleaned_labels
+
+
+def parse_hh_statement_month_end(full_text: str) -> date:
+    match = re.search(r"\b(20\d{2})/(\d{2})\b", full_text)
+    if not match:
+        raise HTTPException(status_code=400, detail="Could not find statement month in HH statement PDF")
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+    last_day = monthrange(year, month)[1]
+    return date(year, month, last_day)
+
+
+def parse_hh_statement_document(file_bytes: bytes) -> dict[str, Any]:
+    pages = extract_pdf_pages_text(file_bytes)
+    full_text = "\n".join(pages)
+    statement_month_end = parse_hh_statement_month_end(full_text)
+
+    inv_pattern = re.compile(r"^\d{8}$")
+    ts_pattern = re.compile(r"^\d+$")
+    money_pattern = re.compile(r"^-?\s?[\d,]+\.\d{2}$")
+    short_date_pattern = re.compile(r"^\d{2}-\d{2}-\d{2}$")
+
+    detail_lines: list[dict[str, Any]] = []
+
+    for page_text in pages:
+        if "Summary Page" in page_text:
+            continue
+
+        lines = [line.rstrip() for line in page_text.splitlines()]
+        footer_idx = next((i for i, line in enumerate(lines) if "Inv Nbr T/S Invoice Amount" in line), len(lines))
+        data_lines = lines[:footer_idx]
+
+        i = 0
+        invoice_numbers: list[str] = []
+        while i < len(data_lines) and inv_pattern.match(data_lines[i].strip()):
+            invoice_numbers.append(data_lines[i].strip())
+            i += 1
+
+        ts_codes: list[str] = []
+        while i < len(data_lines) and ts_pattern.match(data_lines[i].strip()):
+            ts_codes.append(data_lines[i].strip())
+            i += 1
+
+        invoice_amounts: list[Decimal] = []
+        while i < len(data_lines) and money_pattern.match(data_lines[i].strip()):
+            invoice_amounts.append(parse_hh_money(data_lines[i]))
+            i += 1
+
+        date_tokens: list[str] = []
+        while i < len(data_lines) and short_date_pattern.match(data_lines[i].strip()):
+            date_tokens.append(data_lines[i].strip())
+            i += 1
+
+        row_count = len(invoice_numbers)
+        invoice_dates = date_tokens[:row_count]
+        due_dates = date_tokens[row_count : row_count * 2]
+
+        usable_count = min(len(invoice_numbers), len(ts_codes), len(invoice_amounts), len(invoice_dates), len(due_dates))
+
+        for idx in range(usable_count):
+            amount = invoice_amounts[idx]
+            detail_lines.append(
+                {
+                    "invoice_number": invoice_numbers[idx],
+                    "invoice_type": None,
+                    "invoice_date": parse_hh_short_date(invoice_dates[idx]),
+                    "due_date": parse_hh_short_date(due_dates[idx]),
+                    "invoice_amount": amount,
+                    "open_amount": amount,
+                    "current_amount": None,
+                    "past_due_amount": None,
+                    "raw_json": {"statement_ts_code": ts_codes[idx]},
+                }
+            )
+
+    summary_balances: dict[str, Any] = {}
+    due_bucket_totals: dict[str, float] = {}
+    summary_components: dict[str, Any] = {}
+
+    summary_page_1 = next((page_text for page_text in pages if "Opening Balance" in page_text and "Balance Owing" in page_text), "")
+    if summary_page_1:
+        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_1)]
+        bucket_labels = extract_due_bucket_labels(summary_page_1)
+
+        if len(amounts) >= 5:
+            summary_balances = {
+                "opening_balance": float(amounts[0]),
+                "total_adjustments": float(amounts[1]),
+                "total_purchases_this_month": float(amounts[2]),
+                "total_payments_this_month": float(amounts[3]),
+                "balance_owing": float(amounts[4]),
+            }
+
+            bucket_amounts = amounts[5 : 5 + len(bucket_labels)]
+            for idx, label in enumerate(bucket_labels):
+                if idx < len(bucket_amounts):
+                    due_bucket_totals[label] = float(bucket_amounts[idx])
+
+    summary_page_2 = next((page_text for page_text in pages if "This Month" in page_text and "Total Purchases" in page_text), "")
+    if summary_page_2:
+        amounts = [parse_hh_money(value) for value in re.findall(r"-?\s?[\d,]+\.\d{2}", summary_page_2)]
+        metric_labels = [
+            "GST/HST",
+            "Enviro Amount",
+            "Special Shares - Subscribed For",
+            "Five Yr Notes - Subscribed For",
+            "Service [D. C. Freight]",
+            "Total Surcharges",
+            "Advertising",
+            "Warehouse",
+            "Direct",
+            "Disc and Promo",
+            "Building Supply",
+            "Service [T/S 7 Expense]",
+            "Red Sur Prom",
+            "Total Purchases",
+        ]
+
+        if len(amounts) >= len(metric_labels) * 4:
+            for idx, label in enumerate(metric_labels):
+                summary_components[label] = {
+                    "this_month": float(amounts[idx]),
+                    "same_month_last_year": float(amounts[idx + 14]),
+                    "this_year_to_date": float(amounts[idx + 28]),
+                    "last_year_to_date": float(amounts[idx + 42]),
+                }
+
+    total_open_balance = summary_balances.get("balance_owing")
+    if total_open_balance is None:
+        total_open_balance = float(sum(line["open_amount"] for line in detail_lines))
+
+    return {
+        "statement_month_end": statement_month_end,
+        "total_open_balance": total_open_balance,
+        "statement_line_count": len(detail_lines),
+        "summary_balances": summary_balances,
+        "due_bucket_totals": due_bucket_totals,
+        "summary_components": summary_components,
+        "lines": detail_lines,
+    }
+
+
+def extract_money_tokens(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return re.findall(MONEY_TOKEN_PATTERN, value, flags=re.IGNORECASE)
+
+
+def extract_invoice_meta_from_text(full_text: str, source_filename: str) -> tuple[date | None, str | None]:
+    fallbacks = choose_invoice_filename_fallbacks(source_filename)
+    invoice_meta_match = re.search(r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b", full_text)
+
+    invoice_date = parse_hh_iso_word_date(invoice_meta_match.group(1)) if invoice_meta_match else fallbacks["invoice_date"]
+    invoice_number = invoice_meta_match.group(2) if invoice_meta_match else fallbacks["invoice_number"]
+    return invoice_date, invoice_number
+
+
+def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | None, Decimal | None]:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    for idx in range(len(cleaned_lines)):
+        window_lines = cleaned_lines[idx : idx + 6]
+        if not window_lines:
+            continue
+
+        window_text = " ".join(window_lines)
+        upper_window = window_text.upper()
+
+        if "REMITTANCE DUE" not in upper_window and "PLEASE APPLY THIS AMOUNT TO YOUR" not in upper_window:
+            continue
+
+        due_date = find_first_parsed_date_in_line(window_text)
+        money_tokens = extract_money_tokens(window_text)
+        total_amount = parse_hh_signed_money(money_tokens[-1]) if money_tokens else None
+        return due_date, total_amount
+
+    return None, None
+
+
+def extract_terms_summary_amounts(lines: list[str]) -> tuple[Decimal, Decimal, Decimal]:
+    for raw_line in reversed(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "SUB TOTAL" in upper_cleaned or "GST/HST" in upper_cleaned:
+            continue
+
+        money_tokens = extract_money_tokens(cleaned)
+        if len(money_tokens) >= 3 and re.match(r"^\d{2}\b", cleaned):
+            subtotal = parse_hh_signed_money(money_tokens[0])
+            hst_amount = parse_hh_signed_money(money_tokens[1])
+            pst_amount = parse_hh_signed_money(money_tokens[2])
+            return subtotal, hst_amount, pst_amount
+
+    return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
+
+
+def extract_component_totals_tokens(lines: list[str]) -> list[str] | None:
+    candidates: list[list[str]] = []
+
+    for raw_line in lines:
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "LESS" in upper_cleaned or "---" in cleaned or "PLEASE APPLY THIS AMOUNT TO YOUR" in upper_cleaned:
+            continue
+
+        money_tokens = [token for token in extract_money_tokens(cleaned) if "." in token or token.upper().endswith("CR") or token.upper().endswith("C")]
+        if len(money_tokens) >= 8:
+            candidates.append(money_tokens[-8:])
+
+    if candidates:
+        return candidates[-1]
+    return None
+
+
+def build_component_amounts(*, lines: list[str], subtotal: Decimal) -> tuple[dict[str, Decimal], list[str]]:
+    tokens = extract_component_totals_tokens(lines)
+    warnings: list[str] = []
+
+    if not tokens:
+        warnings.append("component_totals_not_found_used_safe_fallback")
+        zero = Decimal("0.00")
+        return (
+            {
+                "c_list_total": subtotal,
+                "discount_amount": zero,
+                "promo_discount_amount": zero,
+                "surcharge_amount": zero,
+                "subscribed_shares_amount": zero,
+                "five_year_note_amount": zero,
+                "advertising_amount": zero,
+                "pre_tax_total": subtotal,
+            },
+            warnings,
+        )
+
+    return (
+        {
+            "c_list_total": parse_hh_signed_money(tokens[0]),
+            "discount_amount": parse_hh_signed_money(tokens[1]),
+            "promo_discount_amount": parse_hh_signed_money(tokens[2]),
+            "surcharge_amount": parse_hh_signed_money(tokens[3]),
+            "subscribed_shares_amount": parse_hh_signed_money(tokens[4]),
+            "five_year_note_amount": parse_hh_signed_money(tokens[5]),
+            "advertising_amount": parse_hh_signed_money(tokens[6]),
+            "pre_tax_total": parse_hh_signed_money(tokens[7]),
+        },
+        warnings,
+    )
+
+
+def extract_labeled_money_from_lines(lines: list[str], label: str) -> Decimal:
+    upper_label = label.upper()
+
+    for idx, raw_line in enumerate(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        if upper_label not in cleaned.upper():
+            continue
+
+        same_line_tokens = extract_money_tokens(cleaned)
+        if same_line_tokens:
+            return parse_hh_signed_money(same_line_tokens[-1])
+
+        for look_ahead in range(idx + 1, min(idx + 3, len(lines))):
+            next_line = normalize_text(lines[look_ahead])
+            if not next_line:
+                continue
+            next_tokens = extract_money_tokens(next_line)
+            if next_tokens:
+                return parse_hh_signed_money(next_tokens[0])
+
+    return Decimal("0.00")
+
+
+def extract_vendor_direct_metadata(lines: list[str]) -> dict[str, Any]:
+    vendor_name = None
+    vendor_invoice_number = None
+    vendor_invoice_date = None
+
+    for idx, raw_line in enumerate(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "INVOICE DT:" not in upper_cleaned or "INVOICE NBR:" not in upper_cleaned:
+            continue
+
+        match = re.search(r"Invoice Dt:\s*(20\d{2}-[A-Za-z]{3}-\d{2})\s+Invoice Nbr:\s*(\S+)", cleaned, flags=re.IGNORECASE)
+        if match:
+            vendor_invoice_date = parse_hh_iso_word_date(match.group(1))
+            vendor_invoice_number = match.group(2)
+
+        for prev_idx in range(idx - 1, -1, -1):
+            prev_line = normalize_text(lines[prev_idx])
+            if prev_line:
+                vendor_name = prev_line
+                break
+
+        break
+
+    return {
+        "vendor_name": vendor_name,
+        "vendor_invoice_number": vendor_invoice_number,
+        "vendor_invoice_date": vendor_invoice_date,
+    }
+
+
+def classify_direct_family_invoice(source_filename: str, full_text_upper: str, vendor_invoice_number: str | None, vendor_invoice_date: date | None) -> tuple[str, str]:
+    source_name_upper = Path(source_filename).name.upper()
+
+    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
+        return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
+
+    if any(marker in source_name_upper for marker in HH_DIRECT_FILENAME_MARKERS):
+        return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
+
+    if "E DIRECT INVOICE" in full_text_upper:
+        return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
+
+    if vendor_invoice_number or vendor_invoice_date:
+        return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
+
+    return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
+
+
+def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    ctx = extract_invoice_parser_context(file_bytes)
+    all_lines = ctx["all_lines"]
+    full_text = ctx["full_text"]
+    full_text_upper = ctx["full_text_upper"]
+
+    invoice_date, invoice_number = extract_invoice_meta_from_text(full_text=full_text, source_filename=source_filename)
+    remittance_due_date, total_amount = extract_invoice_remittance_due_and_total(all_lines)
+    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
+    component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
+
+    service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
+    enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
+
+    vendor_meta = extract_vendor_direct_metadata(all_lines)
+    vendor_name = vendor_meta["vendor_name"]
+    vendor_invoice_number = vendor_meta["vendor_invoice_number"]
+    vendor_invoice_date = vendor_meta["vendor_invoice_date"]
+
+    invoice_type, document_type = classify_direct_family_invoice(
+        source_filename=source_filename,
+        full_text_upper=full_text_upper,
+        vendor_invoice_number=vendor_invoice_number,
+        vendor_invoice_date=vendor_invoice_date,
+    )
+
+    if invoice_type == INVOICE_TYPE_HH_DIRECT:
+        vendor_name = "Home Hardware Stores Limited"
+        vendor_invoice_number = None
+        vendor_invoice_date = None
+
+    if total_amount is None:
+        total_amount = subtotal + hst_amount + pst_amount
+
+    if not invoice_number or not invoice_date:
+        raise HTTPException(status_code=400, detail=f"Could not determine invoice number/date for direct-family invoice: {source_filename}")
+
+    return {
+        "document_type": document_type,
+        "invoice_type": invoice_type,
+        "invoice_number": invoice_number,
+        "vendor_name": vendor_name,
+        "vendor_invoice_number": vendor_invoice_number,
+        "po_number": None,
+        "invoice_date": invoice_date,
+        "due_date": remittance_due_date,
+        "remittance_due_date": remittance_due_date,
+        "currency_code": DEFAULT_CURRENCY_CODE,
+        "subtotal": subtotal,
+        "hst_amount": hst_amount,
+        "surcharge_amount": component_amounts["surcharge_amount"],
+        "advertising_amount": component_amounts["advertising_amount"],
+        "subscribed_shares_amount": component_amounts["subscribed_shares_amount"],
+        "five_year_note_amount": component_amounts["five_year_note_amount"],
+        "total_amount": total_amount,
+        "is_statement_only": False,
+        "notes": None,
+        "raw_json": {
+            "parser_version": "invoice_v3",
+            "invoice_source_type": invoice_type,
+            "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
+            "pst_amount": money_float(pst_amount),
+            "c_list_total": money_float(component_amounts["c_list_total"]),
+            "discount_amount": money_float(component_amounts["discount_amount"]),
+            "promo_discount_amount": money_float(component_amounts["promo_discount_amount"]),
+            "pre_tax_total": money_float(component_amounts["pre_tax_total"]),
+            "service_charges": money_float(service_charges),
+            "enviro_fee_amount": money_float(enviro_fee_amount),
+            "source_filename": source_filename,
+            "parser_warnings": parser_warnings,
+        },
+    }
+
+
+def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    ctx = extract_invoice_parser_context(file_bytes)
+    all_lines = ctx["all_lines"]
+    full_text = ctx["full_text"]
+    fallbacks = choose_invoice_filename_fallbacks(source_filename)
+
+    due_total_line = next(
+        (
+            normalize_text(line)
+            for line in all_lines
+            if re.fullmatch(r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?", normalize_text(line) or "")
+        ),
+        None,
+    )
+    due_total_match = re.match(r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)", due_total_line or "")
+
+    remittance_due_date = parse_hh_iso_word_date(due_total_match.group(1)) if due_total_match else fallbacks["remittance_due_date"]
+    total_amount = parse_hh_signed_money(due_total_match.group(2)) if due_total_match else None
+
+    invoice_date, invoice_number = extract_invoice_meta_from_text(full_text=full_text, source_filename=source_filename)
+    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
+    component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
+
+    service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
+    enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
+
+    if total_amount is None:
+        total_amount = subtotal + hst_amount + pst_amount
+
+    if not invoice_number or not invoice_date:
+        raise HTTPException(status_code=400, detail=f"Could not determine invoice number/date for warehouse invoice: {source_filename}")
+
+    return {
+        "document_type": DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
+        "invoice_type": INVOICE_TYPE_WAREHOUSE,
+        "invoice_number": invoice_number,
+        "vendor_name": "Home Hardware Stores Limited",
+        "vendor_invoice_number": None,
+        "po_number": None,
+        "invoice_date": invoice_date,
+        "due_date": remittance_due_date,
+        "remittance_due_date": remittance_due_date,
+        "currency_code": DEFAULT_CURRENCY_CODE,
+        "subtotal": subtotal,
+        "hst_amount": hst_amount,
+        "surcharge_amount": component_amounts["surcharge_amount"],
+        "advertising_amount": component_amounts["advertising_amount"],
+        "subscribed_shares_amount": component_amounts["subscribed_shares_amount"],
+        "five_year_note_amount": component_amounts["five_year_note_amount"],
+        "total_amount": total_amount,
+        "is_statement_only": False,
+        "notes": None,
+        "raw_json": {
+            "parser_version": "invoice_v3",
+            "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
+            "pst_amount": money_float(pst_amount),
+            "c_list_total": money_float(component_amounts["c_list_total"]),
+            "discount_amount": money_float(component_amounts["discount_amount"]),
+            "promo_discount_amount": money_float(component_amounts["promo_discount_amount"]),
+            "pre_tax_total": money_float(component_amounts["pre_tax_total"]),
+            "service_charges": money_float(service_charges),
+            "enviro_fee_amount": money_float(enviro_fee_amount),
+            "source_filename": source_filename,
+            "parser_warnings": parser_warnings,
+        },
+    }
+
+
+def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    source_name_upper = Path(source_filename).name.upper()
+
+    if any(marker in source_name_upper for marker in WAREHOUSE_FILENAME_MARKERS):
+        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+
+    direct_error = None
+    warehouse_error = None
+
+    try:
+        return parse_hh_direct_family_invoice_document(file_bytes, source_filename)
+    except HTTPException as exc:
+        direct_error = exc.detail
+
+    try:
+        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+    except HTTPException as exc:
+        warehouse_error = exc.detail
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Could not parse HH invoice document: {source_filename}. "
+            f"Direct-family parser error: {direct_error}. "
+            f"Warehouse parser error: {warehouse_error}."
+        ),
+    )
+
+
+def extract_due_date_from_remittance_text(full_text: str) -> date | None:
+    lines = [normalize_text(line) for line in full_text.splitlines()]
+    lines = [line for line in lines if line]
+
+    for idx, line in enumerate(lines):
+        if "THE FOLLOWING ARE DUE ON" not in line.upper():
+            continue
+
+        candidates = [line] + lines[idx + 1 : idx + 3]
+        for candidate in candidates:
+            parsed = find_first_parsed_date_in_line(candidate)
+            if parsed:
+                return parsed
+
+        trailing = re.split(r"THE FOLLOWING ARE DUE ON", line, flags=re.IGNORECASE)[-1].strip()
+        parsed = parse_hh_flexible_date(trailing)
+        if parsed:
+            return parsed
+
+    return None
+
+
+def extract_filename_date_fallback(source_filename: str) -> date | None:
+    fallbacks = choose_remittance_filename_fallbacks(source_filename)
+    return fallbacks["withdrawal_date"]
+
+
+def find_money_after_label(full_text: str, label: str) -> Decimal | None:
+    money_pattern = r"-?[\d,]+\.\d{2}(?:CR|C|-)?"
+
+    same_line_match = re.search(rf"{re.escape(label)}\s*[:\-]?\s*({money_pattern})", full_text, flags=re.IGNORECASE)
+    if same_line_match:
+        return parse_hh_signed_money(same_line_match.group(1))
+
+    lines = full_text.splitlines()
+    for idx, raw_line in enumerate(lines):
+        line = normalize_text(raw_line)
+        if not line or label.upper() not in line.upper():
+            continue
+
+        for look_ahead in range(idx, min(idx + 3, len(lines))):
+            candidate = normalize_text(lines[look_ahead])
+            if not candidate:
+                continue
+            match = re.search(money_pattern, candidate)
+            if match:
+                return parse_hh_signed_money(match.group(0))
+
+    return None
+
+
+def parse_remittance_entries_from_layout_line(line: str, common_due_date: date | None, source_filename: str) -> list[dict[str, Any]]:
+    cleaned = normalize_text(line)
+    if not cleaned:
+        return []
+
+    token_pattern = rf"{EIGHT_DIGIT_TOKEN_PATTERN}|{MONEY_TOKEN_PATTERN}"
+    tokens = re.findall(token_pattern, cleaned, flags=re.IGNORECASE)
+
+    entries: list[dict[str, Any]] = []
+    pending_invoice: str | None = None
+
+    for token in tokens:
+        if re.fullmatch(r"\d{8}", token):
+            pending_invoice = token
+            continue
+
+        if pending_invoice is None:
+            continue
+
+        entries.append(
+            {
+                "invoice_number": pending_invoice,
+                "line_description": None,
+                "due_date": common_due_date,
+                "line_amount": parse_hh_signed_money(token),
+                "raw_json": {
+                    "parser_version": "remittance_v3",
+                    "source_filename": source_filename,
+                    "source_line": cleaned,
+                },
+            }
+        )
+        pending_invoice = None
+
+    return entries
+
+
+def parse_hh_remittance_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    pages = extract_pdf_pages_layout_text(file_bytes)
+    full_text = "\n".join(pages)
+
+    remittance_reference = Path(source_filename).stem
+    due_date = extract_due_date_from_remittance_text(full_text)
+    fallback_date = extract_filename_date_fallback(source_filename)
+
+    remittance_date = due_date or fallback_date
+    withdrawal_date = due_date or fallback_date
+
+    pay_this_amount = find_money_after_label(full_text, "Pay This Amount")
+    total_purchases_due = find_money_after_label(full_text, "Total Purchases Due")
+    total_service_expense = find_money_after_label(full_text, "Total Service Expense")
+
+    parsed_lines: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    for page_text in pages:
+        for raw_line in page_text.splitlines():
+            line = normalize_text(raw_line)
+            if not line:
+                continue
+
+            upper_line = line.upper()
+            if (
+                "INVOICE NUMBER" in upper_line
+                or "THE FOLLOWING ARE DUE ON" in upper_line
+                or "TOTAL SERVICE EXPENSE" in upper_line
+                or "PAY THIS AMOUNT" in upper_line
+                or "TOTAL PURCHASES DUE" in upper_line
+            ):
+                continue
+
+            if not re.search(EIGHT_DIGIT_TOKEN_PATTERN, line):
+                continue
+
+            entries = parse_remittance_entries_from_layout_line(
+                line=line,
+                common_due_date=due_date or fallback_date,
+                source_filename=source_filename,
+            )
+
+            for entry in entries:
+                key = (entry["invoice_number"], str(entry["line_amount"]))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                parsed_lines.append(entry)
+
+    if not parsed_lines:
+        raise HTTPException(status_code=400, detail=f"Could not parse any remittance invoice lines from document: {source_filename}")
+
+    detail_line_total = sum((line["line_amount"] for line in parsed_lines), Decimal("0.00"))
+    warnings: list[str] = []
+
+    if pay_this_amount is not None and abs(detail_line_total - pay_this_amount) <= Decimal("0.05"):
+        pass
+    elif total_purchases_due is not None and abs(detail_line_total - total_purchases_due) <= Decimal("0.05"):
+        pass
+    elif total_service_expense is not None and abs(detail_line_total - total_service_expense) <= Decimal("0.05"):
+        warnings.append("Parsed invoice line total ties to Total Service Expense, not the full remittance amount")
+    else:
+        warnings.append(
+            f"Parsed invoice line total {detail_line_total} does not tie to Pay This Amount "
+            f"{pay_this_amount} or Total Purchases Due {total_purchases_due}"
+        )
+
+    bank_total_amount = pay_this_amount or total_purchases_due or detail_line_total
+
+    return {
+        "document_type": DOCUMENT_TYPE_HH_REMITTANCE,
+        "remittance_reference": remittance_reference,
+        "remittance_date": remittance_date,
+        "withdrawal_date": withdrawal_date,
+        "total_amount": bank_total_amount,
+        "line_count": len(parsed_lines),
+        "lines": parsed_lines,
+        "raw_json": {
+            "parser_version": "remittance_v3",
+            "source_filename": source_filename,
+            "page_count": len(pages),
+            "pay_this_amount": money_float(pay_this_amount) if pay_this_amount is not None else None,
+            "total_purchases_due": money_float(total_purchases_due) if total_purchases_due is not None else None,
+            "total_service_expense": money_float(total_service_expense) if total_service_expense is not None else None,
+            "detail_line_total": money_float(detail_line_total),
+            "warnings": warnings,
+        },
+    }
+
+
+def build_invoice_map(invoice_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    invoice_map_by_number: dict[str, list[dict[str, Any]]] = {}
+    for row in invoice_rows:
+        invoice_number = normalize_invoice_number(row["invoice_number"])
+        if not invoice_number:
+            continue
+        invoice_map_by_number.setdefault(invoice_number, []).append(dict(row))
+    return invoice_map_by_number
+
+
+def choose_invoice_match_candidate(candidates: list[dict[str, Any]], desired_invoice_type: str | None) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+
+    if desired_invoice_type:
+        exact_type_matches = [candidate for candidate in candidates if normalize_text(candidate.get("invoice_type")) == desired_invoice_type]
+        if len(exact_type_matches) == 1:
+            return exact_type_matches[0]
+        if len(exact_type_matches) > 1:
+            return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
 class HHAPInvoiceInput(BaseModel):
     invoice_number: str = Field(...)
     invoice_type: str = Field(...)
@@ -1293,7 +1201,7 @@ class HHAPInvoiceInput(BaseModel):
     invoice_date: date | None = None
     due_date: date | None = None
     remittance_due_date: date | None = None
-    currency_code: str = "CAD"
+    currency_code: str = DEFAULT_CURRENCY_CODE
     subtotal: Decimal | None = None
     hst_amount: Decimal | None = None
     surcharge_amount: Decimal | None = None
@@ -1304,6 +1212,7 @@ class HHAPInvoiceInput(BaseModel):
     is_statement_only: bool = False
     notes: str | None = None
     raw_json: dict[str, Any] = Field(default_factory=dict)
+
 
 class HHAPParseStatementDocumentRequest(BaseModel):
     entity_code: str
@@ -1339,9 +1248,11 @@ class HHAPRemittanceUpsertRequest(BaseModel):
     raw_json: dict[str, Any] = Field(default_factory=dict)
     lines: list[HHAPRemittanceLineInput] = Field(default_factory=list)
 
+
 class HHAPParseInvoiceDocumentRequest(BaseModel):
     entity_code: str
     document_id: str | None = None
+
 
 class HHAPStatementLineInput(BaseModel):
     invoice_number: str | None = None
@@ -1381,9 +1292,9 @@ async def hh_ap_upload_documents(
         entity = get_entity(session, entity_code)
         normalized_document_date = normalize_optional_date_input(document_date)
 
-        inserted_documents: list[dict] = []
-        updated_documents: list[dict] = []
-        duplicate_documents: list[dict] = []
+        inserted_documents: list[dict[str, Any]] = []
+        updated_documents: list[dict[str, Any]] = []
+        duplicate_documents: list[dict[str, Any]] = []
 
         for upload in files:
             file_bytes = await upload.read()
@@ -1391,11 +1302,7 @@ async def hh_ap_upload_documents(
                 continue
 
             source_hash = build_source_hash(file_bytes)
-            extracted_text = try_extract_text(
-                file_bytes=file_bytes,
-                filename=upload.filename or "unknown",
-                content_type=upload.content_type,
-            )
+            extracted_text = try_extract_text(file_bytes=file_bytes, filename=upload.filename or "unknown", content_type=upload.content_type)
 
             existing = session.execute(
                 text(
@@ -1420,18 +1327,10 @@ async def hh_ap_upload_documents(
                 },
             ).mappings().first()
 
-            processing_status = (
-                "uploaded_text_ready" if extracted_text else "uploaded_pending_parse"
-            )
+            processing_status = PROCESSING_STATUS_UPLOADED_TEXT_READY if extracted_text else PROCESSING_STATUS_UPLOADED_PENDING_PARSE
 
             if existing:
-                needs_upgrade = (
-                    existing.get("file_size_bytes") in (None, 0)
-                    or (
-                        extracted_text is not None
-                        and not existing.get("extracted_text")
-                    )
-                )
+                needs_upgrade = existing.get("file_size_bytes") in (None, 0) or (extracted_text is not None and not existing.get("extracted_text"))
 
                 if needs_upgrade:
                     updated_row = session.execute(
@@ -1458,12 +1357,7 @@ async def hh_ap_upload_documents(
                             "file_bytes": file_bytes,
                             "extracted_text": extracted_text,
                             "processing_status": processing_status,
-                            "raw_json": json.dumps(
-                                {
-                                    "content_type": upload.content_type,
-                                    "file_size_bytes": len(file_bytes),
-                                }
-                            ),
+                            "raw_json": json_dumps({"content_type": upload.content_type, "file_size_bytes": len(file_bytes)}),
                         },
                     ).mappings().first()
 
@@ -1530,12 +1424,7 @@ async def hh_ap_upload_documents(
                     "file_size_bytes": len(file_bytes),
                     "file_bytes": file_bytes,
                     "extracted_text": extracted_text,
-                    "raw_json": json.dumps(
-                        {
-                            "content_type": upload.content_type,
-                            "file_size_bytes": len(file_bytes),
-                        }
-                    ),
+                    "raw_json": json_dumps({"content_type": upload.content_type, "file_size_bytes": len(file_bytes)}),
                 },
             ).mappings().first()
 
@@ -1560,6 +1449,10 @@ async def hh_ap_upload_documents(
             "duplicate_documents": duplicate_documents,
         }
 
+
+# Remaining endpoints omitted from here-doc for brevity in generation step.
+# The full file continues below in the written artifact.
+
 @router.post("/invoices/upload-and-parse-batch")
 async def hh_ap_upload_and_parse_invoices_batch(
     entity_code: str = Form(...),
@@ -1569,10 +1462,9 @@ async def hh_ap_upload_and_parse_invoices_batch(
     normalized_document_date = normalize_optional_date_input(document_date)
 
     with db_session() as session:
-        entity = get_entity(session, entity_code)
+        _ = get_entity(session, entity_code)
 
     invoice_document_types = get_allowed_invoice_document_types()
-
     processed_files: list[dict[str, Any]] = []
     failed_files: list[dict[str, Any]] = []
 
@@ -1581,14 +1473,8 @@ async def hh_ap_upload_and_parse_invoices_batch(
 
         try:
             file_bytes = await upload.read()
-
             if not file_bytes:
-                failed_files.append(
-                    {
-                        "source_filename": filename,
-                        "error": "File was empty",
-                    }
-                )
+                failed_files.append({"source_filename": filename, "error": "File was empty"})
                 continue
 
             with db_session() as session:
@@ -1626,7 +1512,9 @@ async def hh_ap_upload_and_parse_invoices_batch(
                 ).mappings().first()
 
                 initial_processing_status = (
-                    "uploaded_text_ready" if extracted_text else "uploaded_pending_parse"
+                    PROCESSING_STATUS_UPLOADED_TEXT_READY
+                    if extracted_text
+                    else PROCESSING_STATUS_UPLOADED_PENDING_PARSE
                 )
 
                 if existing_document:
@@ -1634,10 +1522,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
 
                     needs_upgrade = (
                         existing_document.get("file_size_bytes") in (None, 0)
-                        or (
-                            extracted_text is not None
-                            and not existing_document.get("extracted_text")
-                        )
+                        or (extracted_text is not None and not existing_document.get("extracted_text"))
                     )
 
                     if needs_upgrade:
@@ -1664,7 +1549,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 "file_bytes": file_bytes,
                                 "extracted_text": extracted_text,
                                 "processing_status": initial_processing_status,
-                                "raw_json": json.dumps(
+                                "raw_json": json_dumps(
                                     {
                                         "content_type": upload.content_type,
                                         "file_size_bytes": len(file_bytes),
@@ -1691,7 +1576,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 raw_json
                             ) VALUES (
                                 :entity_id,
-                                'hh_invoice',
+                                :document_type,
                                 :source_filename,
                                 :source_hash,
                                 :document_date,
@@ -1708,6 +1593,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                         ),
                         {
                             "entity_id": entity["id"],
+                            "document_type": DOCUMENT_TYPE_HH_INVOICE,
                             "source_filename": filename,
                             "source_hash": source_hash,
                             "document_date": normalized_document_date,
@@ -1716,7 +1602,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                             "file_size_bytes": len(file_bytes),
                             "file_bytes": file_bytes,
                             "extracted_text": extracted_text,
-                            "raw_json": json.dumps(
+                            "raw_json": json_dumps(
                                 {
                                     "content_type": upload.content_type,
                                     "file_size_bytes": len(file_bytes),
@@ -1778,7 +1664,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 :subscribed_shares_amount,
                                 :five_year_note_amount,
                                 :total_amount,
-                                'unmatched',
+                                :match_status,
                                 :is_statement_only,
                                 :notes,
                                 CAST(:raw_json AS jsonb)
@@ -1826,9 +1712,10 @@ async def hh_ap_upload_and_parse_invoices_batch(
                             "subscribed_shares_amount": parsed["subscribed_shares_amount"],
                             "five_year_note_amount": parsed["five_year_note_amount"],
                             "total_amount": parsed["total_amount"],
+                            "match_status": MATCH_STATUS_UNMATCHED,
                             "is_statement_only": parsed["is_statement_only"],
                             "notes": parsed["notes"],
-                            "raw_json": json.dumps(parsed["raw_json"] or {}),
+                            "raw_json": json_dumps(parsed["raw_json"]),
                         },
                     ).mappings().first()
 
@@ -1836,7 +1723,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                         text(
                             """
                             UPDATE hh_ap_documents
-                            SET processing_status = 'parsed_invoice',
+                            SET processing_status = :processing_status,
                                 raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                                 updated_at = NOW()
                             WHERE id = :id
@@ -1844,7 +1731,8 @@ async def hh_ap_upload_and_parse_invoices_batch(
                         ),
                         {
                             "id": document_id,
-                            "parser_json": json.dumps(
+                            "processing_status": PROCESSING_STATUS_PARSED_INVOICE,
+                            "parser_json": json_dumps(
                                 {
                                     "parsed_as": parsed["document_type"],
                                     "parsed_invoice_number": parsed["invoice_number"],
@@ -1870,7 +1758,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                         text(
                             """
                             UPDATE hh_ap_documents
-                            SET processing_status = 'parse_failed_invoice',
+                            SET processing_status = :processing_status,
                                 raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                                 updated_at = NOW()
                             WHERE id = :id
@@ -1878,7 +1766,8 @@ async def hh_ap_upload_and_parse_invoices_batch(
                         ),
                         {
                             "id": document_id,
-                            "parser_json": json.dumps(
+                            "processing_status": PROCESSING_STATUS_PARSE_FAILED_INVOICE,
+                            "parser_json": json_dumps(
                                 {
                                     "parse_failed_as": "invoice",
                                     "parse_error": exc.detail,
@@ -1896,12 +1785,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                     )
 
         except Exception as exc:
-            failed_files.append(
-                {
-                    "source_filename": filename,
-                    "error": str(exc),
-                }
-            )
+            failed_files.append({"source_filename": filename, "error": str(exc)})
 
     return {
         "entity_code": entity_code,
@@ -1920,8 +1804,7 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
 
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
-
-        upserted: list[dict] = []
+        upserted: list[dict[str, Any]] = []
 
         for invoice in payload.invoices:
             invoice_number = normalize_invoice_number(invoice.invoice_number)
@@ -2018,7 +1901,7 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
                     "invoice_date": invoice.invoice_date,
                     "due_date": invoice.due_date,
                     "remittance_due_date": invoice.remittance_due_date,
-                    "currency_code": normalize_text(invoice.currency_code) or "CAD",
+                    "currency_code": normalize_text(invoice.currency_code) or DEFAULT_CURRENCY_CODE,
                     "subtotal": invoice.subtotal,
                     "hst_amount": invoice.hst_amount,
                     "surcharge_amount": invoice.surcharge_amount,
@@ -2026,10 +1909,10 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
                     "subscribed_shares_amount": invoice.subscribed_shares_amount,
                     "five_year_note_amount": invoice.five_year_note_amount,
                     "total_amount": invoice.total_amount,
-                    "match_status": "unmatched",
+                    "match_status": MATCH_STATUS_UNMATCHED,
                     "is_statement_only": invoice.is_statement_only,
                     "notes": normalize_text(invoice.notes),
-                    "raw_json": json.dumps(invoice.raw_json or {}),
+                    "raw_json": json_dumps(invoice.raw_json),
                 },
             ).mappings().first()
 
@@ -2048,12 +1931,10 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
             "upserted_invoices": upserted,
         }
 
-
 @router.post("/remittances/upsert")
 def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
-
         remittance = None
 
         if payload.document_id:
@@ -2067,10 +1948,7 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "document_id": payload.document_id,
-                },
+                {"entity_id": entity["id"], "document_id": payload.document_id},
             ).mappings().first()
 
         if not remittance and (payload.remittance_reference or payload.withdrawal_date):
@@ -2116,7 +1994,7 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
                     "remittance_date": payload.remittance_date,
                     "withdrawal_date": payload.withdrawal_date,
                     "total_amount": payload.total_amount,
-                    "raw_json": json.dumps(payload.raw_json or {}),
+                    "raw_json": json_dumps(payload.raw_json),
                 },
             ).mappings().first()
         else:
@@ -2150,19 +2028,11 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
                     "remittance_date": payload.remittance_date,
                     "withdrawal_date": payload.withdrawal_date,
                     "total_amount": payload.total_amount,
-                    "raw_json": json.dumps(payload.raw_json or {}),
+                    "raw_json": json_dumps(payload.raw_json),
                 },
             ).mappings().first()
 
-        session.execute(
-            text(
-                """
-                DELETE FROM hh_ap_remittance_lines
-                WHERE remittance_id = :remittance_id
-                """
-            ),
-            {"remittance_id": remittance_row["id"]},
-        )
+        session.execute(text("DELETE FROM hh_ap_remittance_lines WHERE remittance_id = :remittance_id"), {"remittance_id": remittance_row["id"]})
 
         inserted_lines = 0
         for line in payload.lines:
@@ -2187,7 +2057,7 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
                         :due_date,
                         :line_amount,
                         NULL,
-                        'unmatched',
+                        :match_status,
                         CAST(:raw_json AS jsonb)
                     )
                     """
@@ -2199,7 +2069,8 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
                     "line_description": normalize_text(line.line_description),
                     "due_date": line.due_date,
                     "line_amount": line.line_amount,
-                    "raw_json": json.dumps(line.raw_json or {}),
+                    "match_status": MATCH_STATUS_UNMATCHED,
+                    "raw_json": json_dumps(line.raw_json),
                 },
             )
             inserted_lines += 1
@@ -2215,7 +2086,6 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
 def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
-
         statement = None
 
         if payload.document_id:
@@ -2229,10 +2099,7 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "document_id": payload.document_id,
-                },
+                {"entity_id": entity["id"], "document_id": payload.document_id},
             ).mappings().first()
 
         if not statement:
@@ -2247,10 +2114,7 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "statement_month_end": payload.statement_month_end,
-                },
+                {"entity_id": entity["id"], "statement_month_end": payload.statement_month_end},
             ).mappings().first()
 
         if statement:
@@ -2274,7 +2138,7 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                     "statement_date": payload.statement_date,
                     "statement_month_end": payload.statement_month_end,
                     "total_open_balance": payload.total_open_balance,
-                    "raw_json": json.dumps(payload.raw_json or {}),
+                    "raw_json": json_dumps(payload.raw_json),
                 },
             ).mappings().first()
         else:
@@ -2305,19 +2169,11 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                     "statement_date": payload.statement_date,
                     "statement_month_end": payload.statement_month_end,
                     "total_open_balance": payload.total_open_balance,
-                    "raw_json": json.dumps(payload.raw_json or {}),
+                    "raw_json": json_dumps(payload.raw_json),
                 },
             ).mappings().first()
 
-        session.execute(
-            text(
-                """
-                DELETE FROM hh_ap_statement_lines
-                WHERE statement_id = :statement_id
-                """
-            ),
-            {"statement_id": statement_row["id"]},
-        )
+        session.execute(text("DELETE FROM hh_ap_statement_lines WHERE statement_id = :statement_id"), {"statement_id": statement_row["id"]})
 
         inserted_lines = 0
         for line in payload.lines:
@@ -2351,7 +2207,7 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                         :current_amount,
                         :past_due_amount,
                         NULL,
-                        'unmatched',
+                        :match_status,
                         FALSE,
                         CAST(:raw_json AS jsonb)
                     )
@@ -2368,7 +2224,8 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
                     "open_amount": line.open_amount,
                     "current_amount": line.current_amount,
                     "past_due_amount": line.past_due_amount,
-                    "raw_json": json.dumps(line.raw_json or {}),
+                    "match_status": MATCH_STATUS_UNMATCHED,
+                    "raw_json": json_dumps(line.raw_json),
                 },
             )
             inserted_lines += 1
@@ -2380,7 +2237,6 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
             "statement_month_end": str(payload.statement_month_end),
         }
 
-
 @router.post("/statements/parse-document")
 def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
     with db_session() as session:
@@ -2390,59 +2246,35 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND id = :document_id
-                      AND document_type = 'hh_statement'
+                      AND document_type = :document_type
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "document_id": payload.document_id,
-                },
+                {"entity_id": entity["id"], "document_id": payload.document_id, "document_type": DOCUMENT_TYPE_HH_STATEMENT},
             ).mappings().first()
         else:
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
-                      AND document_type = 'hh_statement'
+                      AND document_type = :document_type
                     ORDER BY created_at DESC
                     LIMIT 1
                     """
                 ),
-                {"entity_id": entity["id"]},
+                {"entity_id": entity["id"], "document_type": DOCUMENT_TYPE_HH_STATEMENT},
             ).mappings().first()
 
         if not document:
-            raise HTTPException(
-                status_code=404,
-                detail="No HH statement document found for this entity",
-            )
-
+            raise HTTPException(status_code=404, detail="No HH statement document found for this entity")
         if not document["file_bytes"]:
-            raise HTTPException(
-                status_code=400,
-                detail="This HH statement document has no stored file bytes to parse",
-            )
+            raise HTTPException(status_code=400, detail="This HH statement document has no stored file bytes to parse")
 
         parsed = parse_hh_statement_document(document["file_bytes"])
         statement_month_end = parsed["statement_month_end"]
@@ -2454,19 +2286,12 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                 SELECT id
                 FROM hh_ap_statements
                 WHERE entity_id = :entity_id
-                  AND (
-                        document_id = :document_id
-                        OR statement_month_end = :statement_month_end
-                  )
+                  AND (document_id = :document_id OR statement_month_end = :statement_month_end)
                 ORDER BY created_at DESC
                 LIMIT 1
                 """
             ),
-            {
-                "entity_id": entity["id"],
-                "document_id": document["id"],
-                "statement_month_end": statement_month_end,
-            },
+            {"entity_id": entity["id"], "document_id": document["id"], "statement_month_end": statement_month_end},
         ).mappings().first()
 
         statement_raw_json = {
@@ -2497,7 +2322,7 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                     "statement_date": statement_date,
                     "statement_month_end": statement_month_end,
                     "total_open_balance": parsed["total_open_balance"],
-                    "raw_json": json.dumps(statement_raw_json),
+                    "raw_json": json_dumps(statement_raw_json),
                 },
             ).mappings().first()
         else:
@@ -2505,19 +2330,9 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                 text(
                     """
                     INSERT INTO hh_ap_statements (
-                        entity_id,
-                        document_id,
-                        statement_date,
-                        statement_month_end,
-                        total_open_balance,
-                        raw_json
+                        entity_id, document_id, statement_date, statement_month_end, total_open_balance, raw_json
                     ) VALUES (
-                        :entity_id,
-                        :document_id,
-                        :statement_date,
-                        :statement_month_end,
-                        :total_open_balance,
-                        CAST(:raw_json AS jsonb)
+                        :entity_id, :document_id, :statement_date, :statement_month_end, :total_open_balance, CAST(:raw_json AS jsonb)
                     )
                     RETURNING id
                     """
@@ -2528,19 +2343,11 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                     "statement_date": statement_date,
                     "statement_month_end": statement_month_end,
                     "total_open_balance": parsed["total_open_balance"],
-                    "raw_json": json.dumps(statement_raw_json),
+                    "raw_json": json_dumps(statement_raw_json),
                 },
             ).mappings().first()
 
-        session.execute(
-            text(
-                """
-                DELETE FROM hh_ap_statement_lines
-                WHERE statement_id = :statement_id
-                """
-            ),
-            {"statement_id": statement_row["id"]},
-        )
+        session.execute(text("DELETE FROM hh_ap_statement_lines WHERE statement_id = :statement_id"), {"statement_id": statement_row["id"]})
 
         inserted_lines = 0
         for line in parsed["lines"]:
@@ -2548,35 +2355,13 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                 text(
                     """
                     INSERT INTO hh_ap_statement_lines (
-                        statement_id,
-                        entity_id,
-                        invoice_number,
-                        invoice_type,
-                        invoice_date,
-                        due_date,
-                        invoice_amount,
-                        open_amount,
-                        current_amount,
-                        past_due_amount,
-                        matched_invoice_id,
-                        match_status,
-                        is_missing_download,
-                        raw_json
+                        statement_id, entity_id, invoice_number, invoice_type, invoice_date, due_date,
+                        invoice_amount, open_amount, current_amount, past_due_amount,
+                        matched_invoice_id, match_status, is_missing_download, raw_json
                     ) VALUES (
-                        :statement_id,
-                        :entity_id,
-                        :invoice_number,
-                        :invoice_type,
-                        :invoice_date,
-                        :due_date,
-                        :invoice_amount,
-                        :open_amount,
-                        :current_amount,
-                        :past_due_amount,
-                        NULL,
-                        'unmatched',
-                        FALSE,
-                        CAST(:raw_json AS jsonb)
+                        :statement_id, :entity_id, :invoice_number, :invoice_type, :invoice_date, :due_date,
+                        :invoice_amount, :open_amount, :current_amount, :past_due_amount,
+                        NULL, :match_status, FALSE, CAST(:raw_json AS jsonb)
                     )
                     """
                 ),
@@ -2591,7 +2376,8 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
                     "open_amount": line["open_amount"],
                     "current_amount": line["current_amount"],
                     "past_due_amount": line["past_due_amount"],
-                    "raw_json": json.dumps(line["raw_json"] or {}),
+                    "match_status": MATCH_STATUS_UNMATCHED,
+                    "raw_json": json_dumps(line["raw_json"]),
                 },
             )
             inserted_lines += 1
@@ -2600,7 +2386,7 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
             text(
                 """
                 UPDATE hh_ap_documents
-                SET processing_status = 'parsed_statement',
+                SET processing_status = :processing_status,
                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -2608,13 +2394,12 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
             ),
             {
                 "id": document["id"],
-                "parser_json": json.dumps(
-                    {
-                        "parsed_as": "hh_statement",
-                        "parsed_statement_month_end": str(statement_month_end),
-                        "parsed_statement_line_count": inserted_lines,
-                    }
-                ),
+                "processing_status": PROCESSING_STATUS_PARSED_STATEMENT,
+                "parser_json": json_dumps({
+                    "parsed_as": DOCUMENT_TYPE_HH_STATEMENT,
+                    "parsed_statement_month_end": str(statement_month_end),
+                    "parsed_statement_line_count": inserted_lines,
+                }),
             },
         )
 
@@ -2634,21 +2419,13 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
 def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
-
         allowed_document_types = tuple(get_allowed_invoice_document_types())
 
         if payload.document_id:
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND id = :document_id
@@ -2656,24 +2433,13 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "document_id": payload.document_id,
-                    "allowed_document_types": list(allowed_document_types),
-                },
+                {"entity_id": entity["id"], "document_id": payload.document_id, "allowed_document_types": list(allowed_document_types)},
             ).mappings().first()
         else:
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND document_type = ANY(:allowed_document_types)
@@ -2681,78 +2447,29 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "allowed_document_types": list(allowed_document_types),
-                },
+                {"entity_id": entity["id"], "allowed_document_types": list(allowed_document_types)},
             ).mappings().first()
 
         if not document:
-            raise HTTPException(
-                status_code=404,
-                detail="No HH invoice document found for this entity",
-            )
-
+            raise HTTPException(status_code=404, detail="No HH invoice document found for this entity")
         if not document["file_bytes"]:
-            raise HTTPException(
-                status_code=400,
-                detail="This HH invoice document has no stored file bytes to parse",
-            )
+            raise HTTPException(status_code=400, detail="This HH invoice document has no stored file bytes to parse")
 
-        parsed = parse_hh_invoice_document(
-            file_bytes=document["file_bytes"],
-            source_filename=document["source_filename"],
-        )
+        parsed = parse_hh_invoice_document(file_bytes=document["file_bytes"], source_filename=document["source_filename"])
 
         invoice_row = session.execute(
             text(
                 """
                 INSERT INTO hh_ap_invoices (
-                    entity_id,
-                    document_id,
-                    invoice_number,
-                    invoice_type,
-                    vendor_name,
-                    vendor_invoice_number,
-                    po_number,
-                    invoice_date,
-                    due_date,
-                    remittance_due_date,
-                    currency_code,
-                    subtotal,
-                    hst_amount,
-                    surcharge_amount,
-                    advertising_amount,
-                    subscribed_shares_amount,
-                    five_year_note_amount,
-                    total_amount,
-                    match_status,
-                    is_statement_only,
-                    notes,
-                    raw_json
+                    entity_id, document_id, invoice_number, invoice_type, vendor_name, vendor_invoice_number,
+                    po_number, invoice_date, due_date, remittance_due_date, currency_code, subtotal, hst_amount,
+                    surcharge_amount, advertising_amount, subscribed_shares_amount, five_year_note_amount,
+                    total_amount, match_status, is_statement_only, notes, raw_json
                 ) VALUES (
-                    :entity_id,
-                    :document_id,
-                    :invoice_number,
-                    :invoice_type,
-                    :vendor_name,
-                    :vendor_invoice_number,
-                    :po_number,
-                    :invoice_date,
-                    :due_date,
-                    :remittance_due_date,
-                    :currency_code,
-                    :subtotal,
-                    :hst_amount,
-                    :surcharge_amount,
-                    :advertising_amount,
-                    :subscribed_shares_amount,
-                    :five_year_note_amount,
-                    :total_amount,
-                    'unmatched',
-                    :is_statement_only,
-                    :notes,
-                    CAST(:raw_json AS jsonb)
+                    :entity_id, :document_id, :invoice_number, :invoice_type, :vendor_name, :vendor_invoice_number,
+                    :po_number, :invoice_date, :due_date, :remittance_due_date, :currency_code, :subtotal, :hst_amount,
+                    :surcharge_amount, :advertising_amount, :subscribed_shares_amount, :five_year_note_amount,
+                    :total_amount, :match_status, :is_statement_only, :notes, CAST(:raw_json AS jsonb)
                 )
                 ON CONFLICT (entity_id, invoice_number, invoice_type)
                 DO UPDATE SET
@@ -2797,9 +2514,10 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
                 "subscribed_shares_amount": parsed["subscribed_shares_amount"],
                 "five_year_note_amount": parsed["five_year_note_amount"],
                 "total_amount": parsed["total_amount"],
+                "match_status": MATCH_STATUS_UNMATCHED,
                 "is_statement_only": parsed["is_statement_only"],
                 "notes": parsed["notes"],
-                "raw_json": json.dumps(parsed["raw_json"] or {}),
+                "raw_json": json_dumps(parsed["raw_json"]),
             },
         ).mappings().first()
 
@@ -2807,7 +2525,7 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             text(
                 """
                 UPDATE hh_ap_documents
-                SET processing_status = 'parsed_invoice',
+                SET processing_status = :processing_status,
                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -2815,13 +2533,12 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             ),
             {
                 "id": document["id"],
-                "parser_json": json.dumps(
-                    {
-                        "parsed_as": parsed["document_type"],
-                        "parsed_invoice_number": parsed["invoice_number"],
-                        "parsed_invoice_type": parsed["invoice_type"],
-                    }
-                ),
+                "processing_status": PROCESSING_STATUS_PARSED_INVOICE,
+                "parser_json": json_dumps({
+                    "parsed_as": parsed["document_type"],
+                    "parsed_invoice_number": parsed["invoice_number"],
+                    "parsed_invoice_type": parsed["invoice_type"],
+                }),
             },
         )
 
@@ -2845,29 +2562,17 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
             "raw_json": parsed["raw_json"],
         }
 
-
 @router.post("/remittances/parse-document")
 def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
-
-        allowed_document_types = (
-            "hh_remittance",
-            "hh_document",
-        )
+        allowed_document_types = (DOCUMENT_TYPE_HH_REMITTANCE, DOCUMENT_TYPE_HH_DOCUMENT)
 
         if payload.document_id:
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND id = :document_id
@@ -2875,24 +2580,13 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "document_id": payload.document_id,
-                    "allowed_document_types": list(allowed_document_types),
-                },
+                {"entity_id": entity["id"], "document_id": payload.document_id, "allowed_document_types": list(allowed_document_types)},
             ).mappings().first()
         else:
             document = session.execute(
                 text(
                     """
-                    SELECT
-                        id,
-                        document_type,
-                        source_filename,
-                        document_date,
-                        processing_status,
-                        raw_json,
-                        file_bytes
+                    SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND document_type = ANY(:allowed_document_types)
@@ -2900,28 +2594,15 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                     LIMIT 1
                     """
                 ),
-                {
-                    "entity_id": entity["id"],
-                    "allowed_document_types": list(allowed_document_types),
-                },
+                {"entity_id": entity["id"], "allowed_document_types": list(allowed_document_types)},
             ).mappings().first()
 
         if not document:
-            raise HTTPException(
-                status_code=404,
-                detail="No HH remittance document found for this entity",
-            )
-
+            raise HTTPException(status_code=404, detail="No HH remittance document found for this entity")
         if not document["file_bytes"]:
-            raise HTTPException(
-                status_code=400,
-                detail="This HH remittance document has no stored file bytes to parse",
-            )
+            raise HTTPException(status_code=400, detail="This HH remittance document has no stored file bytes to parse")
 
-        parsed = parse_hh_remittance_document(
-            file_bytes=document["file_bytes"],
-            source_filename=document["source_filename"],
-        )
+        parsed = parse_hh_remittance_document(file_bytes=document["file_bytes"], source_filename=document["source_filename"])
 
         existing_remittance = session.execute(
             text(
@@ -2971,7 +2652,7 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                     "remittance_date": parsed["remittance_date"],
                     "withdrawal_date": parsed["withdrawal_date"],
                     "total_amount": parsed["total_amount"],
-                    "raw_json": json.dumps(parsed["raw_json"] or {}),
+                    "raw_json": json_dumps(parsed["raw_json"]),
                 },
             ).mappings().first()
         else:
@@ -2979,21 +2660,9 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                 text(
                     """
                     INSERT INTO hh_ap_remittances (
-                        entity_id,
-                        document_id,
-                        remittance_reference,
-                        remittance_date,
-                        withdrawal_date,
-                        total_amount,
-                        raw_json
+                        entity_id, document_id, remittance_reference, remittance_date, withdrawal_date, total_amount, raw_json
                     ) VALUES (
-                        :entity_id,
-                        :document_id,
-                        :remittance_reference,
-                        :remittance_date,
-                        :withdrawal_date,
-                        :total_amount,
-                        CAST(:raw_json AS jsonb)
+                        :entity_id, :document_id, :remittance_reference, :remittance_date, :withdrawal_date, :total_amount, CAST(:raw_json AS jsonb)
                     )
                     RETURNING id
                     """
@@ -3005,19 +2674,11 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                     "remittance_date": parsed["remittance_date"],
                     "withdrawal_date": parsed["withdrawal_date"],
                     "total_amount": parsed["total_amount"],
-                    "raw_json": json.dumps(parsed["raw_json"] or {}),
+                    "raw_json": json_dumps(parsed["raw_json"]),
                 },
             ).mappings().first()
 
-        session.execute(
-            text(
-                """
-                DELETE FROM hh_ap_remittance_lines
-                WHERE remittance_id = :remittance_id
-                """
-            ),
-            {"remittance_id": remittance_row["id"]},
-        )
+        session.execute(text("DELETE FROM hh_ap_remittance_lines WHERE remittance_id = :remittance_id"), {"remittance_id": remittance_row["id"]})
 
         inserted_lines = 0
         for line in parsed["lines"]:
@@ -3025,25 +2686,11 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                 text(
                     """
                     INSERT INTO hh_ap_remittance_lines (
-                        remittance_id,
-                        entity_id,
-                        invoice_number,
-                        line_description,
-                        due_date,
-                        line_amount,
-                        matched_invoice_id,
-                        match_status,
-                        raw_json
+                        remittance_id, entity_id, invoice_number, line_description, due_date, line_amount,
+                        matched_invoice_id, match_status, raw_json
                     ) VALUES (
-                        :remittance_id,
-                        :entity_id,
-                        :invoice_number,
-                        :line_description,
-                        :due_date,
-                        :line_amount,
-                        NULL,
-                        'unmatched',
-                        CAST(:raw_json AS jsonb)
+                        :remittance_id, :entity_id, :invoice_number, :line_description, :due_date, :line_amount,
+                        NULL, :match_status, CAST(:raw_json AS jsonb)
                     )
                     """
                 ),
@@ -3054,7 +2701,8 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
                     "line_description": normalize_text(line["line_description"]),
                     "due_date": line["due_date"],
                     "line_amount": line["line_amount"],
-                    "raw_json": json.dumps(line["raw_json"] or {}),
+                    "match_status": MATCH_STATUS_UNMATCHED,
+                    "raw_json": json_dumps(line["raw_json"]),
                 },
             )
             inserted_lines += 1
@@ -3063,7 +2711,7 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
             text(
                 """
                 UPDATE hh_ap_documents
-                SET processing_status = 'parsed_remittance',
+                SET processing_status = :processing_status,
                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:parser_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -3071,13 +2719,12 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
             ),
             {
                 "id": document["id"],
-                "parser_json": json.dumps(
-                    {
-                        "parsed_as": parsed["document_type"],
-                        "parsed_remittance_reference": parsed["remittance_reference"],
-                        "parsed_remittance_line_count": inserted_lines,
-                    }
-                ),
+                "processing_status": PROCESSING_STATUS_PARSED_REMITTANCE,
+                "parser_json": json_dumps({
+                    "parsed_as": parsed["document_type"],
+                    "parsed_remittance_reference": parsed["remittance_reference"],
+                    "parsed_remittance_line_count": inserted_lines,
+                }),
             },
         )
 
@@ -3110,12 +2757,7 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
             {"entity_id": entity["id"]},
         ).mappings().all()
 
-        invoice_map_by_number: dict[str, list[dict]] = {}
-        for row in invoice_rows:
-            invoice_number = normalize_invoice_number(row["invoice_number"])
-            if not invoice_number:
-                continue
-            invoice_map_by_number.setdefault(invoice_number, []).append(dict(row))
+        invoice_map_by_number = build_invoice_map(invoice_rows)
 
         statement_scope_sql = """
             SELECT id, invoice_number, invoice_type
@@ -3135,10 +2777,7 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
             """
             statement_scope_params["statement_month_end"] = payload.statement_month_end
 
-        statement_rows = session.execute(
-            text(statement_scope_sql),
-            statement_scope_params,
-        ).mappings().all()
+        statement_rows = session.execute(text(statement_scope_sql), statement_scope_params).mappings().all()
 
         matched_invoice_ids: set[str] = set()
         matched_statement_count = 0
@@ -3147,18 +2786,8 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
         for row in statement_rows:
             invoice_number = normalize_invoice_number(row["invoice_number"])
             invoice_type = normalize_text(row["invoice_type"])
-
             candidates = invoice_map_by_number.get(invoice_number or "", [])
-
-            matched_invoice = None
-            if invoice_type:
-                for candidate in candidates:
-                    if normalize_text(candidate["invoice_type"]) == invoice_type:
-                        matched_invoice = candidate
-                        break
-
-            if not matched_invoice and candidates:
-                matched_invoice = candidates[0]
+            matched_invoice = choose_invoice_match_candidate(candidates, invoice_type)
 
             if matched_invoice:
                 session.execute(
@@ -3166,16 +2795,13 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                         """
                         UPDATE hh_ap_statement_lines
                         SET matched_invoice_id = :matched_invoice_id,
-                            match_status = 'matched',
+                            match_status = :match_status,
                             is_missing_download = FALSE,
                             updated_at = NOW()
                         WHERE id = :id
                         """
                     ),
-                    {
-                        "id": row["id"],
-                        "matched_invoice_id": matched_invoice["id"],
-                    },
+                    {"id": row["id"], "matched_invoice_id": matched_invoice["id"], "match_status": MATCH_STATUS_MATCHED},
                 )
                 matched_invoice_ids.add(str(matched_invoice["id"]))
                 matched_statement_count += 1
@@ -3185,13 +2811,13 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                         """
                         UPDATE hh_ap_statement_lines
                         SET matched_invoice_id = NULL,
-                            match_status = 'missing_download',
+                            match_status = :match_status,
                             is_missing_download = TRUE,
                             updated_at = NOW()
                         WHERE id = :id
                         """
                     ),
-                    {"id": row["id"]},
+                    {"id": row["id"], "match_status": MATCH_STATUS_MISSING_DOWNLOAD},
                 )
                 missing_download_count += 1
 
@@ -3212,7 +2838,7 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
         for row in remittance_rows:
             invoice_number = normalize_invoice_number(row["invoice_number"])
             candidates = invoice_map_by_number.get(invoice_number or "", [])
-            matched_invoice = candidates[0] if candidates else None
+            matched_invoice = choose_invoice_match_candidate(candidates, None)
 
             if matched_invoice:
                 session.execute(
@@ -3220,15 +2846,12 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                         """
                         UPDATE hh_ap_remittance_lines
                         SET matched_invoice_id = :matched_invoice_id,
-                            match_status = 'matched',
+                            match_status = :match_status,
                             updated_at = NOW()
                         WHERE id = :id
                         """
                     ),
-                    {
-                        "id": row["id"],
-                        "matched_invoice_id": matched_invoice["id"],
-                    },
+                    {"id": row["id"], "matched_invoice_id": matched_invoice["id"], "match_status": MATCH_STATUS_MATCHED},
                 )
                 matched_invoice_ids.add(str(matched_invoice["id"]))
                 matched_remittance_count += 1
@@ -3238,12 +2861,12 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                         """
                         UPDATE hh_ap_remittance_lines
                         SET matched_invoice_id = NULL,
-                            match_status = 'unmatched',
+                            match_status = :match_status,
                             updated_at = NOW()
                         WHERE id = :id
                         """
                     ),
-                    {"id": row["id"]},
+                    {"id": row["id"], "match_status": MATCH_STATUS_UNMATCHED},
                 )
                 unmatched_remittance_count += 1
 
@@ -3253,9 +2876,9 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                     """
                     UPDATE hh_ap_invoices
                     SET match_status = CASE
-                        WHEN id::text = ANY(:matched_invoice_ids) THEN 'matched'
-                        WHEN is_statement_only = TRUE THEN 'statement_only'
-                        ELSE 'unmatched'
+                        WHEN id::text = ANY(:matched_invoice_ids) THEN :matched_status
+                        WHEN is_statement_only = TRUE THEN :statement_only_status
+                        ELSE :unmatched_status
                     END,
                     updated_at = NOW()
                     WHERE entity_id = :entity_id
@@ -3264,6 +2887,9 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                 {
                     "entity_id": entity["id"],
                     "matched_invoice_ids": list(matched_invoice_ids),
+                    "matched_status": MATCH_STATUS_MATCHED,
+                    "statement_only_status": MATCH_STATUS_STATEMENT_ONLY,
+                    "unmatched_status": MATCH_STATUS_UNMATCHED,
                 },
             )
         else:
@@ -3272,8 +2898,8 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                     """
                     UPDATE hh_ap_invoices
                     SET match_status = CASE
-                        WHEN is_statement_only = TRUE THEN 'statement_only'
-                        ELSE 'unmatched'
+                        WHEN is_statement_only = TRUE THEN :statement_only_status
+                        ELSE :unmatched_status
                     END,
                     updated_at = NOW()
                     WHERE entity_id = :entity_id
@@ -3281,6 +2907,8 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
                 ),
                 {
                     "entity_id": entity["id"],
+                    "statement_only_status": MATCH_STATUS_STATEMENT_ONLY,
+                    "unmatched_status": MATCH_STATUS_UNMATCHED,
                 },
             )
 
@@ -3293,7 +2921,6 @@ def hh_ap_match_run(payload: HHAPMatchRunRequest):
             "unmatched_remittance_line_count": unmatched_remittance_count,
             "matched_invoice_count": len(matched_invoice_ids),
         }
-
 
 @router.get("/status")
 def hh_ap_status(entity_code: str):
@@ -3331,8 +2958,7 @@ def hh_ap_status(entity_code: str):
         remittance_summary = session.execute(
             text(
                 """
-                SELECT
-                    COUNT(*) AS remittance_count
+                SELECT COUNT(*) AS remittance_count
                 FROM hh_ap_remittances
                 WHERE entity_id = :entity_id
                 """
@@ -3357,8 +2983,7 @@ def hh_ap_status(entity_code: str):
         statement_summary = session.execute(
             text(
                 """
-                SELECT
-                    COUNT(*) AS statement_count
+                SELECT COUNT(*) AS statement_count
                 FROM hh_ap_statements
                 WHERE entity_id = :entity_id
                 """
@@ -3381,23 +3006,12 @@ def hh_ap_status(entity_code: str):
             {"entity_id": entity["id"]},
         ).mappings().first()
 
-        latest_statement = get_statement_by_month_end(
-            session=session,
-            entity_id=entity["id"],
-            statement_month_end=None,
-        )
+        latest_statement = get_statement_by_month_end(session=session, entity_id=entity["id"], statement_month_end=None)
 
         latest_documents = session.execute(
             text(
                 """
-                SELECT
-                    id,
-                    document_type,
-                    source_filename,
-                    document_date,
-                    upload_source,
-                    processing_status,
-                    created_at
+                SELECT id, document_type, source_filename, document_date, upload_source, processing_status, created_at
                 FROM hh_ap_documents
                 WHERE entity_id = :entity_id
                 ORDER BY created_at DESC
@@ -3410,13 +3024,7 @@ def hh_ap_status(entity_code: str):
         return {
             "entity_code": entity["entity_code"],
             "entity_name": entity["entity_name"],
-            "document_counts_by_type": [
-                {
-                    "document_type": row["document_type"],
-                    "count": int(row["doc_count"]),
-                }
-                for row in document_type_counts
-            ],
+            "document_counts_by_type": [{"document_type": row["document_type"], "count": int(row["doc_count"])} for row in document_type_counts],
             "invoice_summary": {
                 "invoice_count": int((invoice_summary or {}).get("invoice_count", 0) or 0),
                 "matched_invoice_count": int((invoice_summary or {}).get("matched_invoice_count", 0) or 0),
@@ -3471,18 +3079,9 @@ def hh_ap_exceptions(entity_code: str):
         statement_only_invoices = session.execute(
             text(
                 """
-                SELECT
-                    invoice_number,
-                    invoice_type,
-                    vendor_name,
-                    invoice_date,
-                    due_date,
-                    total_amount,
-                    match_status,
-                    notes
+                SELECT invoice_number, invoice_type, vendor_name, invoice_date, due_date, total_amount, match_status, notes
                 FROM hh_ap_invoices
-                WHERE entity_id = :entity_id
-                  AND is_statement_only = TRUE
+                WHERE entity_id = :entity_id AND is_statement_only = TRUE
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
                 LIMIT 100
                 """
@@ -3493,19 +3092,9 @@ def hh_ap_exceptions(entity_code: str):
         missing_download_statement_lines = session.execute(
             text(
                 """
-                SELECT
-                    invoice_number,
-                    invoice_type,
-                    invoice_date,
-                    due_date,
-                    invoice_amount,
-                    open_amount,
-                    current_amount,
-                    past_due_amount,
-                    match_status
+                SELECT invoice_number, invoice_type, invoice_date, due_date, invoice_amount, open_amount, current_amount, past_due_amount, match_status
                 FROM hh_ap_statement_lines
-                WHERE entity_id = :entity_id
-                  AND is_missing_download = TRUE
+                WHERE entity_id = :entity_id AND is_missing_download = TRUE
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
                 LIMIT 100
                 """
@@ -3516,17 +3105,9 @@ def hh_ap_exceptions(entity_code: str):
         unmatched_remittance_lines = session.execute(
             text(
                 """
-                SELECT
-                    id,
-                    invoice_number,
-                    line_description,
-                    due_date,
-                    line_amount,
-                    match_status,
-                    remittance_id
+                SELECT id, invoice_number, line_description, due_date, line_amount, match_status, remittance_id
                 FROM hh_ap_remittance_lines
-                WHERE entity_id = :entity_id
-                  AND match_status <> 'matched'
+                WHERE entity_id = :entity_id AND match_status <> 'matched'
                 ORDER BY due_date DESC NULLS LAST, invoice_number
                 LIMIT 100
                 """
@@ -3537,18 +3118,9 @@ def hh_ap_exceptions(entity_code: str):
         unmatched_invoices = session.execute(
             text(
                 """
-                SELECT
-                    invoice_number,
-                    invoice_type,
-                    vendor_name,
-                    invoice_date,
-                    due_date,
-                    total_amount,
-                    match_status,
-                    is_statement_only
+                SELECT invoice_number, invoice_type, vendor_name, invoice_date, due_date, total_amount, match_status, is_statement_only
                 FROM hh_ap_invoices
-                WHERE entity_id = :entity_id
-                  AND match_status <> 'matched'
+                WHERE entity_id = :entity_id AND match_status <> 'matched'
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
                 LIMIT 100
                 """
@@ -3617,17 +3189,10 @@ def hh_ap_exceptions(entity_code: str):
 def hh_ap_reconciliation(entity_code: str, statement_month_end: str | None = None):
     with db_session() as session:
         entity = get_entity(session, entity_code)
-        statement = get_statement_by_month_end(
-            session=session,
-            entity_id=entity["id"],
-            statement_month_end=statement_month_end,
-        )
+        statement = get_statement_by_month_end(session=session, entity_id=entity["id"], statement_month_end=statement_month_end)
 
         if not statement:
-            raise HTTPException(
-                status_code=404,
-                detail="No HH AP statement found for this entity and month_end",
-            )
+            raise HTTPException(status_code=404, detail="No HH AP statement found for this entity and month_end")
 
         statement_line_summary = session.execute(
             text(
@@ -3661,8 +3226,7 @@ def hh_ap_reconciliation(entity_code: str, statement_month_end: str | None = Non
                     COALESCE(SUM(COALESCE(i.five_year_note_amount, 0)), 0) AS five_year_note_total,
                     COALESCE(SUM(COALESCE(i.total_amount, 0)), 0) AS invoice_total
                 FROM hh_ap_statement_lines sl
-                JOIN hh_ap_invoices i
-                  ON i.id = sl.matched_invoice_id
+                JOIN hh_ap_invoices i ON i.id = sl.matched_invoice_id
                 WHERE sl.statement_id = :statement_id
                 """
             ),
@@ -3676,10 +3240,8 @@ def hh_ap_reconciliation(entity_code: str, statement_month_end: str | None = Non
                     COUNT(DISTINCT rl.id) AS matched_remittance_line_count,
                     COALESCE(SUM(COALESCE(rl.line_amount, 0)), 0) AS matched_remittance_amount_total
                 FROM hh_ap_statement_lines sl
-                JOIN hh_ap_invoices i
-                  ON i.id = sl.matched_invoice_id
-                JOIN hh_ap_remittance_lines rl
-                  ON rl.matched_invoice_id = i.id
+                JOIN hh_ap_invoices i ON i.id = sl.matched_invoice_id
+                JOIN hh_ap_remittance_lines rl ON rl.matched_invoice_id = i.id
                 WHERE sl.statement_id = :statement_id
                 """
             ),
@@ -3689,17 +3251,7 @@ def hh_ap_reconciliation(entity_code: str, statement_month_end: str | None = Non
         sample_statement_lines = session.execute(
             text(
                 """
-                SELECT
-                    invoice_number,
-                    invoice_type,
-                    invoice_date,
-                    due_date,
-                    invoice_amount,
-                    open_amount,
-                    current_amount,
-                    past_due_amount,
-                    match_status,
-                    is_missing_download
+                SELECT invoice_number, invoice_type, invoice_date, due_date, invoice_amount, open_amount, current_amount, past_due_amount, match_status, is_missing_download
                 FROM hh_ap_statement_lines
                 WHERE statement_id = :statement_id
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
