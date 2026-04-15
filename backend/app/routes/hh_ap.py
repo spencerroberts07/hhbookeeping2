@@ -16,6 +16,42 @@ from ..db import db_session
 
 router = APIRouter(prefix="/api/hh-ap", tags=["hh-ap"])
 
+INVOICE_TYPE_VENDOR_DIRECT = "vendor_direct"
+INVOICE_TYPE_HH_DIRECT = "hh_direct"
+INVOICE_TYPE_WAREHOUSE = "warehouse"
+
+DOCUMENT_TYPE_HH_INVOICE = "hh_invoice"
+DOCUMENT_TYPE_HH_INVOICE_DIRECT = "hh_invoice_direct"
+DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT = "hh_invoice_hh_direct"
+DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE = "hh_invoice_warehouse"
+DOCUMENT_TYPE_HH_DOCUMENT = "hh_document"
+
+VENDOR_DIRECT_FILENAME_MARKERS = (
+    "INV0120E",
+    "INV0130E",
+    "INV0150E",
+    "INV0170E",
+    "INV0171E",
+)
+
+HH_DIRECT_FILENAME_MARKERS = (
+    "INV0140E",
+)
+
+WAREHOUSE_FILENAME_MARKERS = (
+    "INV0670R",
+)
+
+
+def get_allowed_invoice_document_types() -> list[str]:
+    return [
+        DOCUMENT_TYPE_HH_INVOICE,
+        DOCUMENT_TYPE_HH_INVOICE_DIRECT,
+        DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT,
+        DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
+        DOCUMENT_TYPE_HH_DOCUMENT,
+    ]
+
 
 def money(value) -> Decimal:
     if value is None:
@@ -288,12 +324,20 @@ def parse_hh_signed_money(value: str | None) -> Decimal:
         return Decimal("0.00")
 
     cleaned = cleaned.replace(",", "").replace(" ", "")
-
     is_negative = False
 
-    if cleaned.endswith("CR"):
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        is_negative = True
+        cleaned = cleaned[1:-1]
+
+    upper_cleaned = cleaned.upper()
+
+    if upper_cleaned.endswith("CR"):
         is_negative = True
         cleaned = cleaned[:-2]
+    elif upper_cleaned.endswith("C"):
+        is_negative = True
+        cleaned = cleaned[:-1]
 
     if cleaned.endswith("-"):
         is_negative = True
@@ -303,10 +347,13 @@ def parse_hh_signed_money(value: str | None) -> Decimal:
         is_negative = True
         cleaned = cleaned[1:]
 
+    if cleaned.startswith("+"):
+        cleaned = cleaned[1:]
+
     if cleaned.startswith("."):
         cleaned = f"0{cleaned}"
 
-    if cleaned in {"", ".", "0", "0.00"}:
+    if cleaned in {"", ".", "0", "0.0", "0.00"}:
         cleaned = "0.00"
 
     amount = Decimal(cleaned)
@@ -359,36 +406,48 @@ def choose_invoice_filename_fallbacks(source_filename: str) -> dict[str, Any]:
     }
 
 
+def normalize_upper_space_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value).strip().upper()
+
+
+def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> list[str]:
+    standard_pages = extract_pdf_pages_text(file_bytes)
+    layout_pages = extract_pdf_pages_layout_text(file_bytes)
+
+    page_count = max(len(standard_pages), len(layout_pages))
+    merged_pages: list[str] = []
+
+    for idx in range(page_count):
+        standard_text = standard_pages[idx] if idx < len(standard_pages) else ""
+        layout_text = layout_pages[idx] if idx < len(layout_pages) else ""
+
+        chosen = layout_text if len(layout_text.strip()) >= len(standard_text.strip()) else standard_text
+        merged_pages.append(chosen or layout_text or standard_text or "")
+
+    return merged_pages
+
+
 def find_first_page_lines(file_bytes: bytes) -> list[str]:
-    pages = extract_pdf_pages_text(file_bytes)
-    if not pages:
+    pages = extract_pdf_pages_best_effort_text(file_bytes)
+    if not pages or not any(normalize_text(page) for page in pages):
         raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
     return [line.rstrip() for line in pages[0].splitlines()]
 
 
-def find_pure_money_line_after(lines: list[str], start_index: int) -> str | None:
-    for idx in range(start_index + 1, len(lines)):
-        cleaned = normalize_text(lines[idx])
-        if cleaned and re.fullmatch(r"[\d,]*\.?\d+(?:CR)?", cleaned):
-            return cleaned
-    return None
+def extract_money_tokens(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return re.findall(r"-?[\d,]*\.?\d+(?:CR|C|-)?", value, flags=re.IGNORECASE)
 
 
-def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    lines = find_first_page_lines(file_bytes)
+def extract_invoice_meta_from_text(full_text: str, source_filename: str) -> tuple[date | None, str | None]:
     fallbacks = choose_invoice_filename_fallbacks(source_filename)
 
-    invoice_meta_line = next(
-        (
-            line
-            for line in lines
-            if re.search(r"\b20\d{2}-[A-Za-z]{3}-\d{2}\s+\d{8}\b", line)
-        ),
-        "",
-    )
     invoice_meta_match = re.search(
         r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b",
-        invoice_meta_line,
+        full_text,
     )
 
     invoice_date = (
@@ -402,91 +461,227 @@ def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) ->
         else fallbacks["invoice_number"]
     )
 
-    due_line = next(
-        (
-            normalize_text(line)
-            for line in lines
-            if re.fullmatch(r"20\d{2}-[A-Za-z]{3}-\d{2}", normalize_text(line) or "")
-        ),
-        None,
-    )
-    remittance_due_date = (
-        parse_hh_iso_word_date(due_line)
-        if due_line
-        else fallbacks["remittance_due_date"]
-    )
+    return invoice_date, invoice_number
 
-    vendor_line = next(
-        (
-            line
-            for line in lines
-            if "Invoice Dt:" not in line and re.search(r"\s+D\s+", line)
-        ),
-        "",
-    )
-    vendor_name = normalize_text(re.split(r"\s+D\s+", vendor_line)[0]) if vendor_line else None
 
-    vendor_meta_line = next(
-        (
-            line
-            for line in lines
-            if "Invoice Dt:" in line and "Invoice Nbr:" in line
-        ),
-        "",
-    )
-    vendor_meta_match = re.search(
-        r"Invoice Dt:\s*(20\d{2}-[A-Za-z]{3}-\d{2})\s+Invoice Nbr:\s*(\S+)",
-        vendor_meta_line,
-    )
+def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | None, Decimal | None]:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
 
-    vendor_invoice_number = vendor_meta_match.group(2) if vendor_meta_match else None
-    vendor_invoice_date = (
-        parse_hh_iso_word_date(vendor_meta_match.group(1))
-        if vendor_meta_match
-        else None
-    )
+    for idx in range(len(cleaned_lines)):
+        window_lines = cleaned_lines[idx : idx + 6]
+        if not window_lines:
+            continue
 
-    top_amount_line = next(
-        (
-            line
-            for line in lines
-            if re.match(r"^\s*\d+\s+[\d,\.CR]+\s+[\d,\.CR]+", line)
-        ),
-        "",
-    )
-    top_money_tokens = [
-        token
-        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", top_amount_line)
-        if "." in token or token.endswith("CR")
-    ]
+        window_text = " ".join(window_lines)
+        upper_window = window_text.upper()
 
-    subtotal = parse_hh_signed_money(top_money_tokens[0]) if len(top_money_tokens) >= 1 else Decimal("0.00")
-    hst_amount = parse_hh_signed_money(top_money_tokens[1]) if len(top_money_tokens) >= 2 else Decimal("0.00")
-    pst_amount = parse_hh_signed_money(top_money_tokens[2]) if len(top_money_tokens) >= 3 else Decimal("0.00")
+        if (
+            "REMITTANCE DUE" not in upper_window
+            and "PLEASE APPLY THIS AMOUNT TO YOUR" not in upper_window
+        ):
+            continue
 
-    component_line_candidates = [
-        line
-        for line in lines
-        if len([
+        due_date = find_first_parsed_date_in_line(window_text)
+
+        money_tokens = extract_money_tokens(window_text)
+        total_amount = parse_hh_signed_money(money_tokens[-1]) if money_tokens else None
+
+        return due_date, total_amount
+
+    return None, None
+
+
+def extract_terms_summary_amounts(lines: list[str]) -> tuple[Decimal, Decimal, Decimal]:
+    for raw_line in reversed(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "SUB TOTAL" in upper_cleaned or "GST/HST" in upper_cleaned:
+            continue
+
+        money_tokens = extract_money_tokens(cleaned)
+        if len(money_tokens) >= 3 and re.match(r"^\d{2}\b", cleaned):
+            subtotal = parse_hh_signed_money(money_tokens[0])
+            hst_amount = parse_hh_signed_money(money_tokens[1])
+            pst_amount = parse_hh_signed_money(money_tokens[2])
+            return subtotal, hst_amount, pst_amount
+
+    return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
+
+
+def extract_component_totals_tokens(
+    lines: list[str],
+    source_filename: str,
+    parser_label: str,
+) -> list[str]:
+    candidates: list[list[str]] = []
+
+    for raw_line in lines:
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "LESS" in upper_cleaned:
+            continue
+        if "---" in cleaned:
+            continue
+        if "PLEASE APPLY THIS AMOUNT TO YOUR" in upper_cleaned:
+            continue
+
+        money_tokens = [
             token
-            for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", line)
-            if "." in token or token.endswith("CR")
-        ]) >= 8
-        and "LESS" not in line
-        and "---" not in line
-    ]
+            for token in extract_money_tokens(cleaned)
+            if "." in token or token.upper().endswith("CR") or token.upper().endswith("C")
+        ]
 
-    if not component_line_candidates:
+        if len(money_tokens) >= 8:
+            candidates.append(money_tokens[-8:])
+
+    if not candidates:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not find component totals line in direct invoice PDF: {source_filename}",
+            detail=f"Could not find component totals line in {parser_label} invoice PDF: {source_filename}",
         )
 
-    component_tokens = [
-        token
-        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", component_line_candidates[-1])
-        if "." in token or token.endswith("CR")
-    ][-8:]
+    return candidates[-1]
+
+
+def extract_labeled_money_from_lines(lines: list[str], label: str) -> Decimal:
+    upper_label = label.upper()
+
+    for idx, raw_line in enumerate(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        if upper_label not in cleaned.upper():
+            continue
+
+        same_line_tokens = extract_money_tokens(cleaned)
+        if same_line_tokens:
+            return parse_hh_signed_money(same_line_tokens[-1])
+
+        for look_ahead in range(idx + 1, min(idx + 3, len(lines))):
+            next_line = normalize_text(lines[look_ahead])
+            if not next_line:
+                continue
+
+            next_tokens = extract_money_tokens(next_line)
+            if next_tokens:
+                return parse_hh_signed_money(next_tokens[0])
+
+    return Decimal("0.00")
+
+
+def extract_vendor_direct_metadata(lines: list[str]) -> dict[str, Any]:
+    vendor_name = None
+    vendor_invoice_number = None
+    vendor_invoice_date = None
+
+    for idx, raw_line in enumerate(lines):
+        cleaned = normalize_text(raw_line)
+        if not cleaned:
+            continue
+
+        upper_cleaned = cleaned.upper()
+        if "INVOICE DT:" not in upper_cleaned or "INVOICE NBR:" not in upper_cleaned:
+            continue
+
+        match = re.search(
+            r"Invoice Dt:\s*(20\d{2}-[A-Za-z]{3}-\d{2})\s+Invoice Nbr:\s*(\S+)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            vendor_invoice_date = parse_hh_iso_word_date(match.group(1))
+            vendor_invoice_number = match.group(2)
+
+        for prev_idx in range(idx - 1, -1, -1):
+            prev_line = normalize_text(lines[prev_idx])
+            if prev_line:
+                vendor_name = prev_line
+                break
+
+        break
+
+    return {
+        "vendor_name": vendor_name,
+        "vendor_invoice_number": vendor_invoice_number,
+        "vendor_invoice_date": vendor_invoice_date,
+    }
+
+
+def detect_hh_invoice_family(file_bytes: bytes, source_filename: str) -> str:
+    pages = extract_pdf_pages_best_effort_text(file_bytes)
+    full_text_upper = normalize_upper_space_text("\n".join(pages))
+    source_name_upper = Path(source_filename).name.upper()
+
+    if (
+        "PLEASE PAY THIS AMOUNT:" in full_text_upper
+        or any(marker in source_name_upper for marker in WAREHOUSE_FILENAME_MARKERS)
+    ):
+        return INVOICE_TYPE_WAREHOUSE
+
+    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
+        return INVOICE_TYPE_VENDOR_DIRECT
+
+    if any(marker in source_name_upper for marker in HH_DIRECT_FILENAME_MARKERS):
+        return INVOICE_TYPE_HH_DIRECT
+
+    if "E DIRECT INVOICE" in full_text_upper:
+        return INVOICE_TYPE_VENDOR_DIRECT
+
+    if (
+        "DIRECT INVOICE" in full_text_upper
+        and "INVOICE DT:" in full_text_upper
+        and "INVOICE NBR:" in full_text_upper
+    ):
+        return INVOICE_TYPE_VENDOR_DIRECT
+
+    if "DIRECT INVOICE" in full_text_upper:
+        return INVOICE_TYPE_HH_DIRECT
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not determine HH invoice family for document: {source_filename}",
+    )
+
+
+def find_pure_money_line_after(lines: list[str], start_index: int) -> str | None:
+    for idx in range(start_index + 1, len(lines)):
+        cleaned = normalize_text(lines[idx])
+        if cleaned and re.fullmatch(r"[\d,]*\.?\d+(?:CR)?", cleaned):
+            return cleaned
+    return None
+
+
+def parse_hh_direct_family_invoice_document(
+    file_bytes: bytes,
+    source_filename: str,
+    invoice_type: str,
+    document_type: str,
+) -> dict[str, Any]:
+    lines = find_first_page_lines(file_bytes)
+    full_text = "\n".join(lines)
+
+    invoice_date, invoice_number = extract_invoice_meta_from_text(
+        full_text=full_text,
+        source_filename=source_filename,
+    )
+
+    remittance_due_date, total_amount = extract_invoice_remittance_due_and_total(lines)
+
+    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(lines)
+
+    component_tokens = extract_component_totals_tokens(
+        lines=lines,
+        source_filename=source_filename,
+        parser_label="direct-family",
+    )
 
     c_list_total = parse_hh_signed_money(component_tokens[0])
     discount_amount = parse_hh_signed_money(component_tokens[1])
@@ -497,34 +692,33 @@ def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) ->
     advertising_amount = parse_hh_signed_money(component_tokens[6])
     pre_tax_total = parse_hh_signed_money(component_tokens[7])
 
-    service_charge_line = next((line for line in lines if "Service Charges" in line), "")
-    enviro_fee_line = next((line for line in lines if "Enviro Fee Amount" in line), "")
+    service_charges = extract_labeled_money_from_lines(lines, "Service Charges")
+    enviro_fee_amount = extract_labeled_money_from_lines(lines, "Enviro Fee Amount")
 
-    service_charges = parse_hh_signed_money(
-        re.findall(r"[\d,]*\.?\d+(?:CR)?", service_charge_line)[0]
-    ) if service_charge_line else Decimal("0.00")
+    vendor_name = None
+    vendor_invoice_number = None
+    vendor_invoice_date = None
 
-    enviro_fee_amount = parse_hh_signed_money(
-        re.findall(r"[\d,]*\.?\d+(?:CR)?", enviro_fee_line)[0]
-    ) if enviro_fee_line else Decimal("0.00")
+    if invoice_type == INVOICE_TYPE_VENDOR_DIRECT:
+        vendor_meta = extract_vendor_direct_metadata(lines)
+        vendor_name = vendor_meta["vendor_name"]
+        vendor_invoice_number = vendor_meta["vendor_invoice_number"]
+        vendor_invoice_date = vendor_meta["vendor_invoice_date"]
+    else:
+        vendor_name = "Home Hardware Stores Limited"
 
-    sold_to_idx = next((idx for idx, line in enumerate(lines) if normalize_text(line) == "Sold To:"), -1)
-    total_pay_line = find_pure_money_line_after(lines, sold_to_idx) if sold_to_idx >= 0 else None
-    total_amount = (
-        parse_hh_signed_money(total_pay_line)
-        if total_pay_line
-        else subtotal + hst_amount + pst_amount
-    )
+    if total_amount is None:
+        total_amount = subtotal + hst_amount + pst_amount
 
     if not invoice_number or not invoice_date:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not determine invoice number/date for direct invoice: {source_filename}",
+            detail=f"Could not determine invoice number/date for direct-family invoice: {source_filename}",
         )
 
     return {
-        "document_type": "hh_invoice_direct",
-        "invoice_type": "vendor_direct",
+        "document_type": document_type,
+        "invoice_type": invoice_type,
         "invoice_number": invoice_number,
         "vendor_name": vendor_name,
         "vendor_invoice_number": vendor_invoice_number,
@@ -543,8 +737,8 @@ def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) ->
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v1",
-            "invoice_source_type": "vendor_direct",
+            "parser_version": "invoice_v2",
+            "invoice_source_type": invoice_type,
             "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
             "pst_amount": money_float(pst_amount),
             "c_list_total": money_float(c_list_total),
@@ -558,8 +752,27 @@ def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) ->
     }
 
 
+def parse_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    return parse_hh_direct_family_invoice_document(
+        file_bytes=file_bytes,
+        source_filename=source_filename,
+        invoice_type=INVOICE_TYPE_VENDOR_DIRECT,
+        document_type=DOCUMENT_TYPE_HH_INVOICE_DIRECT,
+    )
+
+
+def parse_hh_hh_direct_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
+    return parse_hh_direct_family_invoice_document(
+        file_bytes=file_bytes,
+        source_filename=source_filename,
+        invoice_type=INVOICE_TYPE_HH_DIRECT,
+        document_type=DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT,
+    )
+
+
 def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     lines = find_first_page_lines(file_bytes)
+    full_text = "\n".join(lines)
     fallbacks = choose_invoice_filename_fallbacks(source_filename)
 
     due_total_line = next(
@@ -567,14 +780,14 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
             normalize_text(line)
             for line in lines
             if re.fullmatch(
-                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR)?",
+                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?",
                 normalize_text(line) or "",
             )
         ),
         None,
     )
     due_total_match = re.match(
-        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR)?)",
+        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)",
         due_total_line or "",
     )
 
@@ -586,56 +799,19 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
     total_amount = (
         parse_hh_signed_money(due_total_match.group(2))
         if due_total_match
-        else Decimal("0.00")
+        else None
     )
 
-    invoice_meta_line = next(
-        (
-            line
-            for line in lines
-            if re.search(r"\b20\d{2}-[A-Za-z]{3}-\d{2}\s+\d{8}\b", line)
-        ),
-        "",
-    )
-    invoice_meta_match = re.search(
-        r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b",
-        invoice_meta_line,
+    invoice_date, invoice_number = extract_invoice_meta_from_text(
+        full_text=full_text,
+        source_filename=source_filename,
     )
 
-    invoice_date = (
-        parse_hh_iso_word_date(invoice_meta_match.group(1))
-        if invoice_meta_match
-        else fallbacks["invoice_date"]
+    component_tokens = extract_component_totals_tokens(
+        lines=lines,
+        source_filename=source_filename,
+        parser_label="warehouse",
     )
-    invoice_number = (
-        invoice_meta_match.group(2)
-        if invoice_meta_match
-        else fallbacks["invoice_number"]
-    )
-
-    component_line_candidates = [
-        line
-        for line in lines
-        if len([
-            token
-            for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", line)
-            if "." in token or token.endswith("CR")
-        ]) >= 8
-        and "LESS" not in line
-        and "---" not in line
-    ]
-
-    if not component_line_candidates:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not find component totals line in warehouse invoice PDF: {source_filename}",
-        )
-
-    component_tokens = [
-        token
-        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", component_line_candidates[-1])
-        if "." in token or token.endswith("CR")
-    ][-8:]
 
     c_list_total = parse_hh_signed_money(component_tokens[0])
     discount_amount = parse_hh_signed_money(component_tokens[1])
@@ -646,39 +822,12 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
     advertising_amount = parse_hh_signed_money(component_tokens[6])
     pre_service_pre_tax_total = parse_hh_signed_money(component_tokens[7])
 
-    service_charge_line = next((line for line in lines if "Service Charges" in line), "")
-    enviro_fee_line = next((line for line in lines if "Enviro Fee Amount" in line), "")
+    service_charges = extract_labeled_money_from_lines(lines, "Service Charges")
+    enviro_fee_amount = extract_labeled_money_from_lines(lines, "Enviro Fee Amount")
 
-    service_charges = parse_hh_signed_money(
-        re.findall(r"[\d,]*\.?\d+(?:CR)?", service_charge_line)[0]
-    ) if service_charge_line else Decimal("0.00")
+    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(lines)
 
-    enviro_fee_amount = parse_hh_signed_money(
-        re.findall(r"[\d,]*\.?\d+(?:CR)?", enviro_fee_line)[0]
-    ) if enviro_fee_line else Decimal("0.00")
-
-    lower_summary_line = next(
-        (
-            line
-            for line in lines
-            if re.match(
-                r"^\s*[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s+[\d,\.CR]+\s*$",
-                line,
-            )
-        ),
-        "",
-    )
-    lower_summary_tokens = [
-        token
-        for token in re.findall(r"[\d,]*\.?\d+(?:CR)?", lower_summary_line)
-        if "." in token or token.endswith("CR")
-    ]
-
-    subtotal = parse_hh_signed_money(lower_summary_tokens[-3]) if len(lower_summary_tokens) >= 3 else Decimal("0.00")
-    hst_amount = parse_hh_signed_money(lower_summary_tokens[-2]) if len(lower_summary_tokens) >= 2 else Decimal("0.00")
-    pst_amount = parse_hh_signed_money(lower_summary_tokens[-1]) if len(lower_summary_tokens) >= 1 else Decimal("0.00")
-
-    if total_amount == Decimal("0.00"):
+    if total_amount is None:
         total_amount = subtotal + hst_amount + pst_amount
 
     if not invoice_number or not invoice_date:
@@ -688,8 +837,8 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         )
 
     return {
-        "document_type": "hh_invoice_warehouse",
-        "invoice_type": "warehouse",
+        "document_type": DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
+        "invoice_type": INVOICE_TYPE_WAREHOUSE,
         "invoice_number": invoice_number,
         "vendor_name": "Home Hardware Stores Limited",
         "vendor_invoice_number": None,
@@ -708,8 +857,8 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v1",
-            "invoice_source_type": "warehouse",
+            "parser_version": "invoice_v2",
+            "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
             "pst_amount": money_float(pst_amount),
             "c_list_total": money_float(c_list_total),
             "discount_amount": money_float(discount_amount),
@@ -721,59 +870,25 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         },
     }
 
-
 def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
-    pages = extract_pdf_pages_text(file_bytes)
-    first_page_text = pages[0] if pages else ""
-    first_page_upper = first_page_text.upper()
-    source_name_upper = Path(source_filename).name.upper()
-
-    direct_filename_markers = (
-        "INV0120E",
-        "INV0150E",
+    invoice_family = detect_hh_invoice_family(
+        file_bytes=file_bytes,
+        source_filename=source_filename,
     )
 
-    warehouse_filename_markers = (
-        "INV0670R",
-    )
-
-    # Strong text clues first
-    if "DIRECT INVOICE" in first_page_upper:
-        return parse_hh_direct_invoice_document(file_bytes, source_filename)
-
-    if "PLEASE PAY THIS AMOUNT:" in first_page_upper:
+    if invoice_family == INVOICE_TYPE_WAREHOUSE:
         return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
 
-    # Filename clues second
-    if any(marker in source_name_upper for marker in direct_filename_markers):
+    if invoice_family == INVOICE_TYPE_VENDOR_DIRECT:
         return parse_hh_direct_invoice_document(file_bytes, source_filename)
 
-    if any(marker in source_name_upper for marker in warehouse_filename_markers):
-        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
-
-    # Fallback: try both parsers and keep the one that succeeds
-    direct_error = None
-    warehouse_error = None
-
-    try:
-        return parse_hh_direct_invoice_document(file_bytes, source_filename)
-    except HTTPException as exc:
-        direct_error = exc.detail
-
-    try:
-        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
-    except HTTPException as exc:
-        warehouse_error = exc.detail
+    if invoice_family == INVOICE_TYPE_HH_DIRECT:
+        return parse_hh_hh_direct_invoice_document(file_bytes, source_filename)
 
     raise HTTPException(
         status_code=400,
-        detail=(
-            f"Could not determine HH invoice type for document: {source_filename}. "
-            f"Direct parser error: {direct_error}. "
-            f"Warehouse parser error: {warehouse_error}."
-        ),
+        detail=f"Unsupported HH invoice family for document: {source_filename}",
     )
-
 
 def parse_hh_flexible_date(value: str | None) -> date | None:
     cleaned = normalize_text(value)
@@ -1456,12 +1571,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
     with db_session() as session:
         entity = get_entity(session, entity_code)
 
-    invoice_document_types = [
-        "hh_invoice",
-        "hh_invoice_direct",
-        "hh_invoice_warehouse",
-        "hh_document",
-    ]
+    invoice_document_types = get_allowed_invoice_document_types()
 
     processed_files: list[dict[str, Any]] = []
     failed_files: list[dict[str, Any]] = []
@@ -2525,12 +2635,7 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
 
-        allowed_document_types = (
-            "hh_invoice",
-            "hh_invoice_direct",
-            "hh_invoice_warehouse",
-            "hh_document",
-        )
+        allowed_document_types = tuple(get_allowed_invoice_document_types())
 
         if payload.document_id:
             document = session.execute(
