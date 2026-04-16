@@ -9,4 +9,8 @@ psycopg[binary]==3.2.3
 python-multipart==0.0.12
 PyJWT[crypto]==2.10.1
 cryptography==44.0.1
-pypdf
+pypdf==5.9.0
+PyMuPDF==1.27.2.2
+pytesseract==0.3.13
+pdf2image==1.17.0
+Pillow==10.4.0
