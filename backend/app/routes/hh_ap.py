@@ -23,11 +23,13 @@ router = APIRouter(prefix="/api/hh-ap", tags=["hh-ap"])
 INVOICE_TYPE_VENDOR_DIRECT = "vendor_direct"
 INVOICE_TYPE_HH_DIRECT = "hh_direct"
 INVOICE_TYPE_WAREHOUSE = "warehouse"
+INVOICE_TYPE_CLAIM = "claim"
 
 DOCUMENT_TYPE_HH_INVOICE = "hh_invoice"
 DOCUMENT_TYPE_HH_INVOICE_DIRECT = "hh_invoice_direct"
 DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT = "hh_invoice_hh_direct"
 DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE = "hh_invoice_warehouse"
+DOCUMENT_TYPE_HH_INVOICE_CLAIM = "hh_invoice_claim"
 DOCUMENT_TYPE_HH_DOCUMENT = "hh_document"
 DOCUMENT_TYPE_HH_STATEMENT = "hh_statement"
 DOCUMENT_TYPE_HH_REMITTANCE = "hh_remittance"
@@ -38,6 +40,7 @@ PROCESSING_STATUS_PARSED_INVOICE = "parsed_invoice"
 PROCESSING_STATUS_PARSED_STATEMENT = "parsed_statement"
 PROCESSING_STATUS_PARSED_REMITTANCE = "parsed_remittance"
 PROCESSING_STATUS_PARSE_FAILED_INVOICE = "parse_failed_invoice"
+PROCESSING_STATUS_NEEDS_OCR = "needs_ocr"
 
 MATCH_STATUS_MATCHED = "matched"
 MATCH_STATUS_UNMATCHED = "unmatched"
@@ -45,6 +48,7 @@ MATCH_STATUS_MISSING_DOWNLOAD = "missing_download"
 MATCH_STATUS_STATEMENT_ONLY = "statement_only"
 
 DEFAULT_CURRENCY_CODE = "CAD"
+OCR_MIN_TEXT_CHARS = 40
 
 VENDOR_DIRECT_FILENAME_MARKERS = (
     "INV0120E",
@@ -72,6 +76,7 @@ def get_allowed_invoice_document_types() -> list[str]:
         DOCUMENT_TYPE_HH_INVOICE_DIRECT,
         DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT,
         DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
+        DOCUMENT_TYPE_HH_INVOICE_CLAIM,
         DOCUMENT_TYPE_HH_DOCUMENT,
     ]
 
@@ -263,6 +268,7 @@ def try_extract_text(file_bytes: bytes, filename: str, content_type: str | None)
     return None
 
 
+
 def _get_pdf_reader(file_bytes: bytes):
     try:
         from pypdf import PdfReader
@@ -275,26 +281,107 @@ def _get_pdf_reader(file_bytes: bytes):
     return PdfReader(BytesIO(file_bytes))
 
 
-def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
-    reader = _get_pdf_reader(file_bytes)
-    return [(page.extract_text() or "") for page in reader.pages]
-
-
-def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
+def _safe_extract_pdf_pages_text(file_bytes: bytes, *, extraction_mode: str | None = None) -> list[str]:
     reader = _get_pdf_reader(file_bytes)
     page_texts: list[str] = []
 
     for page in reader.pages:
         try:
-            text_value = page.extract_text(extraction_mode="layout") or ""
+            if extraction_mode:
+                text_value = page.extract_text(extraction_mode=extraction_mode) or ""
+            else:
+                text_value = page.extract_text() or ""
         except TypeError:
             text_value = page.extract_text() or ""
+        except Exception:
+            text_value = ""
         page_texts.append(text_value)
 
     return page_texts
 
 
-def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> list[str]:
+def extract_pdf_pages_text(file_bytes: bytes) -> list[str]:
+    return _safe_extract_pdf_pages_text(file_bytes, extraction_mode=None)
+
+
+def extract_pdf_pages_layout_text(file_bytes: bytes) -> list[str]:
+    return _safe_extract_pdf_pages_text(file_bytes, extraction_mode="layout")
+
+
+def _ocr_pdf_pages_with_pymupdf(file_bytes: bytes) -> list[str]:
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return []
+
+    try:
+        from PIL import Image
+    except Exception:
+        return []
+
+    try:
+        import pytesseract  # type: ignore
+    except Exception:
+        return []
+
+    page_texts: list[str] = []
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text_value = pytesseract.image_to_string(img) or ""
+            page_texts.append(text_value)
+    finally:
+        doc.close()
+
+    return page_texts
+
+
+def _ocr_pdf_pages_with_pdf2image(file_bytes: bytes) -> list[str]:
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore
+    except Exception:
+        return []
+
+    try:
+        import pytesseract  # type: ignore
+    except Exception:
+        return []
+
+    try:
+        images = convert_from_bytes(file_bytes, dpi=250)
+    except Exception:
+        return []
+
+    page_texts: list[str] = []
+    for img in images:
+        try:
+            text_value = pytesseract.image_to_string(img) or ""
+        except Exception:
+            text_value = ""
+        page_texts.append(text_value)
+
+    return page_texts
+
+
+def extract_pdf_pages_ocr_text(file_bytes: bytes) -> tuple[list[str], str | None]:
+    for method_name, func in (
+        ("ocr_pymupdf_tesseract", _ocr_pdf_pages_with_pymupdf),
+        ("ocr_pdf2image_tesseract", _ocr_pdf_pages_with_pdf2image),
+    ):
+        try:
+            pages = func(file_bytes)
+        except Exception:
+            pages = []
+
+        if pages and sum(len((page or "").strip()) for page in pages) >= OCR_MIN_TEXT_CHARS:
+            return pages, method_name
+
+    return [], None
+
+
+def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> dict[str, Any]:
     standard_pages = extract_pdf_pages_text(file_bytes)
     layout_pages = extract_pdf_pages_layout_text(file_bytes)
 
@@ -307,14 +394,45 @@ def extract_pdf_pages_best_effort_text(file_bytes: bytes) -> list[str]:
         chosen = layout_text if len(layout_text.strip()) >= len(standard_text.strip()) else standard_text
         merged_pages.append(chosen or layout_text or standard_text or "")
 
-    return merged_pages
+    text_method = "pypdf_layout" if sum(len((p or "").strip()) for p in layout_pages) >= sum(len((p or "").strip()) for p in standard_pages) else "pypdf_text"
+    char_count = sum(len((page or "").strip()) for page in merged_pages)
+
+    if char_count >= OCR_MIN_TEXT_CHARS:
+        return {
+            "pages": merged_pages,
+            "text_method": text_method,
+            "ocr_used": False,
+            "char_count": char_count,
+        }
+
+    ocr_pages, ocr_method = extract_pdf_pages_ocr_text(file_bytes)
+    ocr_char_count = sum(len((page or "").strip()) for page in ocr_pages)
+
+    if ocr_pages and ocr_char_count > char_count:
+        return {
+            "pages": ocr_pages,
+            "text_method": ocr_method or "ocr_unknown",
+            "ocr_used": True,
+            "char_count": ocr_char_count,
+        }
+
+    return {
+        "pages": merged_pages,
+        "text_method": text_method,
+        "ocr_used": False,
+        "char_count": char_count,
+    }
 
 
 def extract_invoice_parser_context(file_bytes: bytes) -> dict[str, Any]:
-    pages = extract_pdf_pages_best_effort_text(file_bytes)
+    extraction = extract_pdf_pages_best_effort_text(file_bytes)
+    pages = extraction["pages"]
 
     if not pages or not any(normalize_text(page) for page in pages):
-        raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+        raise HTTPException(
+            status_code=400,
+            detail="No text could be extracted from PDF. OCR fallback also did not produce readable text."
+        )
 
     all_lines: list[str] = []
     for page in pages:
@@ -326,8 +444,10 @@ def extract_invoice_parser_context(file_bytes: bytes) -> dict[str, Any]:
         "all_lines": all_lines,
         "full_text": full_text,
         "full_text_upper": normalize_upper_space_text(full_text),
+        "text_method": extraction["text_method"],
+        "ocr_used": extraction["ocr_used"],
+        "char_count": extraction["char_count"],
     }
-
 
 def parse_hh_short_date(value: str) -> date:
     cleaned = normalize_text(value)
@@ -800,13 +920,16 @@ def extract_vendor_direct_metadata(lines: list[str]) -> dict[str, Any]:
 def classify_direct_family_invoice(source_filename: str, full_text_upper: str, vendor_invoice_number: str | None, vendor_invoice_date: date | None) -> tuple[str, str]:
     source_name_upper = Path(source_filename).name.upper()
 
-    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
-        return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
+    if "CLAIM INVOICE" in full_text_upper:
+        return INVOICE_TYPE_CLAIM, DOCUMENT_TYPE_HH_INVOICE_CLAIM
 
     if any(marker in source_name_upper for marker in HH_DIRECT_FILENAME_MARKERS):
         return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
 
     if "E DIRECT INVOICE" in full_text_upper:
+        return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
+
+    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
         return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
 
     if vendor_invoice_number or vendor_invoice_date:
@@ -841,7 +964,7 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         vendor_invoice_date=vendor_invoice_date,
     )
 
-    if invoice_type == INVOICE_TYPE_HH_DIRECT:
+    if invoice_type in {INVOICE_TYPE_HH_DIRECT, INVOICE_TYPE_CLAIM}:
         vendor_name = "Home Hardware Stores Limited"
         vendor_invoice_number = None
         vendor_invoice_date = None
@@ -873,7 +996,7 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v3",
+            "parser_version": "invoice_v4",
             "invoice_source_type": invoice_type,
             "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
             "pst_amount": money_float(pst_amount),
@@ -884,6 +1007,9 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
             "service_charges": money_float(service_charges),
             "enviro_fee_amount": money_float(enviro_fee_amount),
             "source_filename": source_filename,
+            "text_extraction_method": ctx["text_method"],
+            "ocr_used": ctx["ocr_used"],
+            "extracted_char_count": ctx["char_count"],
             "parser_warnings": parser_warnings,
         },
     }
@@ -942,7 +1068,7 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v3",
+            "parser_version": "invoice_v4",
             "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
             "pst_amount": money_float(pst_amount),
             "c_list_total": money_float(component_amounts["c_list_total"]),
@@ -952,6 +1078,9 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
             "service_charges": money_float(service_charges),
             "enviro_fee_amount": money_float(enviro_fee_amount),
             "source_filename": source_filename,
+            "text_extraction_method": ctx["text_method"],
+            "ocr_used": ctx["ocr_used"],
+            "extracted_char_count": ctx["char_count"],
             "parser_warnings": parser_warnings,
         },
     }
@@ -959,22 +1088,27 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
 
 def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     source_name_upper = Path(source_filename).name.upper()
+    warehouse_error = None
+    direct_error = None
 
     if any(marker in source_name_upper for marker in WAREHOUSE_FILENAME_MARKERS):
-        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
-
-    direct_error = None
-    warehouse_error = None
-
-    try:
-        return parse_hh_direct_family_invoice_document(file_bytes, source_filename)
-    except HTTPException as exc:
-        direct_error = exc.detail
-
-    try:
-        return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
-    except HTTPException as exc:
-        warehouse_error = exc.detail
+        try:
+            return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+        except HTTPException as exc:
+            warehouse_error = exc.detail
+        try:
+            return parse_hh_direct_family_invoice_document(file_bytes, source_filename)
+        except HTTPException as exc:
+            direct_error = exc.detail
+    else:
+        try:
+            return parse_hh_direct_family_invoice_document(file_bytes, source_filename)
+        except HTTPException as exc:
+            direct_error = exc.detail
+        try:
+            return parse_hh_warehouse_invoice_document(file_bytes, source_filename)
+        except HTTPException as exc:
+            warehouse_error = exc.detail
 
     raise HTTPException(
         status_code=400,
