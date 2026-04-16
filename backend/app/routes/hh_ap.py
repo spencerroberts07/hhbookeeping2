@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from difflib import get_close_matches
 from calendar import monthrange
 from datetime import date, datetime
 from decimal import Decimal
@@ -464,10 +465,70 @@ def parse_hh_short_date(value: str) -> date:
         ) from exc
 
 
+OCR_MONTH_ABBREVIATIONS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def normalize_ocr_month_token(value: str | None) -> str | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", cleaned).upper()
+    if not cleaned:
+        return None
+
+    cleaned = (
+        cleaned.replace("0", "O")
+        .replace("1", "I")
+        .replace("5", "S")
+        .replace("8", "B")
+    )
+
+    if len(cleaned) >= 3:
+        cleaned = cleaned[:3]
+
+    if cleaned in OCR_MONTH_ABBREVIATIONS:
+        return cleaned
+
+    close = get_close_matches(cleaned, OCR_MONTH_ABBREVIATIONS, n=1, cutoff=0.34)
+    if close:
+        return close[0]
+
+    common_map = {
+        "SAN": "JAN",
+        "IAN": "JAN",
+        "JAM": "JAN",
+        "PEC": "DEC",
+        "OEC": "DEC",
+        "GEC": "DEC",
+        "APR": "APR",
+        "JUL": "JUL",
+        "AUC": "AUG",
+        "0CT": "OCT",
+        "NOV": "NOV",
+    }
+    return common_map.get(cleaned)
+
+
 def parse_hh_iso_word_date(value: str | None) -> date:
     cleaned = normalize_text(value)
     if not cleaned:
         raise HTTPException(status_code=400, detail="Missing HH invoice date value")
+
+    normalized = cleaned.replace("—", "-").replace("–", "-").replace("_", "-")
+    normalized = re.sub(r"\s+", "", normalized)
+
+    match = re.fullmatch(r"(20\d{2})-([A-Za-z0-9]{3,5})-(\d{2})", normalized)
+    if match:
+        year = int(match.group(1))
+        month_token = normalize_ocr_month_token(match.group(2))
+        day = int(match.group(3))
+        if month_token:
+            month = OCR_MONTH_ABBREVIATIONS.index(month_token) + 1
+            try:
+                return date(year, month, day)
+            except ValueError:
+                pass
 
     for fmt in ("%Y-%b-%d", "%Y-%B-%d"):
         try:
@@ -558,9 +619,24 @@ def extract_filename_8digit_tokens(source_filename: str) -> list[str]:
 
 def choose_invoice_filename_fallbacks(source_filename: str) -> dict[str, Any]:
     tokens = extract_filename_8digit_tokens(source_filename)
-    invoice_date = parse_hh_mmddyyyy(tokens[0]) if len(tokens) >= 1 else None
-    invoice_number = tokens[-2] if len(tokens) >= 2 else None
-    remittance_due_date = parse_hh_mmddyyyy(tokens[-1]) if len(tokens) >= 3 else None
+
+    date_like_tokens: list[str] = []
+    non_date_tokens: list[str] = []
+    for token in tokens:
+        if parse_hh_mmddyyyy(token):
+            date_like_tokens.append(token)
+        else:
+            non_date_tokens.append(token)
+
+    invoice_date = parse_hh_mmddyyyy(date_like_tokens[0]) if date_like_tokens else None
+    remittance_due_date = parse_hh_mmddyyyy(date_like_tokens[-1]) if len(date_like_tokens) >= 2 else None
+
+    if non_date_tokens:
+        invoice_number = non_date_tokens[0]
+    elif len(tokens) == 1:
+        invoice_number = tokens[0]
+    else:
+        invoice_number = None
 
     return {
         "invoice_date": invoice_date,
@@ -750,10 +826,42 @@ def extract_money_tokens(value: str | None) -> list[str]:
 
 def extract_invoice_meta_from_text(full_text: str, source_filename: str) -> tuple[date | None, str | None]:
     fallbacks = choose_invoice_filename_fallbacks(source_filename)
-    invoice_meta_match = re.search(r"\b(20\d{2}-[A-Za-z]{3}-\d{2})\s+(\d{8})\b", full_text)
 
-    invoice_date = parse_hh_iso_word_date(invoice_meta_match.group(1)) if invoice_meta_match else fallbacks["invoice_date"]
-    invoice_number = invoice_meta_match.group(2) if invoice_meta_match else fallbacks["invoice_number"]
+    invoice_date = fallbacks["invoice_date"]
+    invoice_number = fallbacks["invoice_number"]
+
+    compact_text = full_text.replace("|", " ").replace("[", " ").replace("]", " ")
+
+    date_number_match = re.search(
+        r"(20\d{2}[-–—][A-Za-z0-9]{3,5}[-–—]\d{2}).{0,25}?(\d{8})",
+        compact_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if date_number_match:
+        try:
+            invoice_date = parse_hh_iso_word_date(date_number_match.group(1))
+        except HTTPException:
+            pass
+        invoice_number = date_number_match.group(2)
+
+    if not invoice_date:
+        date_only_match = re.search(r"(20\d{2}[-–—][A-Za-z0-9]{3,5}[-–—]\d{2})", compact_text, flags=re.IGNORECASE)
+        if date_only_match:
+            try:
+                invoice_date = parse_hh_iso_word_date(date_only_match.group(1))
+            except HTTPException:
+                pass
+
+    if not invoice_number:
+        label_match = re.search(r"INVOICE\s+NUMBER.{0,20}?(\d{8})", compact_text, flags=re.IGNORECASE | re.DOTALL)
+        if label_match:
+            invoice_number = label_match.group(1)
+
+    if not invoice_number:
+        eight_digit_tokens = re.findall(EIGHT_DIGIT_TOKEN_PATTERN, compact_text)
+        if eight_digit_tokens:
+            invoice_number = eight_digit_tokens[0]
+
     return invoice_date, invoice_number
 
 
@@ -920,8 +1028,24 @@ def extract_vendor_direct_metadata(lines: list[str]) -> dict[str, Any]:
 def classify_direct_family_invoice(source_filename: str, full_text_upper: str, vendor_invoice_number: str | None, vendor_invoice_date: date | None) -> tuple[str, str]:
     source_name_upper = Path(source_filename).name.upper()
 
+    hh_direct_clues = (
+        "INSURANCE INVOICES",
+        "DEALER SERVICE INVOICES",
+        "ADVERTISING PAID BACK CLAIMS",
+        "MOBILE DEVICE SERVICE CHARGE",
+        "GROUP INSURANCE",
+        "GENERAL INSURANCE PREMIUM",
+        "INTERCHANGE REBATE",
+        "HELPLINE",
+        "LOYALTY",
+        "ZEBRA",
+    )
+
     if "CLAIM INVOICE" in full_text_upper:
         return INVOICE_TYPE_CLAIM, DOCUMENT_TYPE_HH_INVOICE_CLAIM
+
+    if any(clue in full_text_upper for clue in hh_direct_clues):
+        return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
 
     if any(marker in source_name_upper for marker in HH_DIRECT_FILENAME_MARKERS):
         return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
@@ -929,10 +1053,10 @@ def classify_direct_family_invoice(source_filename: str, full_text_upper: str, v
     if "E DIRECT INVOICE" in full_text_upper:
         return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
 
-    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
+    if vendor_invoice_number or vendor_invoice_date:
         return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
 
-    if vendor_invoice_number or vendor_invoice_date:
+    if any(marker in source_name_upper for marker in VENDOR_DIRECT_FILENAME_MARKERS):
         return INVOICE_TYPE_VENDOR_DIRECT, DOCUMENT_TYPE_HH_INVOICE_DIRECT
 
     return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
