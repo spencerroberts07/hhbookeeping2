@@ -8,6 +8,7 @@ from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from collections import Counter
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -246,6 +247,40 @@ def get_statement_by_month_end(session, entity_id: str, statement_month_end: str
         ).mappings().first()
 
     return statement
+
+
+def parse_optional_iso_query_date(param_name: str, value: str | None) -> date | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+
+    try:
+        return date.fromisoformat(cleaned)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{param_name} must be blank or in YYYY-MM-DD format",
+        )
+
+
+def categorize_missing_download_statement_line(
+    invoice_date: date | None,
+    loaded_period_start: date | None,
+    loaded_period_end: date | None,
+) -> tuple[str, bool | None]:
+    if invoice_date is None:
+        return "missing_download_unknown_invoice_date", None
+
+    if loaded_period_start and invoice_date < loaded_period_start:
+        return "prior_period_open_invoice", False
+
+    if loaded_period_end and invoice_date > loaded_period_end:
+        return "outside_loaded_period_future_invoice", False
+
+    if loaded_period_start and loaded_period_end:
+        return "current_period_missing_pdf", True
+
+    return "missing_download_unclassified", None
 
 
 def build_source_hash(file_bytes: bytes) -> str:
@@ -3330,79 +3365,150 @@ def hh_ap_status(entity_code: str):
 
 
 @router.get("/exceptions")
-def hh_ap_exceptions(entity_code: str):
+def hh_ap_exceptions(
+    entity_code: str,
+    statement_month_end: str | None = None,
+    loaded_period_start: str | None = None,
+    loaded_period_end: str | None = None,
+    limit: int = 500,
+):
     with db_session() as session:
         entity = get_entity(session, entity_code)
 
-        statement_only_invoices = session.execute(
-            text(
-                """
-                SELECT invoice_number, invoice_type, vendor_name, invoice_date, due_date, total_amount, match_status, notes
-                FROM hh_ap_invoices
-                WHERE entity_id = :entity_id AND is_statement_only = TRUE
-                ORDER BY invoice_date DESC NULLS LAST, invoice_number
-                LIMIT 100
-                """
-            ),
-            {"entity_id": entity["id"]},
-        ).mappings().all()
+        statement_month_end_date = parse_optional_iso_query_date(
+            "statement_month_end",
+            statement_month_end,
+        )
+        loaded_period_start_date = parse_optional_iso_query_date(
+            "loaded_period_start",
+            loaded_period_start,
+        )
+        loaded_period_end_date = parse_optional_iso_query_date(
+            "loaded_period_end",
+            loaded_period_end,
+        )
+
+        if (loaded_period_start_date and not loaded_period_end_date) or (
+            loaded_period_end_date and not loaded_period_start_date
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="loaded_period_start and loaded_period_end must both be provided together",
+            )
+
+        if (
+            loaded_period_start_date
+            and loaded_period_end_date
+            and loaded_period_start_date > loaded_period_end_date
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="loaded_period_start cannot be after loaded_period_end",
+            )
+
+        statement = get_statement_by_month_end(
+            session=session,
+            entity_id=entity["id"],
+            statement_month_end=str(statement_month_end_date) if statement_month_end_date else None,
+        )
+
+        if not statement:
+            raise HTTPException(
+                status_code=404,
+                detail="No HH AP statement found for this entity and month_end",
+            )
 
         missing_download_statement_lines = session.execute(
             text(
                 """
-                SELECT invoice_number, invoice_type, invoice_date, due_date, invoice_amount, open_amount, current_amount, past_due_amount, match_status
+                SELECT
+                    id,
+                    invoice_number,
+                    invoice_type,
+                    invoice_date,
+                    due_date,
+                    invoice_amount,
+                    open_amount,
+                    current_amount,
+                    past_due_amount,
+                    match_status
                 FROM hh_ap_statement_lines
-                WHERE entity_id = :entity_id AND is_missing_download = TRUE
+                WHERE statement_id = :statement_id
+                  AND is_missing_download = TRUE
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
-                LIMIT 100
+                LIMIT :limit
                 """
             ),
-            {"entity_id": entity["id"]},
+            {
+                "statement_id": statement["id"],
+                "limit": limit,
+            },
         ).mappings().all()
 
         unmatched_remittance_lines = session.execute(
             text(
                 """
-                SELECT id, invoice_number, line_description, due_date, line_amount, match_status, remittance_id
+                SELECT
+                    id,
+                    invoice_number,
+                    line_description,
+                    due_date,
+                    line_amount,
+                    match_status,
+                    remittance_id
                 FROM hh_ap_remittance_lines
-                WHERE entity_id = :entity_id AND match_status <> 'matched'
+                WHERE entity_id = :entity_id
+                  AND match_status <> 'matched'
                 ORDER BY due_date DESC NULLS LAST, invoice_number
-                LIMIT 100
+                LIMIT :limit
                 """
             ),
-            {"entity_id": entity["id"]},
+            {
+                "entity_id": entity["id"],
+                "limit": limit,
+            },
         ).mappings().all()
 
         unmatched_invoices = session.execute(
             text(
                 """
-                SELECT invoice_number, invoice_type, vendor_name, invoice_date, due_date, total_amount, match_status, is_statement_only
+                SELECT
+                    invoice_number,
+                    invoice_type,
+                    vendor_name,
+                    invoice_date,
+                    due_date,
+                    total_amount,
+                    match_status,
+                    is_statement_only
                 FROM hh_ap_invoices
-                WHERE entity_id = :entity_id AND match_status <> 'matched'
+                WHERE entity_id = :entity_id
+                  AND match_status <> 'matched'
                 ORDER BY invoice_date DESC NULLS LAST, invoice_number
-                LIMIT 100
+                LIMIT :limit
                 """
             ),
-            {"entity_id": entity["id"]},
+            {
+                "entity_id": entity["id"],
+                "limit": limit,
+            },
         ).mappings().all()
 
-        return {
-            "entity_code": entity["entity_code"],
-            "statement_only_invoices": [
+        categorized_missing_downloads: list[dict[str, Any]] = []
+        category_counter: Counter[str] = Counter()
+
+        for row in missing_download_statement_lines:
+            category, is_in_loaded_period = categorize_missing_download_statement_line(
+                invoice_date=row["invoice_date"],
+                loaded_period_start=loaded_period_start_date,
+                loaded_period_end=loaded_period_end_date,
+            )
+
+            category_counter[category] += 1
+
+            categorized_missing_downloads.append(
                 {
-                    "invoice_number": row["invoice_number"],
-                    "invoice_type": row["invoice_type"],
-                    "vendor_name": row["vendor_name"],
-                    "invoice_date": str(row["invoice_date"]) if row["invoice_date"] else None,
-                    "due_date": str(row["due_date"]) if row["due_date"] else None,
-                    "total_amount": float(row["total_amount"] or 0),
-                    "match_status": row["match_status"],
-                    "notes": row["notes"],
-                }
-                for row in statement_only_invoices
-            ],
-            "missing_download_statement_lines": [
-                {
+                    "id": str(row["id"]),
                     "invoice_number": row["invoice_number"],
                     "invoice_type": row["invoice_type"],
                     "invoice_date": str(row["invoice_date"]) if row["invoice_date"] else None,
@@ -3412,9 +3518,23 @@ def hh_ap_exceptions(entity_code: str):
                     "current_amount": float(row["current_amount"] or 0),
                     "past_due_amount": float(row["past_due_amount"] or 0),
                     "match_status": row["match_status"],
+                    "category": category,
+                    "is_in_loaded_period": is_in_loaded_period,
                 }
-                for row in missing_download_statement_lines
-            ],
+            )
+
+        missing_download_summary = {
+            "total_missing_download_count": len(categorized_missing_downloads),
+            "by_category": dict(sorted(category_counter.items())),
+        }
+
+        return {
+            "entity_code": entity["entity_code"],
+            "statement_month_end": str(statement["statement_month_end"]) if statement["statement_month_end"] else None,
+            "loaded_period_start": str(loaded_period_start_date) if loaded_period_start_date else None,
+            "loaded_period_end": str(loaded_period_end_date) if loaded_period_end_date else None,
+            "missing_download_summary": missing_download_summary,
+            "missing_download_statement_lines": categorized_missing_downloads,
             "unmatched_remittance_lines": [
                 {
                     "id": str(row["id"]),
@@ -3441,7 +3561,6 @@ def hh_ap_exceptions(entity_code: str):
                 for row in unmatched_invoices
             ],
         }
-
 
 @router.get("/reconciliation")
 def hh_ap_reconciliation(entity_code: str, statement_month_end: str | None = None):
