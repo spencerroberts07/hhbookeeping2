@@ -18,6 +18,7 @@ app.include_router(dashboard_router)
 app.include_router(cash_balancing_router)
 app.include_router(month_end_router)
 app.include_router(hh_ap_router)
+app.include_router(month_end_hh_ap_router)
 
 
 @app.get("/health", response_model=HealthResponse)
