@@ -51,6 +51,7 @@ MATCH_STATUS_STATEMENT_ONLY = "statement_only"
 
 DEFAULT_CURRENCY_CODE = "CAD"
 OCR_MIN_TEXT_CHARS = 40
+TOTAL_TIE_TOLERANCE = Decimal("0.05")
 
 VENDOR_DIRECT_FILENAME_MARKERS = (
     "INV0120E",
@@ -904,23 +905,56 @@ def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | N
     cleaned_lines = [normalize_text(line) for line in lines]
     cleaned_lines = [line for line in cleaned_lines if line]
 
-    for idx in range(len(cleaned_lines)):
-        window_lines = cleaned_lines[idx : idx + 6]
+    label_indexes: list[int] = []
+
+    for idx, line in enumerate(cleaned_lines):
+        upper_line = line.upper()
+        if (
+            "REMITTANCE DUE" in upper_line
+            or "PLEASE APPLY THIS AMOUNT TO YOUR" in upper_line
+            or "PLEASE PAY THIS AMOUNT" in upper_line
+        ):
+            label_indexes.append(idx)
+
+    best_due_date: date | None = None
+    best_total_amount: Decimal | None = None
+
+    for idx in label_indexes:
+        window_start = max(0, idx - 2)
+        window_end = min(len(cleaned_lines), idx + 14)
+        window_lines = cleaned_lines[window_start:window_end]
         if not window_lines:
             continue
 
         window_text = " ".join(window_lines)
-        upper_window = window_text.upper()
 
-        if "REMITTANCE DUE" not in upper_window and "PLEASE APPLY THIS AMOUNT TO YOUR" not in upper_window:
+        parsed_due_date = find_first_parsed_date_in_line(window_text)
+        if parsed_due_date and best_due_date is None:
+            best_due_date = parsed_due_date
+
+        money_candidates: list[Decimal] = []
+        for token in extract_money_tokens(window_text):
+            try:
+                amount = parse_hh_signed_money(token)
+            except Exception:
+                continue
+            money_candidates.append(amount)
+
+        nonzero_candidates = [amount for amount in money_candidates if not is_effectively_zero(amount)]
+        if not nonzero_candidates:
             continue
 
-        due_date = find_first_parsed_date_in_line(window_text)
-        money_tokens = extract_money_tokens(window_text)
-        total_amount = parse_hh_signed_money(money_tokens[-1]) if money_tokens else None
-        return due_date, total_amount
+        positive_candidates = [amount for amount in nonzero_candidates if amount > 0]
 
-    return None, None
+        if positive_candidates:
+            candidate = max(positive_candidates, key=lambda x: abs(x))
+        else:
+            candidate = max(nonzero_candidates, key=lambda x: abs(x))
+
+        if best_total_amount is None or abs(candidate) > abs(best_total_amount):
+            best_total_amount = money(candidate)
+
+    return best_due_date, best_total_amount
 
 
 def extract_terms_summary_amounts(lines: list[str]) -> tuple[Decimal, Decimal, Decimal]:
@@ -998,6 +1032,69 @@ def build_component_amounts(*, lines: list[str], subtotal: Decimal) -> tuple[dic
         },
         warnings,
     )
+
+def is_effectively_zero(amount: Decimal | None) -> bool:
+    if amount is None:
+        return True
+    return abs(money(amount)) <= Decimal("0.005")
+
+
+def derive_expected_invoice_total(
+    *,
+    subtotal: Decimal,
+    hst_amount: Decimal,
+    pst_amount: Decimal,
+    component_amounts: dict[str, Decimal],
+) -> Decimal:
+    pre_tax_total = money(component_amounts.get("pre_tax_total", Decimal("0.00")))
+    subtotal = money(subtotal)
+    hst_amount = money(hst_amount)
+    pst_amount = money(pst_amount)
+
+    # Prefer component pre-tax total when available because some OCR reads
+    # the lower terms/subtotal block poorly, especially on hh_direct docs.
+    if not is_effectively_zero(pre_tax_total):
+        return money(pre_tax_total + hst_amount + pst_amount)
+
+    return money(subtotal + hst_amount + pst_amount)
+
+
+def resolve_invoice_total_amount(
+    *,
+    parsed_total_amount: Decimal | None,
+    subtotal: Decimal,
+    hst_amount: Decimal,
+    pst_amount: Decimal,
+    component_amounts: dict[str, Decimal],
+    parser_warnings: list[str],
+) -> Decimal:
+    expected_total = derive_expected_invoice_total(
+        subtotal=subtotal,
+        hst_amount=hst_amount,
+        pst_amount=pst_amount,
+        component_amounts=component_amounts,
+    )
+
+    if parsed_total_amount is None:
+        parser_warnings.append("total_amount_missing_used_expected_total_fallback")
+        return expected_total
+
+    parsed_total_amount = money(parsed_total_amount)
+
+    # If parser found zero but the derived total is clearly nonzero, trust the derived total.
+    if is_effectively_zero(parsed_total_amount) and not is_effectively_zero(expected_total):
+        parser_warnings.append("total_amount_zero_overridden_from_expected_total")
+        return expected_total
+
+    # If parser found something materially different than the derived total, prefer the derived total.
+    # This protects against OCR / layout cases where the parser grabs .00 or some wrong nearby amount.
+    if not is_effectively_zero(expected_total) and abs(parsed_total_amount - expected_total) > TOTAL_TIE_TOLERANCE:
+        parser_warnings.append(
+            f"total_amount_overridden_from_expected_total parsed={money_float(parsed_total_amount)} expected={money_float(expected_total)}"
+        )
+        return expected_total
+
+    return parsed_total_amount
 
 
 def extract_labeled_money_from_lines(lines: list[str], label: str) -> Decimal:
@@ -1103,8 +1200,11 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
     full_text = ctx["full_text"]
     full_text_upper = ctx["full_text_upper"]
 
-    invoice_date, invoice_number = extract_invoice_meta_from_text(full_text=full_text, source_filename=source_filename)
-    remittance_due_date, total_amount = extract_invoice_remittance_due_and_total(all_lines)
+    invoice_date, invoice_number = extract_invoice_meta_from_text(
+        full_text=full_text,
+        source_filename=source_filename,
+    )
+    remittance_due_date, parsed_total_amount = extract_invoice_remittance_due_and_total(all_lines)
     subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
     component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
 
@@ -1128,11 +1228,20 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         vendor_invoice_number = None
         vendor_invoice_date = None
 
-    if total_amount is None:
-        total_amount = subtotal + hst_amount + pst_amount
+    total_amount = resolve_invoice_total_amount(
+        parsed_total_amount=parsed_total_amount,
+        subtotal=subtotal,
+        hst_amount=hst_amount,
+        pst_amount=pst_amount,
+        component_amounts=component_amounts,
+        parser_warnings=parser_warnings,
+    )
 
     if not invoice_number or not invoice_date:
-        raise HTTPException(status_code=400, detail=f"Could not determine invoice number/date for direct-family invoice: {source_filename}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not determine invoice number/date for direct-family invoice: {source_filename}",
+        )
 
     return {
         "document_type": document_type,
@@ -1155,7 +1264,7 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v4",
+            "parser_version": "invoice_v5",
             "invoice_source_type": invoice_type,
             "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
             "pst_amount": money_float(pst_amount),
@@ -1173,7 +1282,6 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         },
     }
 
-
 def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     ctx = extract_invoice_parser_context(file_bytes)
     all_lines = ctx["all_lines"]
@@ -1184,27 +1292,53 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         (
             normalize_text(line)
             for line in all_lines
-            if re.fullmatch(r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?", normalize_text(line) or "")
+            if re.fullmatch(
+                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?",
+                normalize_text(line) or "",
+            )
         ),
         None,
     )
-    due_total_match = re.match(r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)", due_total_line or "")
+    due_total_match = re.match(
+        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)",
+        due_total_line or "",
+    )
 
-    remittance_due_date = parse_hh_iso_word_date(due_total_match.group(1)) if due_total_match else fallbacks["remittance_due_date"]
-    total_amount = parse_hh_signed_money(due_total_match.group(2)) if due_total_match else None
+    remittance_due_date = (
+        parse_hh_iso_word_date(due_total_match.group(1))
+        if due_total_match
+        else fallbacks["remittance_due_date"]
+    )
+    parsed_total_amount = (
+        parse_hh_signed_money(due_total_match.group(2))
+        if due_total_match
+        else None
+    )
 
-    invoice_date, invoice_number = extract_invoice_meta_from_text(full_text=full_text, source_filename=source_filename)
+    invoice_date, invoice_number = extract_invoice_meta_from_text(
+        full_text=full_text,
+        source_filename=source_filename,
+    )
     subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
     component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
 
     service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
     enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
 
-    if total_amount is None:
-        total_amount = subtotal + hst_amount + pst_amount
+    total_amount = resolve_invoice_total_amount(
+        parsed_total_amount=parsed_total_amount,
+        subtotal=subtotal,
+        hst_amount=hst_amount,
+        pst_amount=pst_amount,
+        component_amounts=component_amounts,
+        parser_warnings=parser_warnings,
+    )
 
     if not invoice_number or not invoice_date:
-        raise HTTPException(status_code=400, detail=f"Could not determine invoice number/date for warehouse invoice: {source_filename}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not determine invoice number/date for warehouse invoice: {source_filename}",
+        )
 
     return {
         "document_type": DOCUMENT_TYPE_HH_INVOICE_WAREHOUSE,
@@ -1227,7 +1361,7 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v4",
+            "parser_version": "invoice_v5",
             "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
             "pst_amount": money_float(pst_amount),
             "c_list_total": money_float(component_amounts["c_list_total"]),
