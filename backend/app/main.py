@@ -8,6 +8,7 @@ from .routes.month_end import router as month_end_router
 from .routes.sync import router as sync_router
 from .schemas import HealthResponse
 from .routes.hh_ap import router as hh_ap_router
+from .routes.month_end_hh_ap import router as month_end_hh_ap_router
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.2.0")
 
