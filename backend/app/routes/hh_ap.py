@@ -1276,6 +1276,197 @@ def classify_direct_family_invoice(source_filename: str, full_text_upper: str, v
 
     return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
 
+def extract_direct_family_header_terms(
+    lines: list[str],
+) -> tuple[Decimal, Decimal, Decimal]:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    def is_header_stop(line: str) -> bool:
+        upper_line = line.upper()
+        return any(
+            marker in upper_line
+            for marker in (
+                "SERVICE COURIER UNIT",
+                "DEALER SERVICES CHARGE",
+                "DEALER SERVICE INVOICES",
+                "CLAIM INVOICE",
+                "SERVICE CHARGES",
+                "ENVIRO FEE AMOUNT",
+                "SOLD TO:",
+            )
+        )
+
+    header_stop_idx = next(
+        (idx for idx, line in enumerate(cleaned_lines) if is_header_stop(line)),
+        len(cleaned_lines),
+    )
+
+    header_lines = cleaned_lines[:header_stop_idx] if header_stop_idx > 0 else cleaned_lines[:25]
+
+    anchor_indexes = [
+        idx
+        for idx, line in enumerate(header_lines)
+        if (
+            "SUB TOTAL" in line.upper()
+            or "GST/HST" in line.upper()
+            or "PLEASE APPLY THIS AMOUNT TO YOUR" in line.upper()
+            or "REMITTANCE DUE" in line.upper()
+        )
+    ]
+
+    if not anchor_indexes:
+        anchor_indexes = [0]
+
+    for anchor_idx in anchor_indexes:
+        for row_idx in range(anchor_idx + 1, min(anchor_idx + 8, len(header_lines))):
+            candidate_texts = [header_lines[row_idx]]
+
+            if row_idx + 1 < len(header_lines):
+                candidate_texts.append(f"{header_lines[row_idx]} {header_lines[row_idx + 1]}")
+
+            for candidate_text in candidate_texts:
+                upper_candidate = candidate_text.upper()
+
+                if any(
+                    skip_marker in upper_candidate
+                    for skip_marker in (
+                        "LESS ",
+                        "PLUS ",
+                        "PAGE",
+                        "ST. JACOBS",
+                        "INVOICE DATE",
+                        "INVOICE NUMBER",
+                    )
+                ):
+                    continue
+
+                decimal_tokens = extract_decimal_money_tokens(candidate_text)
+
+                if len(decimal_tokens) < 3:
+                    continue
+
+                try:
+                    subtotal = money(parse_hh_signed_money(decimal_tokens[0]))
+                    hst_amount = money(parse_hh_signed_money(decimal_tokens[1]))
+                    pst_amount = money(parse_hh_signed_money(decimal_tokens[2]))
+                except Exception:
+                    continue
+
+                if is_effectively_zero(subtotal) and is_effectively_zero(hst_amount) and is_effectively_zero(pst_amount):
+                    continue
+
+                return subtotal, hst_amount, pst_amount
+
+    return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
+
+
+def extract_direct_family_footer_due_and_total(
+    lines: list[str],
+) -> tuple[date | None, Decimal | None]:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    sold_to_indexes = [
+        idx
+        for idx, line in enumerate(cleaned_lines)
+        if "SOLD TO" in line.upper()
+    ]
+
+    best_due_date: date | None = None
+    best_total_amount: Decimal | None = None
+
+    for idx in sold_to_indexes:
+        before_window = cleaned_lines[max(0, idx - 6):idx]
+        after_window = cleaned_lines[idx + 1:min(len(cleaned_lines), idx + 7)]
+
+        if best_due_date is None:
+            for candidate_line in reversed(before_window):
+                parsed_dates: list[date] = []
+                for token in extract_date_tokens_from_line(candidate_line):
+                    parsed = parse_hh_flexible_date(token)
+                    if parsed:
+                        parsed_dates.append(parsed)
+
+                if parsed_dates:
+                    best_due_date = parsed_dates[-1]
+                    break
+
+        for candidate_line in after_window:
+            decimal_tokens = extract_decimal_money_tokens(candidate_line)
+
+            if len(decimal_tokens) == 1:
+                try:
+                    amount = money(parse_hh_signed_money(decimal_tokens[0]))
+                except Exception:
+                    continue
+
+                if not is_effectively_zero(amount):
+                    best_total_amount = amount
+                    break
+
+        if best_total_amount is None:
+            joined_after = " ".join(after_window)
+            decimal_tokens = extract_decimal_money_tokens(joined_after)
+
+            if decimal_tokens:
+                try:
+                    amount = money(parse_hh_signed_money(decimal_tokens[-1]))
+                except Exception:
+                    amount = None
+
+                if amount is not None and not is_effectively_zero(amount):
+                    best_total_amount = amount
+
+        if best_due_date is not None and best_total_amount is not None:
+            break
+
+    return best_due_date, best_total_amount
+
+
+def resolve_direct_family_total_amount(
+    *,
+    footer_total_amount: Decimal | None,
+    subtotal: Decimal,
+    hst_amount: Decimal,
+    pst_amount: Decimal,
+    parser_warnings: list[str],
+) -> Decimal:
+    subtotal_based_total = money(subtotal + hst_amount + pst_amount)
+
+    if footer_total_amount is None:
+        parser_warnings.append("direct_footer_total_missing_used_subtotal_tax_fallback")
+        return subtotal_based_total
+
+    footer_total_amount = money(footer_total_amount)
+
+    if is_effectively_zero(footer_total_amount) and not is_effectively_zero(subtotal_based_total):
+        parser_warnings.append("direct_footer_total_zero_used_subtotal_tax_fallback")
+        return subtotal_based_total
+
+    if (
+        not is_effectively_zero(subtotal_based_total)
+        and (
+            (footer_total_amount > 0 and subtotal_based_total < 0)
+            or (footer_total_amount < 0 and subtotal_based_total > 0)
+        )
+    ):
+        parser_warnings.append(
+            f"direct_footer_total_sign_mismatch footer={money_float(footer_total_amount)} subtotal_based={money_float(subtotal_based_total)}"
+        )
+        return subtotal_based_total
+
+    if (
+        not is_effectively_zero(subtotal_based_total)
+        and abs(footer_total_amount) + TOTAL_TIE_TOLERANCE < abs(subtotal_based_total)
+    ):
+        parser_warnings.append(
+            f"direct_footer_total_too_small footer={money_float(footer_total_amount)} subtotal_based={money_float(subtotal_based_total)}"
+        )
+        return subtotal_based_total
+
+    return footer_total_amount
+    
 
 def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     ctx = extract_invoice_parser_context(file_bytes)
@@ -1287,12 +1478,6 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         full_text=full_text,
         source_filename=source_filename,
     )
-    remittance_due_date, parsed_total_amount = extract_invoice_remittance_due_and_total(all_lines)
-    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
-    component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
-
-    service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
-    enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
 
     vendor_meta = extract_vendor_direct_metadata(all_lines)
     vendor_name = vendor_meta["vendor_name"]
@@ -1306,19 +1491,51 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         vendor_invoice_date=vendor_invoice_date,
     )
 
+    service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
+    enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
+
+    parser_warnings: list[str] = []
+
     if invoice_type in {INVOICE_TYPE_HH_DIRECT, INVOICE_TYPE_CLAIM}:
+        subtotal, hst_amount, pst_amount = extract_direct_family_header_terms(all_lines)
+        remittance_due_date, footer_total_amount = extract_direct_family_footer_due_and_total(all_lines)
+
+        component_amounts, component_warnings = build_component_amounts(
+            lines=all_lines,
+            subtotal=subtotal,
+        )
+        parser_warnings.extend(component_warnings)
+
+        total_amount = resolve_direct_family_total_amount(
+            footer_total_amount=footer_total_amount,
+            subtotal=subtotal,
+            hst_amount=hst_amount,
+            pst_amount=pst_amount,
+            parser_warnings=parser_warnings,
+        )
+
         vendor_name = "Home Hardware Stores Limited"
         vendor_invoice_number = None
         vendor_invoice_date = None
 
-    total_amount = resolve_invoice_total_amount(
-        parsed_total_amount=parsed_total_amount,
-        subtotal=subtotal,
-        hst_amount=hst_amount,
-        pst_amount=pst_amount,
-        component_amounts=component_amounts,
-        parser_warnings=parser_warnings,
-    )
+    else:
+        remittance_due_date, parsed_total_amount = extract_invoice_remittance_due_and_total(all_lines)
+        subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
+
+        component_amounts, component_warnings = build_component_amounts(
+            lines=all_lines,
+            subtotal=subtotal,
+        )
+        parser_warnings.extend(component_warnings)
+
+        total_amount = resolve_invoice_total_amount(
+            parsed_total_amount=parsed_total_amount,
+            subtotal=subtotal,
+            hst_amount=hst_amount,
+            pst_amount=pst_amount,
+            component_amounts=component_amounts,
+            parser_warnings=parser_warnings,
+        )
 
     if not invoice_number or not invoice_date:
         raise HTTPException(
@@ -1347,7 +1564,7 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v5",
+            "parser_version": "invoice_v8",
             "invoice_source_type": invoice_type,
             "vendor_invoice_date": str(vendor_invoice_date) if vendor_invoice_date else None,
             "pst_amount": money_float(pst_amount),
@@ -1364,7 +1581,7 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
             "parser_warnings": parser_warnings,
         },
     }
-
+    
 
 def extract_warehouse_header_terms_and_total(
     lines: list[str],
