@@ -901,11 +901,17 @@ def extract_invoice_meta_from_text(full_text: str, source_filename: str) -> tupl
     return invoice_date, invoice_number
 
 
+def extract_decimal_money_tokens(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return re.findall(r"-?[\d,]*\.\d+(?:CR|C|-)?", value, flags=re.IGNORECASE)
+
+
 def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | None, Decimal | None]:
     cleaned_lines = [normalize_text(line) for line in lines]
     cleaned_lines = [line for line in cleaned_lines if line]
 
-    label_indexes: list[int] = []
+    anchor_indexes: list[int] = []
 
     for idx, line in enumerate(cleaned_lines):
         upper_line = line.upper()
@@ -914,64 +920,94 @@ def extract_invoice_remittance_due_and_total(lines: list[str]) -> tuple[date | N
             or "PLEASE APPLY THIS AMOUNT TO YOUR" in upper_line
             or "PLEASE PAY THIS AMOUNT" in upper_line
         ):
-            label_indexes.append(idx)
+            anchor_indexes.append(idx)
 
     best_due_date: date | None = None
     best_total_amount: Decimal | None = None
 
-    for idx in label_indexes:
-        window_start = max(0, idx - 2)
-        window_end = min(len(cleaned_lines), idx + 14)
+    for idx in anchor_indexes:
+        window_start = max(0, idx - 3)
+        window_end = min(len(cleaned_lines), idx + 3)
         window_lines = cleaned_lines[window_start:window_end]
-        if not window_lines:
-            continue
-
         window_text = " ".join(window_lines)
 
         parsed_due_date = find_first_parsed_date_in_line(window_text)
         if parsed_due_date and best_due_date is None:
             best_due_date = parsed_due_date
 
-        money_candidates: list[Decimal] = []
-        for token in extract_money_tokens(window_text):
-            try:
-                amount = parse_hh_signed_money(token)
-            except Exception:
-                continue
-            money_candidates.append(amount)
-
-        nonzero_candidates = [amount for amount in money_candidates if not is_effectively_zero(amount)]
-        if not nonzero_candidates:
+        decimal_tokens = extract_decimal_money_tokens(window_text)
+        if not decimal_tokens:
             continue
 
-        positive_candidates = [amount for amount in nonzero_candidates if amount > 0]
+        parsed_amounts: list[Decimal] = []
+        for token in decimal_tokens:
+            try:
+                parsed_amounts.append(parse_hh_signed_money(token))
+            except Exception:
+                continue
 
-        if positive_candidates:
-            candidate = max(positive_candidates, key=lambda x: abs(x))
-        else:
-            candidate = max(nonzero_candidates, key=lambda x: abs(x))
+        nonzero_amounts = [amount for amount in parsed_amounts if not is_effectively_zero(amount)]
+        if not nonzero_amounts:
+            continue
 
-        if best_total_amount is None or abs(candidate) > abs(best_total_amount):
+        # The payable amount at the bottom is almost always the last decimal money value
+        candidate = nonzero_amounts[-1]
+
+        if best_total_amount is None:
+            best_total_amount = money(candidate)
+        elif abs(candidate) > abs(best_total_amount):
             best_total_amount = money(candidate)
 
     return best_due_date, best_total_amount
 
-
 def extract_terms_summary_amounts(lines: list[str]) -> tuple[Decimal, Decimal, Decimal]:
-    for raw_line in reversed(lines):
-        cleaned = normalize_text(raw_line)
-        if not cleaned:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    # First try: find the bottom "Please apply this amount..." area and read the terms row right around it
+    for idx, line in enumerate(cleaned_lines):
+        upper_line = line.upper()
+        if "PLEASE APPLY THIS AMOUNT TO YOUR" not in upper_line and "REMITTANCE DUE" not in upper_line:
             continue
 
-        upper_cleaned = cleaned.upper()
-        if "SUB TOTAL" in upper_cleaned or "GST/HST" in upper_cleaned:
-            continue
+        window_start = max(0, idx - 4)
+        window_end = min(len(cleaned_lines), idx + 2)
+        window_lines = cleaned_lines[window_start:window_end]
+        window_text = " ".join(window_lines)
 
-        money_tokens = extract_money_tokens(cleaned)
-        if len(money_tokens) >= 3 and re.match(r"^\d{2}\b", cleaned):
-            subtotal = parse_hh_signed_money(money_tokens[0])
-            hst_amount = parse_hh_signed_money(money_tokens[1])
-            pst_amount = parse_hh_signed_money(money_tokens[2])
+        decimal_tokens = extract_decimal_money_tokens(window_text)
+
+        # For these HH invoices, the bottom terms block is:
+        # subtotal, gst/hst, pst, payable_total
+        if len(decimal_tokens) >= 4:
+            subtotal = parse_hh_signed_money(decimal_tokens[-4])
+            hst_amount = parse_hh_signed_money(decimal_tokens[-3])
+            pst_amount = parse_hh_signed_money(decimal_tokens[-2])
+            return subtotal, hst_amount, pst_amount
+
+        if len(decimal_tokens) >= 3:
+            subtotal = parse_hh_signed_money(decimal_tokens[0])
+            hst_amount = parse_hh_signed_money(decimal_tokens[1])
+            pst_amount = parse_hh_signed_money(decimal_tokens[2])
+            return subtotal, hst_amount, pst_amount
+
+    # Fallback: scan from the bottom looking for a line or short window with at least 3 decimal money tokens
+    for idx in range(len(cleaned_lines) - 1, -1, -1):
+        window_start = max(0, idx - 1)
+        window_end = min(len(cleaned_lines), idx + 2)
+        window_text = " ".join(cleaned_lines[window_start:window_end])
+
+        decimal_tokens = extract_decimal_money_tokens(window_text)
+        if len(decimal_tokens) >= 4:
+            subtotal = parse_hh_signed_money(decimal_tokens[-4])
+            hst_amount = parse_hh_signed_money(decimal_tokens[-3])
+            pst_amount = parse_hh_signed_money(decimal_tokens[-2])
+            return subtotal, hst_amount, pst_amount
+
+        if len(decimal_tokens) >= 3:
+            subtotal = parse_hh_signed_money(decimal_tokens[0])
+            hst_amount = parse_hh_signed_money(decimal_tokens[1])
+            pst_amount = parse_hh_signed_money(decimal_tokens[2])
             return subtotal, hst_amount, pst_amount
 
     return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
