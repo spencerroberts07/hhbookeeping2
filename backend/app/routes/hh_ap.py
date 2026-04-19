@@ -1318,45 +1318,229 @@ def parse_hh_direct_family_invoice_document(file_bytes: bytes, source_filename: 
         },
     }
 
+
+def extract_warehouse_header_terms_and_total(
+    lines: list[str],
+) -> dict[str, Any] | None:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    money_pattern = r"-?[\d,]*\.\d+(?:CR|C|-)?"
+    date_pattern = r"20\d{2}-[A-Za-z]{3}-\d{2}"
+
+    anchor_indexes = [
+        idx
+        for idx, line in enumerate(cleaned_lines)
+        if (
+            "PLEASE PAY THIS AMOUNT" in line.upper()
+            or "PLEASE APPLY THIS AMOUNT TO YOUR" in line.upper()
+            or "REMITTANCE DUE" in line.upper()
+        )
+    ]
+
+    candidates: list[dict[str, Any]] = []
+
+    for idx in anchor_indexes:
+        window_start = max(0, idx - 5)
+        window_end = min(len(cleaned_lines), idx + 5)
+        window_text = " ".join(cleaned_lines[window_start:window_end])
+
+        ordered_tokens = re.findall(
+            rf"{date_pattern}|{money_pattern}",
+            window_text,
+            flags=re.IGNORECASE,
+        )
+
+        if not ordered_tokens:
+            continue
+
+        for pos, token in enumerate(ordered_tokens):
+            if not re.fullmatch(date_pattern, token, flags=re.IGNORECASE):
+                continue
+
+            prev_money_tokens = [
+                value
+                for value in ordered_tokens[:pos]
+                if re.fullmatch(money_pattern, value, flags=re.IGNORECASE)
+            ]
+            next_money_tokens = [
+                value
+                for value in ordered_tokens[pos + 1 :]
+                if re.fullmatch(money_pattern, value, flags=re.IGNORECASE)
+            ]
+
+            if len(prev_money_tokens) < 3 or len(next_money_tokens) < 1:
+                continue
+
+            try:
+                subtotal = money(parse_hh_signed_money(prev_money_tokens[-3]))
+                hst_amount = money(parse_hh_signed_money(prev_money_tokens[-2]))
+                pst_amount = money(parse_hh_signed_money(prev_money_tokens[-1]))
+                due_date = parse_hh_iso_word_date(token)
+                total_amount = money(parse_hh_signed_money(next_money_tokens[0]))
+            except Exception:
+                continue
+
+            if is_effectively_zero(total_amount):
+                continue
+
+            candidates.append(
+                {
+                    "subtotal": subtotal,
+                    "hst_amount": hst_amount,
+                    "pst_amount": pst_amount,
+                    "due_date": due_date,
+                    "total_amount": total_amount,
+                    "score": abs(total_amount),
+                    "source_token_window": ordered_tokens,
+                }
+            )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: row["score"], reverse=True)
+    return candidates[0]
+    
+
+def extract_warehouse_terms_summary_amounts(
+    lines: list[str],
+) -> tuple[Decimal, Decimal, Decimal]:
+    cleaned_lines = [normalize_text(line) for line in lines]
+    cleaned_lines = [line for line in cleaned_lines if line]
+
+    def parse_candidate_text(text_value: str) -> tuple[Decimal, Decimal, Decimal] | None:
+        upper_value = text_value.upper()
+
+        if any(
+            marker in upper_value
+            for marker in (
+                "PLEASE PAY THIS AMOUNT",
+                "PLEASE APPLY THIS AMOUNT TO YOUR",
+                "REMITTANCE DUE",
+                "INVOICE DATE",
+                "CUSTOMER NUMBER",
+                "TERMS:",
+                "PROVINCIAL SALES TAX",
+                "GST",
+                "HST",
+                "TOTAL AT C LIST",
+                "SUBSCRIBED FOR SHARE",
+                "FIVE YEAR NOTE",
+                "ADVERTISING",
+            )
+        ):
+            return None
+
+        decimal_tokens = extract_decimal_money_tokens(text_value)
+
+        if len(decimal_tokens) < 3 or len(decimal_tokens) > 6:
+            return None
+
+        try:
+            use_tokens = decimal_tokens[-3:]
+            subtotal = money(parse_hh_signed_money(use_tokens[0]))
+            hst_amount = money(parse_hh_signed_money(use_tokens[1]))
+            pst_amount = money(parse_hh_signed_money(use_tokens[2]))
+        except Exception:
+            return None
+
+        if is_effectively_zero(subtotal) and is_effectively_zero(hst_amount) and is_effectively_zero(pst_amount):
+            return None
+
+        return subtotal, hst_amount, pst_amount
+
+    candidate_rows: list[tuple[Decimal, Decimal, Decimal, Decimal]] = []
+
+    anchor_indexes = [
+        idx
+        for idx, line in enumerate(cleaned_lines)
+        if (
+            "SERVICE CHARGE" in line.upper()
+            or "SERVICE CHARGES" in line.upper()
+            or "ENVIRO FEE AMOUNT" in line.upper()
+        )
+    ]
+
+    for idx in anchor_indexes:
+        for offset in range(1, 6):
+            row_idx = idx - offset
+            if row_idx < 0:
+                break
+
+            for candidate_text in (
+                cleaned_lines[row_idx],
+                f"{cleaned_lines[row_idx - 1]} {cleaned_lines[row_idx]}" if row_idx - 1 >= 0 else None,
+            ):
+                if not candidate_text:
+                    continue
+
+                parsed = parse_candidate_text(candidate_text)
+                if not parsed:
+                    continue
+
+                subtotal, hst_amount, pst_amount = parsed
+                score = abs(subtotal) + abs(hst_amount) + abs(pst_amount)
+                candidate_rows.append((score, subtotal, hst_amount, pst_amount))
+
+    if not candidate_rows:
+        for idx in range(len(cleaned_lines) - 1, -1, -1):
+            for candidate_text in (
+                cleaned_lines[idx],
+                f"{cleaned_lines[idx - 1]} {cleaned_lines[idx]}" if idx - 1 >= 0 else None,
+            ):
+                if not candidate_text:
+                    continue
+
+                parsed = parse_candidate_text(candidate_text)
+                if not parsed:
+                    continue
+
+                subtotal, hst_amount, pst_amount = parsed
+                score = abs(subtotal) + abs(hst_amount) + abs(pst_amount)
+                candidate_rows.append((score, subtotal, hst_amount, pst_amount))
+
+    if not candidate_rows:
+        return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
+
+    candidate_rows.sort(key=lambda row: row[0], reverse=True)
+    _, subtotal, hst_amount, pst_amount = candidate_rows[0]
+    return subtotal, hst_amount, pst_amount
+
+
 def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     ctx = extract_invoice_parser_context(file_bytes)
     all_lines = ctx["all_lines"]
     full_text = ctx["full_text"]
     fallbacks = choose_invoice_filename_fallbacks(source_filename)
 
-    due_total_line = next(
-        (
-            normalize_text(line)
-            for line in all_lines
-            if re.fullmatch(
-                r"20\d{2}-[A-Za-z]{3}-\d{2}\s+[\d,]*\.?\d+(?:CR|C)?",
-                normalize_text(line) or "",
-            )
-        ),
-        None,
-    )
-    due_total_match = re.match(
-        r"(20\d{2}-[A-Za-z]{3}-\d{2})\s+([\d,]*\.?\d+(?:CR|C)?)",
-        due_total_line or "",
-    )
-
-    remittance_due_date = (
-        parse_hh_iso_word_date(due_total_match.group(1))
-        if due_total_match
-        else fallbacks["remittance_due_date"]
-    )
-    parsed_total_amount = (
-        parse_hh_signed_money(due_total_match.group(2))
-        if due_total_match
-        else None
-    )
-
     invoice_date, invoice_number = extract_invoice_meta_from_text(
         full_text=full_text,
         source_filename=source_filename,
     )
-    subtotal, hst_amount, pst_amount = extract_terms_summary_amounts(all_lines)
-    component_amounts, parser_warnings = build_component_amounts(lines=all_lines, subtotal=subtotal)
+
+    header_terms = extract_warehouse_header_terms_and_total(all_lines)
+
+    if header_terms:
+        remittance_due_date = header_terms["due_date"]
+        parsed_total_amount = header_terms["total_amount"]
+        subtotal = header_terms["subtotal"]
+        hst_amount = header_terms["hst_amount"]
+        pst_amount = header_terms["pst_amount"]
+        parser_warnings: list[str] = []
+    else:
+        remittance_due_date, parsed_total_amount = extract_invoice_remittance_due_and_total(all_lines)
+        subtotal, hst_amount, pst_amount = extract_warehouse_terms_summary_amounts(all_lines)
+        parser_warnings = ["warehouse_header_terms_block_not_found_used_fallback"]
+
+    if remittance_due_date is None:
+        remittance_due_date = fallbacks["remittance_due_date"]
+
+    component_amounts, component_warnings = build_component_amounts(
+        lines=all_lines,
+        subtotal=subtotal,
+    )
+    parser_warnings.extend(component_warnings)
 
     service_charges = extract_labeled_money_from_lines(all_lines, "Service Charges")
     enviro_fee_amount = extract_labeled_money_from_lines(all_lines, "Enviro Fee Amount")
@@ -1397,7 +1581,7 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
         "is_statement_only": False,
         "notes": None,
         "raw_json": {
-            "parser_version": "invoice_v5",
+            "parser_version": "invoice_v6",
             "invoice_source_type": INVOICE_TYPE_WAREHOUSE,
             "pst_amount": money_float(pst_amount),
             "c_list_total": money_float(component_amounts["c_list_total"]),
@@ -1413,7 +1597,7 @@ def parse_hh_warehouse_invoice_document(file_bytes: bytes, source_filename: str)
             "parser_warnings": parser_warnings,
         },
     }
-
+    
 
 def parse_hh_invoice_document(file_bytes: bytes, source_filename: str) -> dict[str, Any]:
     source_name_upper = Path(source_filename).name.upper()
