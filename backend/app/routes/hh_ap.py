@@ -1104,32 +1104,79 @@ def resolve_invoice_total_amount(
     component_amounts: dict[str, Decimal],
     parser_warnings: list[str],
 ) -> Decimal:
-    expected_total = derive_expected_invoice_total(
+    subtotal_based_total = money(subtotal + hst_amount + pst_amount)
+    component_based_total = derive_expected_invoice_total(
         subtotal=subtotal,
         hst_amount=hst_amount,
         pst_amount=pst_amount,
         component_amounts=component_amounts,
     )
 
+    fallback_total = (
+        subtotal_based_total
+        if not is_effectively_zero(subtotal_based_total)
+        else component_based_total
+    )
+
     if parsed_total_amount is None:
-        parser_warnings.append("total_amount_missing_used_expected_total_fallback")
-        return expected_total
+        parser_warnings.append("total_amount_missing_used_fallback_total")
+        return fallback_total
 
     parsed_total_amount = money(parsed_total_amount)
 
-    # If parser found zero but the derived total is clearly nonzero, trust the derived total.
-    if is_effectively_zero(parsed_total_amount) and not is_effectively_zero(expected_total):
-        parser_warnings.append("total_amount_zero_overridden_from_expected_total")
-        return expected_total
+    # Zero parsed total is still clearly bad.
+    if is_effectively_zero(parsed_total_amount) and not is_effectively_zero(fallback_total):
+        parser_warnings.append("total_amount_zero_overridden_from_fallback_total")
+        return fallback_total
 
-    # If parser found something materially different than the derived total, prefer the derived total.
-    # This protects against OCR / layout cases where the parser grabs .00 or some wrong nearby amount.
-    if not is_effectively_zero(expected_total) and abs(parsed_total_amount - expected_total) > TOTAL_TIE_TOLERANCE:
+    # If parsed total has the wrong sign compared with the subtotal-based total, trust fallback.
+    if (
+        not is_effectively_zero(subtotal_based_total)
+        and parsed_total_amount != Decimal("0.00")
+        and subtotal_based_total != Decimal("0.00")
+        and ((parsed_total_amount > 0 and subtotal_based_total < 0) or (parsed_total_amount < 0 and subtotal_based_total > 0))
+    ):
         parser_warnings.append(
-            f"total_amount_overridden_from_expected_total parsed={money_float(parsed_total_amount)} expected={money_float(expected_total)}"
+            f"total_amount_sign_mismatch_overridden parsed={money_float(parsed_total_amount)} fallback={money_float(fallback_total)}"
         )
-        return expected_total
+        return fallback_total
 
+    # If parsed total is materially smaller than subtotal + taxes, it is impossible for a normal invoice.
+    # This catches cases where OCR/layout grabbed the wrong nearby amount.
+    if (
+        not is_effectively_zero(subtotal_based_total)
+        and abs(parsed_total_amount) + TOTAL_TIE_TOLERANCE < abs(subtotal_based_total)
+    ):
+        parser_warnings.append(
+            f"total_amount_too_small_overridden parsed={money_float(parsed_total_amount)} subtotal_based={money_float(subtotal_based_total)}"
+        )
+        return fallback_total
+
+    # If parsed total is wildly larger than subtotal + taxes, it is likely garbage such as a year/date token.
+    # Keep this threshold loose so valid service-charge cases still pass through.
+    if (
+        not is_effectively_zero(subtotal_based_total)
+        and abs(parsed_total_amount) > abs(subtotal_based_total) * Decimal("3.00")
+        and abs(parsed_total_amount - subtotal_based_total) > Decimal("100.00")
+    ):
+        parser_warnings.append(
+            f"total_amount_implausibly_large_overridden parsed={money_float(parsed_total_amount)} subtotal_based={money_float(subtotal_based_total)}"
+        )
+        return fallback_total
+
+    # If component-based total disagrees with subtotal-based total, note it, but do not force an override.
+    # This is important for warehouse invoices where service charges can make the page-1 payable amount
+    # higher than component/pre-tax rollups.
+    if (
+        not is_effectively_zero(component_based_total)
+        and not is_effectively_zero(subtotal_based_total)
+        and abs(component_based_total - subtotal_based_total) > TOTAL_TIE_TOLERANCE
+    ):
+        parser_warnings.append(
+            f"component_total_differs_from_subtotal_total component={money_float(component_based_total)} subtotal_based={money_float(subtotal_based_total)}"
+        )
+
+    # In normal cases, trust the parsed payable amount from the invoice header/footer block.
     return parsed_total_amount
 
 
