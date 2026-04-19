@@ -8,6 +8,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
+from ..journal_batch_workflow import (
+    default_workflow_status_from_batch_status,
+    ensure_batch_can_be_rebuilt,
+    get_journal_batch,
+    get_workflow_events,
+    resolve_workflow_status,
+    serialize_workflow,
+)
 
 router = APIRouter(prefix="/api/month-end", tags=["month-end"])
 
@@ -350,6 +358,18 @@ def upsert_journal_batch(
     total_credits: Decimal,
     summary_json: dict,
 ):
+    existing_batch = get_journal_batch(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        source_module=source_module,
+        batch_label=batch_label,
+    )
+    if existing_batch:
+        ensure_batch_can_be_rebuilt(existing_batch)
+
+    workflow_status = default_workflow_status_from_batch_status(status)
+
     batch = session.execute(
         text(
             """
@@ -359,27 +379,82 @@ def upsert_journal_batch(
                 source_module,
                 batch_label,
                 status,
+                workflow_status,
                 total_debits,
                 total_credits,
-                summary_json
+                summary_json,
+                submitted_by,
+                submitted_at,
+                reviewed_by,
+                reviewed_at,
+                approved_by,
+                approved_at,
+                approval_note,
+                rejection_note,
+                locked_by,
+                locked_at
             ) VALUES (
                 :entity_id,
                 :accounting_period_id,
                 :source_module,
                 :batch_label,
                 :status,
+                :workflow_status,
                 :total_debits,
                 :total_credits,
-                CAST(:summary_json AS jsonb)
+                CAST(:summary_json AS jsonb),
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL
             )
             ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
             DO UPDATE SET
                 status = EXCLUDED.status,
+                workflow_status = EXCLUDED.workflow_status,
                 total_debits = EXCLUDED.total_debits,
                 total_credits = EXCLUDED.total_credits,
                 summary_json = EXCLUDED.summary_json,
+                submitted_by = NULL,
+                submitted_at = NULL,
+                reviewed_by = NULL,
+                reviewed_at = NULL,
+                approved_by = NULL,
+                approved_at = NULL,
+                approval_note = NULL,
+                rejection_note = NULL,
+                locked_by = NULL,
+                locked_at = NULL,
                 updated_at = NOW()
-            RETURNING id, status, total_debits, total_credits
+            RETURNING
+                id,
+                entity_id,
+                accounting_period_id,
+                source_module,
+                batch_label,
+                status,
+                workflow_status,
+                total_debits,
+                total_credits,
+                summary_json,
+                submitted_by,
+                submitted_at,
+                reviewed_by,
+                reviewed_at,
+                approved_by,
+                approved_at,
+                approval_note,
+                rejection_note,
+                locked_by,
+                locked_at,
+                created_at,
+                updated_at
             """
         ),
         {
@@ -388,6 +463,7 @@ def upsert_journal_batch(
             "source_module": source_module,
             "batch_label": batch_label,
             "status": status,
+            "workflow_status": workflow_status,
             "total_debits": total_debits,
             "total_credits": total_credits,
             "summary_json": json.dumps(summary_json),
@@ -670,6 +746,8 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
             for line in journal_lines
         ]
 
+        workflow_history = get_workflow_events(session, str(batch["id"]))
+
         return {
             "entity_code": entity["entity_code"],
             "accounting_period": {
@@ -685,11 +763,13 @@ def build_cash_balancing_month_end_journal(payload: BuildCashBalancingJournalReq
                 "source_module": CASH_BALANCING_SOURCE_MODULE,
                 "batch_label": CASH_BALANCING_BATCH_LABEL,
                 "status": batch_status,
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(total_debits),
                 "total_credits": money_float(total_credits),
                 "balance_difference": money_float(balance_difference),
                 "is_balanced": is_balanced,
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "source_summary": {
                 "day_count": day_stats["day_count"],
                 "source_day_total_sales": money_float(day_stats["total_sales"]),
@@ -768,6 +848,8 @@ def build_manual_month_end_journal(payload: BuildManualMonthEndJournalRequest):
             for line in journal_lines
         ]
 
+        workflow_history = get_workflow_events(session, str(batch["id"]))
+
         return {
             "entity_code": entity["entity_code"],
             "accounting_period": {
@@ -783,11 +865,13 @@ def build_manual_month_end_journal(payload: BuildManualMonthEndJournalRequest):
                 "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
                 "batch_label": batch_label,
                 "status": batch_status,
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(total_debits),
                 "total_credits": money_float(total_credits),
                 "balance_difference": money_float(balance_difference),
                 "is_balanced": is_balanced,
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "journal_lines": response_lines,
         }
 
@@ -798,36 +882,13 @@ def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
         entity = get_entity(session, entity_code)
         period = get_accounting_period(session, entity["id"], period_end)
 
-        batch = session.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    entity_id,
-                    accounting_period_id,
-                    source_module,
-                    batch_label,
-                    status,
-                    total_debits,
-                    total_credits,
-                    summary_json,
-                    created_at,
-                    updated_at
-                FROM journal_batches
-                WHERE entity_id = :entity_id
-                  AND accounting_period_id = :accounting_period_id
-                  AND source_module = :source_module
-                  AND batch_label = :batch_label
-                LIMIT 1
-                """
-            ),
-            {
-                "entity_id": entity["id"],
-                "accounting_period_id": period["id"],
-                "source_module": CASH_BALANCING_SOURCE_MODULE,
-                "batch_label": CASH_BALANCING_BATCH_LABEL,
-            },
-        ).mappings().first()
+        batch = get_journal_batch(
+            session,
+            entity_id=entity["id"],
+            accounting_period_id=period["id"],
+            source_module=CASH_BALANCING_SOURCE_MODULE,
+            batch_label=CASH_BALANCING_BATCH_LABEL,
+        )
 
         if not batch:
             raise HTTPException(
@@ -857,6 +918,8 @@ def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
         total_credits = money(batch["total_credits"])
         balance_difference = total_debits - total_credits
 
+        workflow_history = get_workflow_events(session, str(batch["id"]))
+
         return {
             "entity_code": entity["entity_code"],
             "accounting_period": {
@@ -872,6 +935,7 @@ def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
                 "source_module": batch["source_module"],
                 "batch_label": batch["batch_label"],
                 "status": batch["status"],
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(total_debits),
                 "total_credits": money_float(total_credits),
                 "balance_difference": money_float(balance_difference),
@@ -880,6 +944,7 @@ def review_cash_balancing_month_end_journal(entity_code: str, period_end: str):
                 "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
                 "updated_at": batch["updated_at"].isoformat() if batch["updated_at"] else None,
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "journal_lines": [
                 {
                     "line_number": row["line_number"],
@@ -904,36 +969,13 @@ def review_manual_month_end_journal(
         entity = get_entity(session, entity_code)
         period = get_accounting_period(session, entity["id"], period_end)
 
-        batch = session.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    entity_id,
-                    accounting_period_id,
-                    source_module,
-                    batch_label,
-                    status,
-                    total_debits,
-                    total_credits,
-                    summary_json,
-                    created_at,
-                    updated_at
-                FROM journal_batches
-                WHERE entity_id = :entity_id
-                  AND accounting_period_id = :accounting_period_id
-                  AND source_module = :source_module
-                  AND batch_label = :batch_label
-                LIMIT 1
-                """
-            ),
-            {
-                "entity_id": entity["id"],
-                "accounting_period_id": period["id"],
-                "source_module": MANUAL_MONTH_END_SOURCE_MODULE,
-                "batch_label": batch_label,
-            },
-        ).mappings().first()
+        batch = get_journal_batch(
+            session,
+            entity_id=entity["id"],
+            accounting_period_id=period["id"],
+            source_module=MANUAL_MONTH_END_SOURCE_MODULE,
+            batch_label=batch_label,
+        )
 
         if not batch:
             raise HTTPException(
@@ -963,6 +1005,8 @@ def review_manual_month_end_journal(
         total_credits = money(batch["total_credits"])
         balance_difference = total_debits - total_credits
 
+        workflow_history = get_workflow_events(session, str(batch["id"]))
+
         return {
             "entity_code": entity["entity_code"],
             "accounting_period": {
@@ -978,6 +1022,7 @@ def review_manual_month_end_journal(
                 "source_module": batch["source_module"],
                 "batch_label": batch["batch_label"],
                 "status": batch["status"],
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(total_debits),
                 "total_credits": money_float(total_credits),
                 "balance_difference": money_float(balance_difference),
@@ -986,6 +1031,7 @@ def review_manual_month_end_journal(
                 "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
                 "updated_at": batch["updated_at"].isoformat() if batch["updated_at"] else None,
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "journal_lines": [
                 {
                     "line_number": row["line_number"],
