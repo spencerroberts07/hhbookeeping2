@@ -1276,42 +1276,54 @@ def classify_direct_family_invoice(source_filename: str, full_text_upper: str, v
 
     return INVOICE_TYPE_HH_DIRECT, DOCUMENT_TYPE_HH_INVOICE_HH_DIRECT
 
+def normalize_direct_family_ocr_line(value: str | None) -> str:
+    cleaned = normalize_text(value) or ""
+
+    replacements = {
+        "rem1ttance": "remittance",
+        "rem1tance": "remittance",
+        ".oo": ".00",
+        ".Oo": ".00",
+        ".oO": ".00",
+        ".OO": ".00",
+        ".o0": ".00",
+        ".0o": ".00",
+        " .0 ": " .00 ",
+        " .0$": " .00",
+    }
+
+    for old, new in replacements.items():
+        cleaned = cleaned.replace(old, new)
+
+    cleaned = re.sub(r"(?<=\s)\.0(?=\s|$)", ".00", cleaned)
+    cleaned = re.sub(r"(?<=\s)oo(?=\s|$)", "00", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+    
+
 def extract_direct_family_header_terms(
     lines: list[str],
 ) -> tuple[Decimal, Decimal, Decimal]:
-    cleaned_lines = [normalize_text(line) for line in lines]
-    cleaned_lines = [line for line in cleaned_lines if line]
+    cleaned_lines = [
+        normalize_direct_family_ocr_line(line)
+        for line in lines
+        if normalize_text(line)
+    ]
 
-    def is_header_stop(line: str) -> bool:
-        upper_line = line.upper()
-        return any(
-            marker in upper_line
-            for marker in (
-                "SERVICE COURIER UNIT",
-                "DEALER SERVICES CHARGE",
-                "DEALER SERVICE INVOICES",
-                "CLAIM INVOICE",
-                "SERVICE CHARGES",
-                "ENVIRO FEE AMOUNT",
-                "SOLD TO:",
-            )
-        )
-
-    header_stop_idx = next(
-        (idx for idx, line in enumerate(cleaned_lines) if is_header_stop(line)),
-        len(cleaned_lines),
-    )
-
-    header_lines = cleaned_lines[:header_stop_idx] if header_stop_idx > 0 else cleaned_lines[:25]
+    if not cleaned_lines:
+        return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
 
     anchor_indexes = [
         idx
-        for idx, line in enumerate(header_lines)
+        for idx, line in enumerate(cleaned_lines)
         if (
-            "SUB TOTAL" in line.upper()
-            or "GST/HST" in line.upper()
-            or "PLEASE APPLY THIS AMOUNT TO YOUR" in line.upper()
+            "PLEASE APPLY THIS AMOUNT TO YOUR" in line.upper()
             or "REMITTANCE DUE" in line.upper()
+            or (
+                "TERMS" in line.upper()
+                and "SUB TOTAL" in line.upper()
+                and "GST/HST" in line.upper()
+            )
         )
     ]
 
@@ -1319,11 +1331,15 @@ def extract_direct_family_header_terms(
         anchor_indexes = [0]
 
     for anchor_idx in anchor_indexes:
-        for row_idx in range(anchor_idx + 1, min(anchor_idx + 8, len(header_lines))):
-            candidate_texts = [header_lines[row_idx]]
+        start_idx = max(0, anchor_idx - 4)
+        end_idx = min(len(cleaned_lines), anchor_idx + 6)
 
-            if row_idx + 1 < len(header_lines):
-                candidate_texts.append(f"{header_lines[row_idx]} {header_lines[row_idx + 1]}")
+        for row_idx in range(start_idx, end_idx):
+            candidate_texts = [
+                cleaned_lines[row_idx],
+                " ".join(cleaned_lines[row_idx : min(row_idx + 2, len(cleaned_lines))]),
+                " ".join(cleaned_lines[row_idx : min(row_idx + 3, len(cleaned_lines))]),
+            ]
 
             for candidate_text in candidate_texts:
                 upper_candidate = candidate_text.upper()
@@ -1331,25 +1347,37 @@ def extract_direct_family_header_terms(
                 if any(
                     skip_marker in upper_candidate
                     for skip_marker in (
-                        "LESS ",
-                        "PLUS ",
-                        "PAGE",
+                        "SERVICE CHARGE",
+                        "ENVIRO FEE",
+                        "SOLD TO",
                         "ST. JACOBS",
                         "INVOICE DATE",
                         "INVOICE NUMBER",
+                        "DEALER SERVICE INVOICES",
+                        "CLAIM INVOICE",
+                        "GROUP INSURANCE",
                     )
                 ):
                     continue
 
-                decimal_tokens = extract_decimal_money_tokens(candidate_text)
-
-                if len(decimal_tokens) < 3:
+                decimals = extract_decimal_money_tokens(candidate_text)
+                if len(decimals) < 3:
                     continue
 
+                dates = extract_date_tokens_from_line(candidate_text)
+
+                if dates:
+                    first_date = dates[0]
+                    prefix_text = candidate_text.split(first_date)[0]
+                    prefix_decimals = extract_decimal_money_tokens(prefix_text)
+                    use_tokens = prefix_decimals[-3:] if len(prefix_decimals) >= 3 else decimals[:3]
+                else:
+                    use_tokens = decimals[:3]
+
                 try:
-                    subtotal = money(parse_hh_signed_money(decimal_tokens[0]))
-                    hst_amount = money(parse_hh_signed_money(decimal_tokens[1]))
-                    pst_amount = money(parse_hh_signed_money(decimal_tokens[2]))
+                    subtotal = money(parse_hh_signed_money(use_tokens[0]))
+                    hst_amount = money(parse_hh_signed_money(use_tokens[1]))
+                    pst_amount = money(parse_hh_signed_money(use_tokens[2]))
                 except Exception:
                     continue
 
@@ -1360,12 +1388,17 @@ def extract_direct_family_header_terms(
 
     return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
 
-
 def extract_direct_family_footer_due_and_total(
     lines: list[str],
 ) -> tuple[date | None, Decimal | None]:
-    cleaned_lines = [normalize_text(line) for line in lines]
-    cleaned_lines = [line for line in cleaned_lines if line]
+    cleaned_lines = [
+        normalize_direct_family_ocr_line(line)
+        for line in lines
+        if normalize_text(line)
+    ]
+
+    if not cleaned_lines:
+        return None, None
 
     sold_to_indexes = [
         idx
@@ -1373,12 +1406,20 @@ def extract_direct_family_footer_due_and_total(
         if "SOLD TO" in line.upper()
     ]
 
+    if not sold_to_indexes:
+        sold_to_indexes = [
+            idx
+            for idx, line in enumerate(cleaned_lines)
+            if "DEALER SERVICE INVOICES" in line.upper()
+            or "CLAIM INVOICE" in line.upper()
+        ]
+
     best_due_date: date | None = None
     best_total_amount: Decimal | None = None
 
     for idx in sold_to_indexes:
-        before_window = cleaned_lines[max(0, idx - 6):idx]
-        after_window = cleaned_lines[idx + 1:min(len(cleaned_lines), idx + 7)]
+        before_window = cleaned_lines[max(0, idx - 10):idx]
+        after_window = cleaned_lines[idx + 1:min(len(cleaned_lines), idx + 8)]
 
         if best_due_date is None:
             for candidate_line in reversed(before_window):
@@ -1393,36 +1434,52 @@ def extract_direct_family_footer_due_and_total(
                     break
 
         for candidate_line in after_window:
-            decimal_tokens = extract_decimal_money_tokens(candidate_line)
+            upper_candidate = candidate_line.upper()
 
-            if len(decimal_tokens) == 1:
-                try:
-                    amount = money(parse_hh_signed_money(decimal_tokens[0]))
-                except Exception:
-                    continue
+            if any(
+                skip_marker in upper_candidate
+                for skip_marker in (
+                    "DEALER SERVICE INVOICES",
+                    "CLAIM INVOICE",
+                    "SERVICE COURIER",
+                    "SERVICE CHARGE",
+                    "GST/HST",
+                    "SUBSCRIBED FOR SHARE",
+                )
+            ):
+                continue
 
-                if not is_effectively_zero(amount):
-                    best_total_amount = amount
-                    break
+            decimals = extract_decimal_money_tokens(candidate_line)
+            if not decimals:
+                continue
+
+            try:
+                amount = money(parse_hh_signed_money(decimals[-1]))
+            except Exception:
+                continue
+
+            if not is_effectively_zero(amount):
+                best_total_amount = amount
+                break
 
         if best_total_amount is None:
             joined_after = " ".join(after_window)
-            decimal_tokens = extract_decimal_money_tokens(joined_after)
+            decimals = extract_decimal_money_tokens(joined_after)
 
-            if decimal_tokens:
+            if decimals:
                 try:
-                    amount = money(parse_hh_signed_money(decimal_tokens[-1]))
+                    amount = money(parse_hh_signed_money(decimals[-1]))
                 except Exception:
                     amount = None
 
                 if amount is not None and not is_effectively_zero(amount):
                     best_total_amount = amount
 
-        if best_due_date is not None and best_total_amount is not None:
+        if best_due_date is not None or best_total_amount is not None:
             break
 
     return best_due_date, best_total_amount
-
+    
 
 def resolve_direct_family_total_amount(
     *,
