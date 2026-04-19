@@ -200,7 +200,7 @@ def get_hh_ap_month_invoice_totals(session, entity_id: str, period_start: str, p
                 COALESCE(SUM(COALESCE(advertising_amount, 0)), 0) AS advertising_amount,
                 COALESCE(SUM(COALESCE(subtotal, 0)), 0) AS subtotal_amount,
                 COALESCE(SUM(COALESCE(surcharge_amount, 0)), 0) AS surcharge_amount
-            FROM hh_ap_invoices
+            FROM hh_ap_invoices_effective
             WHERE entity_id = :entity_id
               AND COALESCE(is_statement_only, FALSE) = FALSE
               AND invoice_date >= :period_start
@@ -230,7 +230,7 @@ def get_hh_ap_invoice_type_totals(session, entity_id: str, period_start: str, pe
                 invoice_type,
                 COUNT(*) AS invoice_count,
                 COALESCE(SUM(COALESCE(total_amount, 0)), 0) AS total_amount
-            FROM hh_ap_invoices
+            FROM hh_ap_invoices_effective
             WHERE entity_id = :entity_id
               AND COALESCE(is_statement_only, FALSE) = FALSE
               AND invoice_date >= :period_start
@@ -280,7 +280,7 @@ def get_hh_ap_invoice_type_component_totals(
                         ELSE 0
                     END
                 ), 0) AS warning_total_amount
-            FROM hh_ap_invoices
+            FROM hh_ap_invoices_effective
             WHERE entity_id = :entity_id
               AND COALESCE(is_statement_only, FALSE) = FALSE
               AND invoice_date >= :period_start
@@ -332,7 +332,7 @@ def get_hh_ap_invoices_with_parser_warnings(
                 i.advertising_amount,
                 i.raw_json -> 'parser_warnings' AS parser_warnings,
                 d.source_filename
-            FROM hh_ap_invoices i
+            FROM hh_ap_invoices_effective i
             LEFT JOIN hh_ap_documents d
               ON d.id = i.document_id
             WHERE i.entity_id = :entity_id
@@ -400,7 +400,7 @@ def get_hh_ap_top_invoices_by_total_amount(
             i.advertising_amount,
             i.raw_json -> 'parser_warnings' AS parser_warnings,
             d.source_filename
-        FROM hh_ap_invoices i
+        FROM hh_ap_invoices_effective i
         LEFT JOIN hh_ap_documents d
           ON d.id = i.document_id
         WHERE i.entity_id = :entity_id
