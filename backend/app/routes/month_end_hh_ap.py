@@ -10,6 +10,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
+from ..journal_batch_workflow import (
+    default_workflow_status_from_batch_status,
+    ensure_batch_can_be_rebuilt,
+    get_journal_batch,
+    get_workflow_events,
+    resolve_workflow_status,
+    serialize_workflow,
+)
 
 router = APIRouter(prefix="/api/month-end/hh-ap", tags=["month-end", "hh-ap-month-end"])
 
@@ -499,6 +507,200 @@ def get_hh_ap_unmatched_remittance_summary(session, entity_id: str, period_start
     }
 
 
+def classify_payable_row_scope(invoice_date_value: Any, period_start: str, period_end: str) -> str:
+    if invoice_date_value is None:
+        return "unknown_invoice_date"
+
+    invoice_date_text = str(invoice_date_value)
+    if invoice_date_text < period_start:
+        return "prior_period_open"
+    if invoice_date_text > period_end:
+        return "future_dated"
+    return "current_period"
+
+
+
+def classify_payable_difference_bucket(
+    *,
+    matched_invoice_id: Any,
+    is_missing_download: bool,
+    is_statement_only_invoice: bool,
+    ties_within_tolerance: bool,
+) -> str:
+    if is_missing_download:
+        return "missing_download"
+    if is_statement_only_invoice:
+        return "statement_only_open_item"
+    if matched_invoice_id is None:
+        return "unmatched_statement_line"
+    if ties_within_tolerance:
+        return "matched_tie"
+    return "matched_variance"
+
+
+
+def get_hh_ap_payable_tie_out(
+    session,
+    *,
+    statement_id: str,
+    period_start: str,
+    period_end: str,
+    tolerance: Decimal,
+) -> dict[str, Any]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                sl.id AS statement_line_id,
+                sl.invoice_number,
+                sl.invoice_type,
+                sl.invoice_date,
+                sl.due_date,
+                sl.invoice_amount,
+                sl.open_amount,
+                sl.current_amount,
+                sl.past_due_amount,
+                sl.match_status,
+                sl.is_missing_download,
+                sl.matched_invoice_id,
+                i.invoice_date AS effective_invoice_date,
+                i.due_date AS effective_due_date,
+                i.total_amount AS effective_total_amount,
+                i.override_id,
+                i.override_reason,
+                i.override_review_status,
+                COALESCE(i.is_statement_only, FALSE) AS is_statement_only_invoice,
+                COALESCE(jsonb_array_length(COALESCE(i.raw_json -> 'parser_warnings', '[]'::jsonb)), 0) AS parser_warning_count,
+                d.source_filename
+            FROM hh_ap_statement_lines sl
+            LEFT JOIN hh_ap_invoices_effective i
+              ON i.id = sl.matched_invoice_id
+            LEFT JOIN hh_ap_documents d
+              ON d.id = i.document_id
+            WHERE sl.statement_id = :statement_id
+            ORDER BY sl.invoice_date NULLS LAST, sl.invoice_number, sl.id
+            """
+        ),
+        {"statement_id": statement_id},
+    ).mappings().all()
+
+    tie_rows: list[dict[str, Any]] = []
+    difference_bucket_counts: dict[str, int] = {}
+    row_scope_counts: dict[str, int] = {}
+
+    total_statement_open_amount = Decimal("0.00")
+    total_effective_invoice_total = Decimal("0.00")
+    total_difference_amount = Decimal("0.00")
+
+    matched_row_count = 0
+    unmatched_row_count = 0
+    missing_download_count = 0
+    statement_only_count = 0
+    override_row_count = 0
+    parser_warning_row_count = 0
+    ties_within_tolerance_count = 0
+    variance_row_count = 0
+
+    for row in rows:
+        statement_open_amount = money(row["open_amount"])
+        effective_total_amount = money(row["effective_total_amount"])
+        difference_amount = money(effective_total_amount - statement_open_amount)
+        ties_within_tolerance = abs_money(difference_amount) <= tolerance
+
+        row_scope = classify_payable_row_scope(row["invoice_date"], period_start, period_end)
+        difference_bucket = classify_payable_difference_bucket(
+            matched_invoice_id=row["matched_invoice_id"],
+            is_missing_download=bool(row["is_missing_download"]),
+            is_statement_only_invoice=bool(row["is_statement_only_invoice"]),
+            ties_within_tolerance=ties_within_tolerance,
+        )
+
+        row_scope_counts[row_scope] = row_scope_counts.get(row_scope, 0) + 1
+        difference_bucket_counts[difference_bucket] = difference_bucket_counts.get(difference_bucket, 0) + 1
+
+        total_statement_open_amount += statement_open_amount
+        total_effective_invoice_total += effective_total_amount
+        total_difference_amount += difference_amount
+
+        if row["matched_invoice_id"] is not None:
+            matched_row_count += 1
+        else:
+            unmatched_row_count += 1
+
+        if row["is_missing_download"]:
+            missing_download_count += 1
+        if row["is_statement_only_invoice"]:
+            statement_only_count += 1
+        if row["override_id"] is not None:
+            override_row_count += 1
+        if int(row["parser_warning_count"] or 0) > 0:
+            parser_warning_row_count += 1
+        if ties_within_tolerance:
+            ties_within_tolerance_count += 1
+        else:
+            variance_row_count += 1
+
+        tie_rows.append(
+            {
+                "statement_line_id": str(row["statement_line_id"]),
+                "invoice_number": row["invoice_number"],
+                "invoice_type": row["invoice_type"],
+                "invoice_date": str(row["invoice_date"]) if row["invoice_date"] else None,
+                "due_date": str(row["due_date"]) if row["due_date"] else None,
+                "statement_invoice_amount": money_float(row["invoice_amount"]),
+                "statement_open_amount": money_float(statement_open_amount),
+                "current_amount": money_float(row["current_amount"]),
+                "past_due_amount": money_float(row["past_due_amount"]),
+                "effective_invoice_date": str(row["effective_invoice_date"]) if row["effective_invoice_date"] else None,
+                "effective_due_date": str(row["effective_due_date"]) if row["effective_due_date"] else None,
+                "effective_invoice_total": money_float(effective_total_amount),
+                "difference_amount": money_float(difference_amount),
+                "absolute_difference_amount": money_float(abs_money(difference_amount)),
+                "ties_within_tolerance": ties_within_tolerance,
+                "match_status": row["match_status"],
+                "is_missing_download": bool(row["is_missing_download"]),
+                "has_override": row["override_id"] is not None,
+                "override_id": str(row["override_id"]) if row["override_id"] else None,
+                "override_reason": row["override_reason"],
+                "override_review_status": row["override_review_status"],
+                "is_statement_only_invoice": bool(row["is_statement_only_invoice"]),
+                "parser_warning_count": int(row["parser_warning_count"] or 0),
+                "source_filename": row["source_filename"],
+                "row_scope": row_scope,
+                "difference_bucket": difference_bucket,
+            }
+        )
+
+    top_difference_rows = sorted(
+        tie_rows,
+        key=lambda item: abs(item["absolute_difference_amount"]),
+        reverse=True,
+    )[:25]
+
+    return {
+        "summary": {
+            "row_count": len(tie_rows),
+            "row_scope_counts": row_scope_counts,
+            "difference_bucket_counts": difference_bucket_counts,
+            "matched_row_count": matched_row_count,
+            "unmatched_row_count": unmatched_row_count,
+            "missing_download_count": missing_download_count,
+            "statement_only_count": statement_only_count,
+            "override_row_count": override_row_count,
+            "parser_warning_row_count": parser_warning_row_count,
+            "ties_within_tolerance_count": ties_within_tolerance_count,
+            "variance_row_count": variance_row_count,
+            "total_statement_open_amount": money_float(total_statement_open_amount),
+            "total_effective_invoice_total": money_float(total_effective_invoice_total),
+            "total_difference_amount": money_float(total_difference_amount),
+            "tolerance": money_float(tolerance),
+        },
+        "top_difference_rows": top_difference_rows,
+        "rows": tie_rows,
+    }
+
+
+
 def build_control_result(name: str, status: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "control_name": name,
@@ -531,6 +733,18 @@ def upsert_journal_batch(
     total_credits: Decimal,
     summary_json: dict[str, Any],
 ):
+    existing_batch = get_journal_batch(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        source_module=source_module,
+        batch_label=batch_label,
+    )
+    if existing_batch:
+        ensure_batch_can_be_rebuilt(existing_batch)
+
+    workflow_status = default_workflow_status_from_batch_status(status)
+
     batch = session.execute(
         text(
             """
@@ -540,27 +754,82 @@ def upsert_journal_batch(
                 source_module,
                 batch_label,
                 status,
+                workflow_status,
                 total_debits,
                 total_credits,
-                summary_json
+                summary_json,
+                submitted_by,
+                submitted_at,
+                reviewed_by,
+                reviewed_at,
+                approved_by,
+                approved_at,
+                approval_note,
+                rejection_note,
+                locked_by,
+                locked_at
             ) VALUES (
                 :entity_id,
                 :accounting_period_id,
                 :source_module,
                 :batch_label,
                 :status,
+                :workflow_status,
                 :total_debits,
                 :total_credits,
-                CAST(:summary_json AS jsonb)
+                CAST(:summary_json AS jsonb),
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL
             )
             ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
             DO UPDATE SET
                 status = EXCLUDED.status,
+                workflow_status = EXCLUDED.workflow_status,
                 total_debits = EXCLUDED.total_debits,
                 total_credits = EXCLUDED.total_credits,
                 summary_json = EXCLUDED.summary_json,
+                submitted_by = NULL,
+                submitted_at = NULL,
+                reviewed_by = NULL,
+                reviewed_at = NULL,
+                approved_by = NULL,
+                approved_at = NULL,
+                approval_note = NULL,
+                rejection_note = NULL,
+                locked_by = NULL,
+                locked_at = NULL,
                 updated_at = NOW()
-            RETURNING id, status, total_debits, total_credits, created_at, updated_at
+            RETURNING
+                id,
+                entity_id,
+                accounting_period_id,
+                source_module,
+                batch_label,
+                status,
+                workflow_status,
+                total_debits,
+                total_credits,
+                summary_json,
+                submitted_by,
+                submitted_at,
+                reviewed_by,
+                reviewed_at,
+                approved_by,
+                approved_at,
+                approval_note,
+                rejection_note,
+                locked_by,
+                locked_at,
+                created_at,
+                updated_at
             """
         ),
         {
@@ -569,6 +838,7 @@ def upsert_journal_batch(
             "source_module": source_module,
             "batch_label": batch_label,
             "status": status,
+            "workflow_status": workflow_status,
             "total_debits": total_debits,
             "total_credits": total_credits,
             "summary_json": json.dumps(summary_json),
@@ -848,6 +1118,13 @@ def build_hh_ap_build_payload(session, payload: BuildHHAPMonthEndJournalRequest)
         period_start=str(period["period_start"]),
         period_end=str(period["period_end"]),
     )
+    payable_tie_out = get_hh_ap_payable_tie_out(
+        session=session,
+        statement_id=str(statement["id"]),
+        period_start=str(period["period_start"]),
+        period_end=str(period["period_end"]),
+        tolerance=tolerance,
+    )
 
     review_controls = [
         build_control_result(
@@ -1017,6 +1294,7 @@ def build_hh_ap_build_payload(session, payload: BuildHHAPMonthEndJournalRequest)
             "top_positive_invoices": top_positive_invoices,
             "top_negative_invoices": top_negative_invoices,
         },
+        "payable_tie_out": payable_tie_out,
         "exception_counts": {
             "current_period_missing_pdf_count": current_period_missing_pdf_count,
             "prior_period_open_invoice_count": prior_period_open_invoice_count,
@@ -1086,6 +1364,8 @@ def build_hh_ap_month_end_journal(payload: BuildHHAPMonthEndJournalRequest):
             for line in build_payload["journal_lines"]
         ]
 
+        workflow_history = get_workflow_events(session, str(batch["id"]))
+
         return {
             "entity_code": build_payload["entity"]["entity_code"],
             "accounting_period": {
@@ -1101,11 +1381,13 @@ def build_hh_ap_month_end_journal(payload: BuildHHAPMonthEndJournalRequest):
                 "source_module": HH_AP_SOURCE_MODULE,
                 "batch_label": build_payload["batch_label"],
                 "status": build_payload["batch_status"],
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(build_payload["total_debits"]),
                 "total_credits": money_float(build_payload["total_credits"]),
                 "balance_difference": money_float(build_payload["balance_difference"]),
                 "is_balanced": build_payload["balance_difference"] == Decimal("0.00"),
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "journal_lines": response_lines,
             "summary_json": build_payload["summary_json"],
         }
@@ -1121,39 +1403,16 @@ def review_hh_ap_month_end_journal(
         entity = get_entity(session, entity_code)
         period = get_accounting_period(session, entity["id"], period_end)
 
-        batch = session.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    entity_id,
-                    accounting_period_id,
-                    source_module,
-                    batch_label,
-                    status,
-                    total_debits,
-                    total_credits,
-                    summary_json,
-                    created_at,
-                    updated_at
-                FROM journal_batches
-                WHERE entity_id = :entity_id
-                  AND accounting_period_id = :accounting_period_id
-                  AND source_module = :source_module
-                  AND batch_label = :batch_label
-                LIMIT 1
-                """
-            ),
-            {
-                "entity_id": entity["id"],
-                "accounting_period_id": period["id"],
-                "source_module": HH_AP_SOURCE_MODULE,
-                "batch_label": batch_label,
-            },
-        ).mappings().first()
+        batch = get_journal_batch(
+            session,
+            entity_id=entity["id"],
+            accounting_period_id=period["id"],
+            source_module=HH_AP_SOURCE_MODULE,
+            batch_label=batch_label,
+        )
 
         if not batch:
-            raise HTTPException(status_code=404, detail="No draft HH AP month-end journal batch found for this accounting period")
+            raise HTTPException(status_code=404, detail="No HH AP month-end journal batch found for this accounting period")
 
         lines = session.execute(
             text(
@@ -1176,6 +1435,7 @@ def review_hh_ap_month_end_journal(
         total_debits = money(batch["total_debits"])
         total_credits = money(batch["total_credits"])
         balance_difference = money(total_debits - total_credits)
+        workflow_history = get_workflow_events(session, str(batch["id"]))
 
         return {
             "entity_code": entity["entity_code"],
@@ -1192,6 +1452,7 @@ def review_hh_ap_month_end_journal(
                 "source_module": batch["source_module"],
                 "batch_label": batch["batch_label"],
                 "status": batch["status"],
+                "workflow_status": resolve_workflow_status(batch),
                 "total_debits": money_float(total_debits),
                 "total_credits": money_float(total_credits),
                 "balance_difference": money_float(balance_difference),
@@ -1200,6 +1461,7 @@ def review_hh_ap_month_end_journal(
                 "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
                 "updated_at": batch["updated_at"].isoformat() if batch["updated_at"] else None,
             },
+            "workflow": serialize_workflow(batch, history=workflow_history),
             "journal_lines": [
                 {
                     "line_number": row["line_number"],
