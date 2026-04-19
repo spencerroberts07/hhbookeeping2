@@ -252,6 +252,195 @@ def get_hh_ap_invoice_type_totals(session, entity_id: str, period_start: str, pe
     ]
 
 
+def get_hh_ap_invoice_type_component_totals(
+    session,
+    entity_id: str,
+    period_start: str,
+    period_end: str,
+) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                invoice_type,
+                COUNT(*) AS invoice_count,
+                COALESCE(SUM(COALESCE(total_amount, 0)), 0) AS total_amount,
+                COALESCE(SUM(COALESCE(subtotal, 0)), 0) AS subtotal_amount,
+                COALESCE(SUM(COALESCE(hst_amount, 0)), 0) AS hst_amount,
+                COALESCE(SUM(COALESCE(subscribed_shares_amount, 0)), 0) AS special_shares_amount,
+                COALESCE(SUM(COALESCE(five_year_note_amount, 0)), 0) AS five_year_note_amount,
+                COALESCE(SUM(COALESCE(advertising_amount, 0)), 0) AS advertising_amount,
+                COUNT(*) FILTER (
+                    WHERE COALESCE(jsonb_array_length(COALESCE(raw_json -> 'parser_warnings', '[]'::jsonb)), 0) > 0
+                ) AS warning_invoice_count,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(jsonb_array_length(COALESCE(raw_json -> 'parser_warnings', '[]'::jsonb)), 0) > 0
+                        THEN COALESCE(total_amount, 0)
+                        ELSE 0
+                    END
+                ), 0) AS warning_total_amount
+            FROM hh_ap_invoices
+            WHERE entity_id = :entity_id
+              AND COALESCE(is_statement_only, FALSE) = FALSE
+              AND invoice_date >= :period_start
+              AND invoice_date <= :period_end
+            GROUP BY invoice_type
+            ORDER BY invoice_type
+            """
+        ),
+        {"entity_id": entity_id, "period_start": period_start, "period_end": period_end},
+    ).mappings().all()
+
+    return [
+        {
+            "invoice_type": row["invoice_type"],
+            "invoice_count": int(row["invoice_count"] or 0),
+            "total_amount": money_float(row["total_amount"]),
+            "subtotal_amount": money_float(row["subtotal_amount"]),
+            "hst_amount": money_float(row["hst_amount"]),
+            "special_shares_amount": money_float(row["special_shares_amount"]),
+            "five_year_note_amount": money_float(row["five_year_note_amount"]),
+            "advertising_amount": money_float(row["advertising_amount"]),
+            "warning_invoice_count": int(row["warning_invoice_count"] or 0),
+            "warning_total_amount": money_float(row["warning_total_amount"]),
+        }
+        for row in rows
+    ]
+
+
+def get_hh_ap_invoices_with_parser_warnings(
+    session,
+    entity_id: str,
+    period_start: str,
+    period_end: str,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                i.invoice_number,
+                i.invoice_type,
+                i.invoice_date,
+                i.due_date,
+                i.total_amount,
+                i.subtotal,
+                i.hst_amount,
+                i.subscribed_shares_amount,
+                i.five_year_note_amount,
+                i.advertising_amount,
+                i.raw_json -> 'parser_warnings' AS parser_warnings,
+                d.source_filename
+            FROM hh_ap_invoices i
+            LEFT JOIN hh_ap_documents d
+              ON d.id = i.document_id
+            WHERE i.entity_id = :entity_id
+              AND COALESCE(i.is_statement_only, FALSE) = FALSE
+              AND i.invoice_date >= :period_start
+              AND i.invoice_date <= :period_end
+              AND COALESCE(jsonb_array_length(COALESCE(i.raw_json -> 'parser_warnings', '[]'::jsonb)), 0) > 0
+            ORDER BY ABS(COALESCE(i.total_amount, 0)) DESC, i.invoice_date, i.invoice_number
+            LIMIT :limit
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+    return [
+        {
+            "invoice_number": row["invoice_number"],
+            "invoice_type": row["invoice_type"],
+            "invoice_date": str(row["invoice_date"]) if row["invoice_date"] else None,
+            "due_date": str(row["due_date"]) if row["due_date"] else None,
+            "total_amount": money_float(row["total_amount"]),
+            "subtotal": money_float(row["subtotal"]),
+            "hst_amount": money_float(row["hst_amount"]),
+            "special_shares_amount": money_float(row["subscribed_shares_amount"]),
+            "five_year_note_amount": money_float(row["five_year_note_amount"]),
+            "advertising_amount": money_float(row["advertising_amount"]),
+            "parser_warnings": row["parser_warnings"] if isinstance(row["parser_warnings"], list) else (row["parser_warnings"] or []),
+            "source_filename": row["source_filename"],
+        }
+        for row in rows
+    ]
+
+
+def get_hh_ap_top_invoices_by_total_amount(
+    session,
+    entity_id: str,
+    period_start: str,
+    period_end: str,
+    *,
+    direction: str,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    if direction not in {"positive", "negative"}:
+        raise HTTPException(status_code=400, detail="direction must be positive or negative")
+
+    comparator = ">" if direction == "positive" else "<"
+    ordering = "DESC" if direction == "positive" else "ASC"
+
+    sql = f"""
+        SELECT
+            i.invoice_number,
+            i.invoice_type,
+            i.invoice_date,
+            i.due_date,
+            i.total_amount,
+            i.subtotal,
+            i.hst_amount,
+            i.subscribed_shares_amount,
+            i.five_year_note_amount,
+            i.advertising_amount,
+            i.raw_json -> 'parser_warnings' AS parser_warnings,
+            d.source_filename
+        FROM hh_ap_invoices i
+        LEFT JOIN hh_ap_documents d
+          ON d.id = i.document_id
+        WHERE i.entity_id = :entity_id
+          AND COALESCE(i.is_statement_only, FALSE) = FALSE
+          AND i.invoice_date >= :period_start
+          AND i.invoice_date <= :period_end
+          AND COALESCE(i.total_amount, 0) {comparator} 0
+        ORDER BY COALESCE(i.total_amount, 0) {ordering}, i.invoice_date, i.invoice_number
+        LIMIT :limit
+    """
+
+    rows = session.execute(
+        text(sql),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+    return [
+        {
+            "invoice_number": row["invoice_number"],
+            "invoice_type": row["invoice_type"],
+            "invoice_date": str(row["invoice_date"]) if row["invoice_date"] else None,
+            "due_date": str(row["due_date"]) if row["due_date"] else None,
+            "total_amount": money_float(row["total_amount"]),
+            "subtotal": money_float(row["subtotal"]),
+            "hst_amount": money_float(row["hst_amount"]),
+            "special_shares_amount": money_float(row["subscribed_shares_amount"]),
+            "five_year_note_amount": money_float(row["five_year_note_amount"]),
+            "advertising_amount": money_float(row["advertising_amount"]),
+            "parser_warnings": row["parser_warnings"] if isinstance(row["parser_warnings"], list) else (row["parser_warnings"] or []),
+            "source_filename": row["source_filename"],
+        }
+        for row in rows
+    ]
+
+
 def get_hh_ap_current_period_missing_pdf_count(session, statement_id: str, period_start: str, period_end: str) -> int:
     row = session.execute(
         text(
@@ -604,6 +793,35 @@ def build_hh_ap_build_payload(session, payload: BuildHHAPMonthEndJournalRequest)
         period_start=str(period["period_start"]),
         period_end=str(period["period_end"]),
     )
+    invoice_type_component_totals = get_hh_ap_invoice_type_component_totals(
+        session=session,
+        entity_id=entity["id"],
+        period_start=str(period["period_start"]),
+        period_end=str(period["period_end"]),
+    )
+    invoices_with_parser_warnings = get_hh_ap_invoices_with_parser_warnings(
+        session=session,
+        entity_id=entity["id"],
+        period_start=str(period["period_start"]),
+        period_end=str(period["period_end"]),
+        limit=100,
+    )
+    top_positive_invoices = get_hh_ap_top_invoices_by_total_amount(
+        session=session,
+        entity_id=entity["id"],
+        period_start=str(period["period_start"]),
+        period_end=str(period["period_end"]),
+        direction="positive",
+        limit=25,
+    )
+    top_negative_invoices = get_hh_ap_top_invoices_by_total_amount(
+        session=session,
+        entity_id=entity["id"],
+        period_start=str(period["period_start"]),
+        period_end=str(period["period_end"]),
+        direction="negative",
+        limit=25,
+    )
 
     parsed_inventory_amount = money(
         invoice_month_totals["total_amount"]
@@ -783,6 +1001,21 @@ def build_hh_ap_build_payload(session, payload: BuildHHAPMonthEndJournalRequest)
             "surcharge_amount": money_float(invoice_month_totals["surcharge_amount"]),
             "derived_inventory_amount": money_float(parsed_inventory_amount),
             "invoice_type_totals": invoice_type_totals,
+        },
+        "variance_support": {
+            "component_differences": {
+                "total_amount_difference": money_float(invoice_month_totals["total_amount"] - total_purchases_component),
+                "hst_amount_difference": money_float(invoice_month_totals["hst_amount"] - hst_amount),
+                "special_shares_amount_difference": money_float(invoice_month_totals["subscribed_shares_amount"] - special_shares_amount),
+                "five_year_note_amount_difference": money_float(invoice_month_totals["five_year_note_amount"] - five_year_note_amount),
+                "advertising_amount_difference": money_float(invoice_month_totals["advertising_amount"] - advertising_amount),
+                "inventory_amount_difference": money_float(parsed_inventory_amount - inventory_amount),
+            },
+            "invoice_type_component_totals": invoice_type_component_totals,
+            "parser_warning_invoice_count": len(invoices_with_parser_warnings),
+            "invoices_with_parser_warnings": invoices_with_parser_warnings,
+            "top_positive_invoices": top_positive_invoices,
+            "top_negative_invoices": top_negative_invoices,
         },
         "exception_counts": {
             "current_period_missing_pdf_count": current_period_missing_pdf_count,
