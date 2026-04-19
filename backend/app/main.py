@@ -9,6 +9,7 @@ from .routes.sync import router as sync_router
 from .schemas import HealthResponse
 from .routes.hh_ap import router as hh_ap_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
+from .routes import hh_ap_overrides
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.2.0")
 
@@ -19,6 +20,7 @@ app.include_router(cash_balancing_router)
 app.include_router(month_end_router)
 app.include_router(hh_ap_router)
 app.include_router(month_end_hh_ap_router)
+app.include_router(hh_ap_overrides.router)
 
 
 @app.get("/health", response_model=HealthResponse)
