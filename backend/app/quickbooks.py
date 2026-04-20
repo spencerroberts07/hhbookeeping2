@@ -1,98 +1,107 @@
-from __future__ import annotations
-
-import os
+import base64
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
+from sqlalchemy import text
+
+from .config import settings
+
+BANK_ACCOUNT_TYPES = {
+    "Bank",
+    "CashOnHand",
+    "CreditCard",
+    "OtherCurrentAsset",
+}
 
 
 class QuickBooksClient:
-    """
-    Lightweight QuickBooks Online client used by the bookkeeping control layer.
-
-    Notes:
-    - Uses POST /query with the SQL-like query in the request body.
-    - Handles pagination with STARTPOSITION / MAXRESULTS.
-    - Keeps methods small and reusable so routes/services stay clean.
-    """
-
     def __init__(self) -> None:
-        env_base = os.getenv("QBO_API_BASE_URL", "").strip()
-        self.base_url = env_base or "https://sandbox-quickbooks.api.intuit.com"
-        self.minor_version = os.getenv("QBO_MINOR_VERSION", "75")
-        self.client_id = os.getenv("QBO_CLIENT_ID", "").strip()
-        self.client_secret = os.getenv("QBO_CLIENT_SECRET", "").strip()
+        self.auth_url = settings.qbo_auth_url
+        self.token_url = settings.qbo_token_url
+        self.api_base_url = settings.qbo_api_base_url.rstrip("/")
+        self.scope = settings.qbo_scope
+        self.redirect_uri = settings.qbo_redirect_uri
+        self.minor_version = settings.qbo_minor_version
+
+    @staticmethod
+    def new_state() -> str:
+        return secrets.token_urlsafe(24)
+
+    def build_authorization_url(self, state: str) -> str:
+        query = urlencode(
+            {
+                "client_id": settings.qbo_client_id,
+                "response_type": "code",
+                "scope": self.scope,
+                "redirect_uri": self.redirect_uri,
+                "state": state,
+            }
+        )
+        return f"{self.auth_url}?{query}"
+
+    def _basic_auth_header(self) -> str:
+        raw = f"{settings.qbo_client_id}:{settings.qbo_client_secret}".encode("utf-8")
+        return "Basic " + base64.b64encode(raw).decode("utf-8")
+
+    async def exchange_code(self, code: str) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": self._basic_auth_header(),
+        }
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": self.redirect_uri,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(self.token_url, headers=headers, data=data)
+            response.raise_for_status()
+            return response.json()
 
     async def refresh_access_token(self, refresh_token: str) -> dict[str, Any]:
-        """
-        Exchange a refresh token for a new access token.
-        """
-        if not self.client_id or not self.client_secret:
-            raise ValueError("Missing QBO_CLIENT_ID or QBO_CLIENT_SECRET")
-
-        token_url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-        basic_auth = httpx.BasicAuth(self.client_id, self.client_secret)
-
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": self._basic_auth_header(),
+        }
         data = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         }
-
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                token_url,
-                data=data,
-                headers=headers,
-                auth=basic_auth,
-            )
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(self.token_url, headers=headers, data=data)
             response.raise_for_status()
             return response.json()
 
     async def get_company_info(self, realm_id: str, access_token: str) -> dict[str, Any]:
-        """
-        Fetch basic company info from QBO.
-        """
+        url = f"{self.api_base_url}/v3/company/{realm_id}/companyinfo/{realm_id}"
+        params = {"minorversion": self.minor_version}
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(
-                f"{self.base_url}/v3/company/{realm_id}/companyinfo/{realm_id}",
-                params={"minorversion": self.minor_version},
-                headers=headers,
-            )
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
 
-    async def query(
-        self,
-        realm_id: str,
-        access_token: str,
-        query: str,
-    ) -> dict[str, Any]:
+    async def query(self, realm_id: str, access_token: str, query: str) -> dict[str, Any]:
         """
-        Run a single QBO query using POST /query.
+        Single QBO query using POST /query.
         """
+        url = f"{self.api_base_url}/v3/company/{realm_id}/query"
+        params = {"minorversion": self.minor_version}
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
             "Content-Type": "application/text",
         }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{self.base_url}/v3/company/{realm_id}/query",
-                params={"minorversion": self.minor_version},
-                headers=headers,
-                content=query,
-            )
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(url, headers=headers, params=params, content=query)
             response.raise_for_status()
             return response.json()
 
@@ -105,12 +114,13 @@ class QuickBooksClient:
         page_size: int = 1000,
     ) -> list[dict[str, Any]]:
         """
-        Run a paginated QBO query and return all rows for one object type.
+        Paginated QBO query using POST /query.
 
-        Example:
-            base_query = "SELECT * FROM Check WHERE TxnDate >= '2026-02-01' AND TxnDate <= '2026-02-28'"
-            object_name = "Check"
+        Example base_query:
+            SELECT * FROM Check WHERE TxnDate >= '2026-02-01' AND TxnDate <= '2026-02-28'
         """
+        url = f"{self.api_base_url}/v3/company/{realm_id}/query"
+        params = {"minorversion": self.minor_version}
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
@@ -120,24 +130,16 @@ class QuickBooksClient:
         all_rows: list[dict[str, Any]] = []
         start_pos = 1
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             while True:
                 query = f"{base_query} STARTPOSITION {start_pos} MAXRESULTS {page_size}"
-
-                response = await client.post(
-                    f"{self.base_url}/v3/company/{realm_id}/query",
-                    params={"minorversion": self.minor_version},
-                    headers=headers,
-                    content=query,
-                )
+                response = await client.post(url, headers=headers, params=params, content=query)
                 response.raise_for_status()
 
                 data = response.json()
                 query_response = data.get("QueryResponse", {})
-
                 rows = query_response.get(object_name, []) or []
 
-                # QBO sometimes returns a single object instead of a list
                 if isinstance(rows, dict):
                     rows = [rows]
 
@@ -153,33 +155,123 @@ class QuickBooksClient:
 
         return all_rows
 
-    async def get_account(self, realm_id: str, access_token: str, account_id: str) -> dict[str, Any]:
-        """
-        Fetch a single account by ID.
-        """
+    async def cdc(
+        self,
+        realm_id: str,
+        access_token: str,
+        changed_since_iso: str,
+        entities: list[str],
+    ) -> dict[str, Any]:
+        url = f"{self.api_base_url}/v3/company/{realm_id}/cdc"
+        params = {
+            "changedSince": changed_since_iso,
+            "entities": ",".join(entities),
+            "minorversion": self.minor_version,
+        }
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(
-                f"{self.base_url}/v3/company/{realm_id}/account/{account_id}",
-                params={"minorversion": self.minor_version},
-                headers=headers,
-            )
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.get(url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
 
-    async def get_accounts(self, realm_id: str, access_token: str) -> list[dict[str, Any]]:
-        """
-        Fetch all accounts through the query endpoint.
-        """
-        data = await self.query_all(
-            realm_id=realm_id,
-            access_token=access_token,
-            base_query="SELECT * FROM Account",
-            object_name="Account",
-            page_size=1000,
-        )
-        return data
+
+def token_expiry_from_seconds(seconds: int | None) -> datetime | None:
+    if not seconds:
+        return None
+    return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+def upsert_connection(session, entity_id: str, realm_id: str, token_payload: dict[str, Any]) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO quickbooks_connections (
+                entity_id, realm_id, access_token, refresh_token,
+                access_token_expires_at, refresh_token_expires_at, is_active
+            )
+            VALUES (
+                :entity_id, :realm_id, :access_token, :refresh_token,
+                :access_expiry, :refresh_expiry, TRUE
+            )
+            ON CONFLICT (entity_id, realm_id)
+            DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                access_token_expires_at = EXCLUDED.access_token_expires_at,
+                refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+                disconnected_at = NULL,
+                is_active = TRUE
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "realm_id": realm_id,
+            "access_token": token_payload["access_token"],
+            "refresh_token": token_payload["refresh_token"],
+            "access_expiry": token_expiry_from_seconds(token_payload.get("expires_in")),
+            "refresh_expiry": token_expiry_from_seconds(token_payload.get("x_refresh_token_expires_in")),
+        },
+    )
+
+
+async def ensure_valid_access_token(session, connection: dict[str, Any]) -> dict[str, Any]:
+    """
+    Refresh the QuickBooks access token if expired or close to expiry.
+    Returns an updated connection mapping.
+    """
+    expires_at = connection.get("access_token_expires_at")
+    now_utc = datetime.now(timezone.utc)
+    refresh_needed = False
+
+    if not expires_at:
+        refresh_needed = True
+    else:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now_utc + timedelta(minutes=5):
+            refresh_needed = True
+
+    if not refresh_needed:
+        return connection
+
+    refresh_token = connection.get("refresh_token")
+    if not refresh_token:
+        raise ValueError("QuickBooks refresh token is missing")
+
+    qb = QuickBooksClient()
+    token_payload = await qb.refresh_access_token(refresh_token)
+
+    session.execute(
+        text(
+            """
+            UPDATE quickbooks_connections
+            SET access_token = :access_token,
+                refresh_token = :refresh_token,
+                access_token_expires_at = :access_expiry,
+                refresh_token_expires_at = :refresh_expiry,
+                disconnected_at = NULL,
+                is_active = TRUE,
+                updated_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": connection["id"],
+            "access_token": token_payload["access_token"],
+            "refresh_token": token_payload.get("refresh_token", refresh_token),
+            "access_expiry": token_expiry_from_seconds(token_payload.get("expires_in")),
+            "refresh_expiry": token_expiry_from_seconds(token_payload.get("x_refresh_token_expires_in")),
+        },
+    )
+
+    refreshed = dict(connection)
+    refreshed["access_token"] = token_payload["access_token"]
+    refreshed["refresh_token"] = token_payload.get("refresh_token", refresh_token)
+    refreshed["access_token_expires_at"] = token_expiry_from_seconds(token_payload.get("expires_in"))
+    refreshed["refresh_token_expires_at"] = token_expiry_from_seconds(
+        token_payload.get("x_refresh_token_expires_in")
+    )
+    return refreshed
