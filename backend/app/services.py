@@ -475,22 +475,19 @@ async def sync_qbo_bank_transactions(
             )
             continue
 
-    for row in rows:
-        if object_name == "Purchase":
-            account_ref = row.get("AccountRef") if isinstance(row.get("AccountRef"), dict) else {}
-            account_id = str(account_ref.get("value")) if account_ref.get("value") is not None else None
-            payment_type = row.get("PaymentType")
+        for row in rows:
+            if object_name == "Purchase":
+                account_ref = row.get("AccountRef") if isinstance(row.get("AccountRef"), dict) else {}
+                account_id = str(account_ref.get("value")) if account_ref.get("value") is not None else None
+                payment_type = row.get("PaymentType")
 
-            # Keep only bank-account-backed Purchase rows for this module.
-            if account_id not in bank_account_ids:
-                continue
+                if account_id not in bank_account_ids:
+                    continue
 
-            # Optional tightening: only keep true check-style outflows for now.
-            # Remove this line later if you also want cash/credit-card Purchase rows.
-            if payment_type not in {"Check"}:
-                continue
+                if payment_type not in {"Check"}:
+                    continue
 
-        hits = _extract_bank_hit(row, object_name, bank_account_ids)
+            hits = _extract_bank_hit(row, object_name, bank_account_ids)
 
             for hit in hits:
                 source_transaction_id = hit["source_transaction_id"]
@@ -605,7 +602,7 @@ async def sync_qbo_bank_transactions(
                 reviewed_candidates += 1
                 txn_type = hit["source_transaction_type"]
                 per_type_counts[txn_type] = per_type_counts.get(txn_type, 0) + 1
-    
+
     summary_rows = session.execute(
         text(
             """
