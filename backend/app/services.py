@@ -591,6 +591,156 @@ async def sync_qbo_bank_transactions(
                 txn_type = hit["source_transaction_type"]
                 per_type_counts[txn_type] = per_type_counts.get(txn_type, 0) + 1
 
+        # Handle Check separately because QBO query filtering for Check can be finicky.
+    check_base_query = "SELECT * FROM Check"
+
+    try:
+        check_rows = await qb.query_all(
+            realm_id=connection["realm_id"],
+            access_token=connection["access_token"],
+            base_query=check_base_query,
+            object_name="Check",
+        )
+    except Exception as exc:
+        object_errors.append(
+            {
+                "object_name": "Check",
+                "query": check_base_query,
+                "error": str(exc),
+            }
+        )
+        check_rows = []
+
+    for row in check_rows:
+        txn_date_str = row.get("TxnDate")
+        if not txn_date_str:
+            continue
+
+        try:
+            row_txn_date = date.fromisoformat(txn_date_str)
+        except Exception:
+            continue
+
+        if row_txn_date < date_from or row_txn_date > date_to:
+            continue
+
+        hits = _extract_bank_hit(row, "Check", bank_account_ids)
+
+        for hit in hits:
+            source_transaction_id = hit["source_transaction_id"]
+            if source_transaction_id in seen_ids:
+                continue
+
+            seen_ids.add(source_transaction_id)
+
+            txn_date = (
+                date.fromisoformat(hit["transaction_date"])
+                if hit["transaction_date"]
+                else None
+            )
+            posted_date = (
+                date.fromisoformat(hit["posted_date"])
+                if hit["posted_date"]
+                else None
+            )
+            accounting_period_id = get_or_create_accounting_period(session, entity["id"], txn_date)
+            account_id = hit["source_account_id"]
+
+            existing = session.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM bank_transactions
+                    WHERE entity_id = :entity_id
+                      AND source_system = 'quickbooks'
+                      AND source_transaction_id = :source_transaction_id
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "source_transaction_id": source_transaction_id,
+                },
+            ).mappings().first()
+
+            params = {
+                "entity_id": entity["id"],
+                "accounting_period_id": accounting_period_id,
+                "source_connection_id": connection["id"],
+                "source_account_id": account_id,
+                "source_account_name": (
+                    account_name_map.get(account_id)
+                    or hit["source_account_name"]
+                    or "Unknown bank account"
+                ),
+                "source_account_code": account_code_map.get(account_id),
+                "source_transaction_id": source_transaction_id,
+                "source_transaction_type": hit["source_transaction_type"],
+                "transaction_date": txn_date,
+                "posted_date": posted_date,
+                "description": (hit.get("description") or "")[:500],
+                "reference_number": hit.get("reference_number"),
+                "amount": hit["amount"],
+                "currency_code": hit.get("currency_code"),
+                "direction": hit["direction"],
+                "raw_json": json.dumps(hit.get("raw_json") or {}, default=str),
+            }
+
+            if existing:
+                session.execute(
+                    text(
+                        """
+                        UPDATE bank_transactions
+                        SET accounting_period_id = :accounting_period_id,
+                            source_connection_id = :source_connection_id,
+                            source_account_id = :source_account_id,
+                            source_account_name = :source_account_name,
+                            source_account_code = :source_account_code,
+                            source_transaction_type = :source_transaction_type,
+                            transaction_date = :transaction_date,
+                            posted_date = :posted_date,
+                            description = :description,
+                            reference_number = :reference_number,
+                            amount = :amount,
+                            currency_code = :currency_code,
+                            direction = :direction,
+                            raw_json = CAST(:raw_json AS jsonb),
+                            last_seen_at = NOW()
+                        WHERE id = :id
+                        """
+                    ),
+                    {**params, "id": existing["id"]},
+                )
+                updated_count += 1
+            else:
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO bank_transactions (
+                            entity_id, accounting_period_id, source_system, source_connection_id,
+                            source_account_id, source_account_name, source_account_code,
+                            source_transaction_id, source_transaction_type,
+                            transaction_date, posted_date, description, reference_number,
+                            amount, currency_code, direction, raw_json
+                        )
+                        VALUES (
+                            :entity_id, :accounting_period_id, 'quickbooks', :source_connection_id,
+                            :source_account_id, :source_account_name, :source_account_code,
+                            :source_transaction_id, :source_transaction_type,
+                            :transaction_date, :posted_date, :description, :reference_number,
+                            :amount, :currency_code, :direction, CAST(:raw_json AS jsonb)
+                        )
+                        """
+                    ),
+                    params,
+                )
+                inserted_count += 1
+
+            reviewed_candidates += 1
+            txn_type = hit["source_transaction_type"]
+            per_type_counts[txn_type] = per_type_counts.get(txn_type, 0) + 1
+
+    
     summary_rows = session.execute(
         text(
             """
