@@ -1,17 +1,27 @@
 import json
-
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import text
 
-from .quickbooks import BANK_ACCOUNT_TYPES, QuickBooksClient, ensure_valid_access_token, upsert_connection
+from .quickbooks import (
+    BANK_ACCOUNT_TYPES,
+    QuickBooksClient,
+    ensure_valid_access_token,
+    upsert_connection,
+)
 
 
 def get_entity_by_code(session, entity_code: str):
     return session.execute(
-        text("SELECT id, entity_code, entity_name, quickbooks_company_id FROM entities WHERE entity_code = :entity_code"),
+        text(
+            """
+            SELECT id, entity_code, entity_name, quickbooks_company_id
+            FROM entities
+            WHERE entity_code = :entity_code
+            """
+        ),
         {"entity_code": entity_code},
     ).mappings().first()
 
@@ -35,6 +45,7 @@ def get_active_connection(session, entity_id: str):
 def get_or_create_accounting_period(session, entity_id: str, txn_date: date | None):
     if txn_date is None:
         return None
+
     row = session.execute(
         text(
             """
@@ -48,6 +59,7 @@ def get_or_create_accounting_period(session, entity_id: str, txn_date: date | No
         ),
         {"entity_id": entity_id, "txn_date": txn_date},
     ).mappings().first()
+
     return row["id"] if row else None
 
 
@@ -55,32 +67,44 @@ async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
     entity = get_entity_by_code(session, entity_code)
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
+
     connection = get_active_connection(session, entity["id"])
     if not connection:
         raise ValueError("QuickBooks connection not found for entity")
+
     connection = await ensure_valid_access_token(session, connection)
 
     qb = QuickBooksClient()
     accounts = await qb.query_all(
         realm_id=connection["realm_id"],
         access_token=connection["access_token"],
-        base_query="select * from Account",
+        base_query="SELECT * FROM Account",
         object_name="Account",
     )
 
     imported = 0
     bank_accounts = 0
+
     for acc in accounts:
         code = acc.get("AcctNum") or acc.get("Id")
         name = acc.get("Name") or "Unnamed"
         classification = acc.get("Classification") or "Unclassified"
         account_type = acc.get("AccountType") or classification
-        statement_type = "balance_sheet" if classification in {"Asset", "Liability", "Equity"} else "income_statement"
+        statement_type = (
+            "balance_sheet"
+            if classification in {"Asset", "Liability", "Equity"}
+            else "income_statement"
+        )
+
         session.execute(
             text(
                 """
-                INSERT INTO accounts (entity_id, account_code, account_name, account_class, statement_type, quickbooks_account_id)
-                VALUES (:entity_id, :account_code, :account_name, :account_class, :statement_type, :quickbooks_account_id)
+                INSERT INTO accounts (
+                    entity_id, account_code, account_name, account_class, statement_type, quickbooks_account_id
+                )
+                VALUES (
+                    :entity_id, :account_code, :account_name, :account_class, :statement_type, :quickbooks_account_id
+                )
                 ON CONFLICT (entity_id, account_code)
                 DO UPDATE SET
                     account_name = EXCLUDED.account_name,
@@ -99,53 +123,80 @@ async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
                 "quickbooks_account_id": str(acc.get("Id")),
             },
         )
+
         imported += 1
         if account_type in BANK_ACCOUNT_TYPES:
             bank_accounts += 1
 
-    return {"imported_count": imported, "realm_id": connection["realm_id"], "bank_account_count": bank_accounts}
+    return {
+        "imported_count": imported,
+        "realm_id": connection["realm_id"],
+        "bank_account_count": bank_accounts,
+    }
 
 
 async def import_transactions_cdc(session, entity_code: str, date_from, date_to) -> dict[str, Any]:
     entity = get_entity_by_code(session, entity_code)
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
+
     connection = get_active_connection(session, entity["id"])
     if not connection:
         raise ValueError("QuickBooks connection not found for entity")
+
     connection = await ensure_valid_access_token(session, connection)
 
     qb = QuickBooksClient()
     changed_since = datetime.combine(date_from, time.min, tzinfo=timezone.utc).isoformat()
+
     payload = await qb.cdc(
         realm_id=connection["realm_id"],
         access_token=connection["access_token"],
         changed_since_iso=changed_since,
-        entities=["JournalEntry", "Bill", "BillPayment", "Deposit", "Purchase", "SalesReceipt", "Invoice", "Payment"],
+        entities=[
+            "JournalEntry",
+            "Bill",
+            "BillPayment",
+            "Deposit",
+            "Purchase",
+            "SalesReceipt",
+            "Invoice",
+            "Payment",
+        ],
     )
 
     imported = 0
     entity_nodes = payload.get("CDCResponse", [{}])[0].get("QueryResponse", [])
+
     for bucket in entity_nodes:
         for txn_type, records in bucket.items():
             if not isinstance(records, list):
                 continue
+
             for record in records:
-                txn_date = record.get("TxnDate") or record.get("MetaData", {}).get("LastUpdatedTime", "")[:10] or None
+                txn_date = (
+                    record.get("TxnDate")
+                    or record.get("MetaData", {}).get("LastUpdatedTime", "")[:10]
+                    or None
+                )
                 amount = record.get("TotalAmt") or record.get("HomeTotalAmt") or 0
+
                 counterparty = None
                 if isinstance(record.get("VendorRef"), dict):
                     counterparty = record["VendorRef"].get("name")
                 elif isinstance(record.get("CustomerRef"), dict):
                     counterparty = record["CustomerRef"].get("name")
+
                 memo = record.get("PrivateNote") or record.get("DocNumber") or txn_type
+
                 session.execute(
                     text(
                         """
                         INSERT INTO quickbooks_transactions (
                             entity_id, quickbooks_txn_id, txn_type, txn_date, memo,
                             counterparty_name, amount, source_account_name
-                        ) VALUES (
+                        )
+                        VALUES (
                             :entity_id, :quickbooks_txn_id, :txn_type, :txn_date, :memo,
                             :counterparty_name, :amount, :source_account_name
                         )
@@ -162,6 +213,7 @@ async def import_transactions_cdc(session, entity_code: str, date_from, date_to)
                         "source_account_name": record.get("TxnStatus") or "imported_from_cdc",
                     },
                 )
+
                 imported += 1
 
     return {
@@ -180,7 +232,9 @@ async def connect_company(session, entity_code: str, realm_id: str, code: str) -
     qb = QuickBooksClient()
     token_payload = await qb.exchange_code(code)
     upsert_connection(session, entity["id"], realm_id, token_payload)
+
     company_info = await qb.get_company_info(realm_id, token_payload["access_token"])
+
     return {
         "realm_id": realm_id,
         "company_info": company_info.get("CompanyInfo", {}),
@@ -197,11 +251,16 @@ def _line_account_ref(line: dict[str, Any]) -> tuple[str | None, str | None]:
     detail_type = line.get("DetailType")
     if not detail_type:
         return (None, None)
-    detail = line.get(detail_type, {}) if isinstance(line.get(detail_type), dict) else {}
+
+    raw_detail = line.get(detail_type)
+    detail = raw_detail if isinstance(raw_detail, dict) else {}
+
     account_ref = detail.get("AccountRef") if isinstance(detail.get("AccountRef"), dict) else None
     if not account_ref:
         return (None, None)
-    return (str(account_ref.get("value")) if account_ref.get("value") is not None else None, account_ref.get("name"))
+
+    value = str(account_ref.get("value")) if account_ref.get("value") is not None else None
+    return (value, account_ref.get("name"))
 
 
 def _txn_header_bank_ref(record: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -212,16 +271,30 @@ def _txn_header_bank_ref(record: dict[str, Any]) -> tuple[str | None, str | None
     return (None, None)
 
 
-def _extract_bank_hit(record: dict[str, Any], txn_type: str, bank_account_ids: set[str]) -> list[dict[str, Any]]:
+def _extract_bank_hit(
+    record: dict[str, Any],
+    txn_type: str,
+    bank_account_ids: set[str],
+) -> list[dict[str, Any]]:
     txn_id = str(record.get("Id") or "")
     if not txn_id:
         return []
 
-    txn_date = record.get("TxnDate") or record.get("MetaData", {}).get("LastUpdatedTime", "")[:10] or None
+    txn_date = (
+        record.get("TxnDate")
+        or record.get("MetaData", {}).get("LastUpdatedTime", "")[:10]
+        or None
+    )
     posted_date = txn_date
     doc_number = record.get("DocNumber")
     private_note = record.get("PrivateNote")
-    currency_code = (((record.get("CurrencyRef") or {}).get("value")) if isinstance(record.get("CurrencyRef"), dict) else None) or "CAD"
+
+    currency_code = (
+        ((record.get("CurrencyRef") or {}).get("value"))
+        if isinstance(record.get("CurrencyRef"), dict)
+        else None
+    ) or "CAD"
+
     total_amt = _safe_decimal(record.get("TotalAmt") or record.get("HomeTotalAmt") or 0)
 
     counterparty = None
@@ -233,9 +306,11 @@ def _extract_bank_hit(record: dict[str, Any], txn_type: str, bank_account_ids: s
                 break
 
     hits: list[dict[str, Any]] = []
+
     header_account_id, header_account_name = _txn_header_bank_ref(record)
     if header_account_id and header_account_id in bank_account_ids:
         signed_amount = total_amt
+
         if txn_type in {"Deposit", "SalesReceipt", "Payment"}:
             direction = "inflow"
         elif txn_type in {"Purchase", "Check", "BillPayment", "CreditCardPayment"}:
@@ -245,7 +320,9 @@ def _extract_bank_hit(record: dict[str, Any], txn_type: str, bank_account_ids: s
             direction = "transfer"
         else:
             direction = "unknown"
+
         description = private_note or doc_number or counterparty or txn_type
+
         hits.append(
             {
                 "source_transaction_id": f"{txn_type}:{txn_id}:{header_account_id}:header",
@@ -272,13 +349,19 @@ def _extract_bank_hit(record: dict[str, Any], txn_type: str, bank_account_ids: s
         account_id, account_name = _line_account_ref(line)
         if not account_id or account_id not in bank_account_ids:
             continue
+
         amount = _safe_decimal(line.get("Amount"))
-        posting_type = None
-        detail = line.get("JournalEntryLineDetail") if isinstance(line.get("JournalEntryLineDetail"), dict) else {}
+        detail = (
+            line.get("JournalEntryLineDetail")
+            if isinstance(line.get("JournalEntryLineDetail"), dict)
+            else {}
+        )
         posting_type = detail.get("PostingType")
+
         signed_amount = amount if posting_type == "Debit" else -amount
         direction = "inflow" if signed_amount > 0 else "outflow"
         description = line.get("Description") or private_note or doc_number or txn_type
+
         hits.append(
             {
                 "source_transaction_id": f"{txn_type}:{txn_id}:{account_id}:line:{idx}",
@@ -292,19 +375,31 @@ def _extract_bank_hit(record: dict[str, Any], txn_type: str, bank_account_ids: s
                 "source_account_id": account_id,
                 "source_account_name": account_name,
                 "currency_code": currency_code,
-                "raw_json": {"transaction": record, "line": line, "line_index": idx},
+                "raw_json": {
+                    "transaction": record,
+                    "line": line,
+                    "line_index": idx,
+                },
             }
         )
+
     return hits
 
 
-async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date, date_to: date) -> dict[str, Any]:
+async def sync_qbo_bank_transactions(
+    session,
+    entity_code: str,
+    date_from: date,
+    date_to: date,
+) -> dict[str, Any]:
     entity = get_entity_by_code(session, entity_code)
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
+
     connection = get_active_connection(session, entity["id"])
     if not connection:
         raise ValueError("QuickBooks connection not found for entity")
+
     connection = await ensure_valid_access_token(session, connection)
 
     bank_accounts = session.execute(
@@ -323,23 +418,30 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
     if not bank_accounts:
         raise ValueError("No QuickBooks bank-type accounts found. Run chart-of-accounts sync first.")
 
-    bank_account_ids = {str(row["quickbooks_account_id"]) for row in bank_accounts if row["quickbooks_account_id"]}
-    account_name_map = {str(row["quickbooks_account_id"]): row["account_name"] for row in bank_accounts if row["quickbooks_account_id"]}
-    account_code_map = {str(row["quickbooks_account_id"]): row["account_code"] for row in bank_accounts if row["quickbooks_account_id"]}
+    bank_account_ids = {
+        str(row["quickbooks_account_id"])
+        for row in bank_accounts
+        if row["quickbooks_account_id"]
+    }
+    account_name_map = {
+        str(row["quickbooks_account_id"]): row["account_name"]
+        for row in bank_accounts
+        if row["quickbooks_account_id"]
+    }
+    account_code_map = {
+        str(row["quickbooks_account_id"]): row["account_code"]
+        for row in bank_accounts
+        if row["quickbooks_account_id"]
+    }
 
     qb = QuickBooksClient()
     query_from = date_from.isoformat()
     query_to = date_to.isoformat()
+
     objects = [
-        "Purchase",
+        "Check",
         "Deposit",
         "Transfer",
-        "BillPayment",
-        "Check",
-        "SalesReceipt",
-        "Payment",
-        "CreditCardPayment",
-        "JournalEntry",
     ]
 
     inserted_count = 0
@@ -347,6 +449,7 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
     reviewed_candidates = 0
     per_type_counts: dict[str, int] = {}
     seen_ids: set[str] = set()
+    object_errors: list[dict[str, Any]] = []
 
     for object_name in objects:
         base_query = (
@@ -354,24 +457,47 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
             f"WHERE TxnDate >= '{query_from}' "
             f"AND TxnDate <= '{query_to}'"
         )
-        
-        rows = await qb.query_all(
-            realm_id=connection["realm_id"],
-            access_token=connection["access_token"],
-            base_query=base_query,
-            object_name=object_name,
-        )
+
+        try:
+            rows = await qb.query_all(
+                realm_id=connection["realm_id"],
+                access_token=connection["access_token"],
+                base_query=base_query,
+                object_name=object_name,
+            )
+        except Exception as exc:
+            object_errors.append(
+                {
+                    "object_name": object_name,
+                    "query": base_query,
+                    "error": str(exc),
+                }
+            )
+            continue
+
         for row in rows:
             hits = _extract_bank_hit(row, object_name, bank_account_ids)
+
             for hit in hits:
                 source_transaction_id = hit["source_transaction_id"]
                 if source_transaction_id in seen_ids:
                     continue
+
                 seen_ids.add(source_transaction_id)
-                txn_date = date.fromisoformat(hit["transaction_date"]) if hit["transaction_date"] else None
-                posted_date = date.fromisoformat(hit["posted_date"]) if hit["posted_date"] else None
+
+                txn_date = (
+                    date.fromisoformat(hit["transaction_date"])
+                    if hit["transaction_date"]
+                    else None
+                )
+                posted_date = (
+                    date.fromisoformat(hit["posted_date"])
+                    if hit["posted_date"]
+                    else None
+                )
                 accounting_period_id = get_or_create_accounting_period(session, entity["id"], txn_date)
                 account_id = hit["source_account_id"]
+
                 existing = session.execute(
                     text(
                         """
@@ -383,7 +509,10 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                         LIMIT 1
                         """
                     ),
-                    {"entity_id": entity["id"], "source_transaction_id": source_transaction_id},
+                    {
+                        "entity_id": entity["id"],
+                        "source_transaction_id": source_transaction_id,
+                    },
                 ).mappings().first()
 
                 params = {
@@ -391,7 +520,11 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                     "accounting_period_id": accounting_period_id,
                     "source_connection_id": connection["id"],
                     "source_account_id": account_id,
-                    "source_account_name": account_name_map.get(account_id) or hit["source_account_name"] or "Unknown bank account",
+                    "source_account_name": (
+                        account_name_map.get(account_id)
+                        or hit["source_account_name"]
+                        or "Unknown bank account"
+                    ),
                     "source_account_code": account_code_map.get(account_id),
                     "source_transaction_id": source_transaction_id,
                     "source_transaction_type": hit["source_transaction_type"],
@@ -404,6 +537,7 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                     "direction": hit["direction"],
                     "raw_json": json.dumps(hit.get("raw_json") or {}, default=str),
                 }
+
                 if existing:
                     session.execute(
                         text(
@@ -440,7 +574,8 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                                 source_transaction_id, source_transaction_type,
                                 transaction_date, posted_date, description, reference_number,
                                 amount, currency_code, direction, raw_json
-                            ) VALUES (
+                            )
+                            VALUES (
                                 :entity_id, :accounting_period_id, 'quickbooks', :source_connection_id,
                                 :source_account_id, :source_account_name, :source_account_code,
                                 :source_transaction_id, :source_transaction_type,
@@ -454,7 +589,8 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                     inserted_count += 1
 
                 reviewed_candidates += 1
-                per_type_counts[hit["source_transaction_type"]] = per_type_counts.get(hit["source_transaction_type"], 0) + 1
+                txn_type = hit["source_transaction_type"]
+                per_type_counts[txn_type] = per_type_counts.get(txn_type, 0) + 1
 
     summary_rows = session.execute(
         text(
@@ -468,7 +604,11 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
             ORDER BY source_account_name, review_status
             """
         ),
-        {"entity_id": entity["id"], "date_from": date_from, "date_to": date_to},
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+        },
     ).mappings().all()
 
     return {
@@ -482,11 +622,18 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
         "per_transaction_type_counts": per_type_counts,
         "bank_account_count": len(bank_accounts),
         "summary_by_account_status": [dict(row) for row in summary_rows],
+        "object_errors": object_errors,
         "note": "This sync imports QuickBooks-posted bank activity into the control layer. It does not yet pull the native bank-feed tab from QuickBooks.",
     }
 
 
-def list_bank_transactions(session, entity_code: str, date_from: date, date_to: date, review_status: str | None = None) -> dict[str, Any]:
+def list_bank_transactions(
+    session,
+    entity_code: str,
+    date_from: date,
+    date_to: date,
+    review_status: str | None = None,
+) -> dict[str, Any]:
     entity = get_entity_by_code(session, entity_code)
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
@@ -500,13 +647,21 @@ def list_bank_transactions(session, entity_code: str, date_from: date, date_to: 
         WHERE entity_id = :entity_id
           AND transaction_date BETWEEN :date_from AND :date_to
     """
-    params: dict[str, Any] = {"entity_id": entity["id"], "date_from": date_from, "date_to": date_to}
+
+    params: dict[str, Any] = {
+        "entity_id": entity["id"],
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
     if review_status:
         sql += " AND review_status = :review_status"
         params["review_status"] = review_status
+
     sql += " ORDER BY transaction_date DESC, imported_at DESC LIMIT 500"
 
     rows = session.execute(text(sql), params).mappings().all()
+
     return {
         "entity_code": entity_code,
         "date_from": date_from.isoformat(),
