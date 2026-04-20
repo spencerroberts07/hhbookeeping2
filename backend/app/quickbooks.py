@@ -88,25 +88,53 @@ class QuickBooksClient:
             response.raise_for_status()
             return response.json()
 
-    async def query_all(self, realm_id: str, access_token: str, base_query: str, object_name: str) -> list[dict[str, Any]]:
-        start_position = 1
-        page_size = 1000
-        rows: list[dict[str, Any]] = []
+   async def query_all(
+    self,
+    realm_id: str,
+    access_token: str,
+    base_query: str,
+    object_name: str,
+    page_size: int = 1000,
+) -> list[dict]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/text",
+    }
 
+    all_rows: list[dict] = []
+    start_pos = 1
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
         while True:
-            query = f"{base_query} startposition {start_position} maxresults {page_size}"
-            payload = await self.query(realm_id=realm_id, access_token=access_token, query=query)
-            page_rows = payload.get("QueryResponse", {}).get(object_name, [])
-            if not isinstance(page_rows, list):
-                page_rows = [page_rows]
-            if not page_rows:
-                break
-            rows.extend(page_rows)
-            if len(page_rows) < page_size:
-                break
-            start_position += page_size
+            query = f"{base_query} STARTPOSITION {start_pos} MAXRESULTS {page_size}"
 
-        return rows
+            response = await client.post(
+                f"{self.base_url}/v3/company/{realm_id}/query",
+                params={"minorversion": self.minor_version},
+                headers=headers,
+                content=query,
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            query_response = data.get("QueryResponse", {})
+            rows = query_response.get(object_name, []) or []
+
+            if isinstance(rows, dict):
+                rows = [rows]
+
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+
+            if len(rows) < page_size:
+                break
+
+            start_pos += page_size
+
+    return all_rows
 
     async def cdc(self, realm_id: str, access_token: str, changed_since_iso: str, entities: list[str]) -> dict[str, Any]:
         url = f"{self.api_base_url}/v3/company/{realm_id}/cdc"
