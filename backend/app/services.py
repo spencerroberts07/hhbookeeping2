@@ -397,12 +397,12 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
                     "source_transaction_type": hit["source_transaction_type"],
                     "transaction_date": txn_date,
                     "posted_date": posted_date,
-                    "description": hit["description"][:500],
-                    "reference_number": hit["reference_number"],
+                    "description": (hit.get("description") or "")[:500],
+                    "reference_number": hit.get("reference_number"),
                     "amount": hit["amount"],
-                    "currency_code": hit["currency_code"],
+                    "currency_code": hit.get("currency_code"),
                     "direction": hit["direction"],
-                    "raw_json": hit["raw_json"],
+                    "raw_json": json.dumps(hit.get("raw_json") or {}, default=str),
                 }
                 if existing:
                     session.execute(
