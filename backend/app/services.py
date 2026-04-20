@@ -349,9 +349,9 @@ async def sync_qbo_bank_transactions(session, entity_code: str, date_from: date,
     for object_name in objects:
         base_query = (
             f"SELECT * FROM {object_name} "
-            f"WHERE Metadata.LastUpdatedTime >= '{query_from}T00:00:00+00:00' "
-            f"AND Metadata.LastUpdatedTime <= '{query_to}T23:59:59+00:00'"
-        )        
+            f"WHERE TxnDate >= '{query_from}' "
+            f"AND TxnDate <= '{query_to}'"
+        )
         
         rows = await qb.query_all(
             realm_id=connection["realm_id"],
