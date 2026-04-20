@@ -439,7 +439,6 @@ async def sync_qbo_bank_transactions(
     query_to = date_to.isoformat()
 
     objects = [
-        "Check",
         "Deposit",
         "Transfer",
     ]
