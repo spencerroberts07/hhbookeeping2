@@ -88,6 +88,26 @@ class QuickBooksClient:
             response.raise_for_status()
             return response.json()
 
+    async def query_all(self, realm_id: str, access_token: str, base_query: str, object_name: str) -> list[dict[str, Any]]:
+        start_position = 1
+        page_size = 1000
+        rows: list[dict[str, Any]] = []
+
+        while True:
+            query = f"{base_query} startposition {start_position} maxresults {page_size}"
+            payload = await self.query(realm_id=realm_id, access_token=access_token, query=query)
+            page_rows = payload.get("QueryResponse", {}).get(object_name, [])
+            if not isinstance(page_rows, list):
+                page_rows = [page_rows]
+            if not page_rows:
+                break
+            rows.extend(page_rows)
+            if len(page_rows) < page_size:
+                break
+            start_position += page_size
+
+        return rows
+
     async def cdc(self, realm_id: str, access_token: str, changed_since_iso: str, entities: list[str]) -> dict[str, Any]:
         url = f"{self.api_base_url}/v3/company/{realm_id}/cdc"
         params = {
@@ -100,6 +120,14 @@ class QuickBooksClient:
             response = await client.get(url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
+
+
+BANK_ACCOUNT_TYPES = {
+    "Bank",
+    "CashOnHand",
+    "CreditCard",
+    "OtherCurrentAsset",
+}
 
 
 def token_expiry_from_seconds(seconds: int | None) -> datetime | None:
@@ -139,3 +167,49 @@ def upsert_connection(session, entity_id: str, realm_id: str, token_payload: dic
             "refresh_expiry": token_expiry_from_seconds(token_payload.get("x_refresh_token_expires_in")),
         },
     )
+
+
+def connection_expired(connection: dict[str, Any]) -> bool:
+    expires_at = connection.get("access_token_expires_at")
+    if not expires_at:
+        return False
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    return expires_at <= datetime.now(timezone.utc) + timedelta(minutes=2)
+
+
+async def ensure_valid_access_token(session, connection: dict[str, Any]) -> dict[str, Any]:
+    if not connection_expired(connection):
+        return connection
+
+    qb = QuickBooksClient()
+    refreshed = await qb.refresh_access_token(connection["refresh_token"])
+    session.execute(
+        text(
+            """
+            UPDATE quickbooks_connections
+            SET access_token = :access_token,
+                refresh_token = :refresh_token,
+                access_token_expires_at = :access_expiry,
+                refresh_token_expires_at = :refresh_expiry
+            WHERE id = :connection_id
+            """
+        ),
+        {
+            "connection_id": connection["id"],
+            "access_token": refreshed["access_token"],
+            "refresh_token": refreshed["refresh_token"],
+            "access_expiry": token_expiry_from_seconds(refreshed.get("expires_in")),
+            "refresh_expiry": token_expiry_from_seconds(refreshed.get("x_refresh_token_expires_in")),
+        },
+    )
+    updated = dict(connection)
+    updated.update(
+        {
+            "access_token": refreshed["access_token"],
+            "refresh_token": refreshed["refresh_token"],
+            "access_token_expires_at": token_expiry_from_seconds(refreshed.get("expires_in")),
+            "refresh_token_expires_at": token_expiry_from_seconds(refreshed.get("x_refresh_token_expires_in")),
+        }
+    )
+    return updated
