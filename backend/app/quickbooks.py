@@ -253,8 +253,7 @@ async def ensure_valid_access_token(session, connection: dict[str, Any]) -> dict
                 access_token_expires_at = :access_expiry,
                 refresh_token_expires_at = :refresh_expiry,
                 disconnected_at = NULL,
-                is_active = TRUE,
-                updated_at = NOW()
+                is_active = TRUE
             WHERE id = :id
             """
         ),
@@ -263,7 +262,9 @@ async def ensure_valid_access_token(session, connection: dict[str, Any]) -> dict
             "access_token": token_payload["access_token"],
             "refresh_token": token_payload.get("refresh_token", refresh_token),
             "access_expiry": token_expiry_from_seconds(token_payload.get("expires_in")),
-            "refresh_expiry": token_expiry_from_seconds(token_payload.get("x_refresh_token_expires_in")),
+            "refresh_expiry": token_expiry_from_seconds(
+                token_payload.get("x_refresh_token_expires_in")
+            ),
         },
     )
 
