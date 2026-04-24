@@ -90,9 +90,6 @@ class QuickBooksClient:
             return response.json()
 
     async def query(self, realm_id: str, access_token: str, query: str) -> dict[str, Any]:
-        """
-        Single QBO query using POST /query.
-        """
         url = f"{self.api_base_url}/v3/company/{realm_id}/query"
         params = {"minorversion": self.minor_version}
         headers = {
@@ -113,12 +110,6 @@ class QuickBooksClient:
         object_name: str,
         page_size: int = 1000,
     ) -> list[dict[str, Any]]:
-        """
-        Paginated QBO query using POST /query.
-
-        Example base_query:
-            SELECT * FROM Check WHERE TxnDate >= '2026-02-01' AND TxnDate <= '2026-02-28'
-        """
         url = f"{self.api_base_url}/v3/company/{realm_id}/query"
         params = {"minorversion": self.minor_version}
         headers = {

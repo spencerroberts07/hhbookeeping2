@@ -1,6 +1,6 @@
 import json
 from datetime import date, datetime, time, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from sqlalchemy import text
@@ -11,6 +11,70 @@ from .quickbooks import (
     ensure_valid_access_token,
     upsert_connection,
 )
+
+REVIEW_STATUS_NEW = "new"
+REVIEW_STATUS_NEEDS_REVIEW = "needs_review"
+REVIEW_STATUS_MATCHED = "matched"
+REVIEW_STATUS_IGNORED = "ignored"
+
+VALID_REVIEW_STATUSES = {
+    REVIEW_STATUS_NEW,
+    REVIEW_STATUS_NEEDS_REVIEW,
+    REVIEW_STATUS_MATCHED,
+    REVIEW_STATUS_IGNORED,
+}
+
+VALID_MATCH_TYPES = {
+    "manual_explanation",
+    "hh_remittance",
+    "direct_vendor_payment",
+    "cash_deposit",
+    "card_settlement",
+    "transfer_pair",
+    "other",
+}
+
+
+def normalize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+
+def normalize_actor_email(value: Any) -> str | None:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return None
+    return cleaned.lower()
+
+
+
+def parse_json_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+
+def money_decimal(value: Any) -> Decimal:
+    if value in (None, ""):
+        return Decimal("0.00")
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+
+def money_float(value: Any) -> float:
+    return float(money_decimal(value))
+
 
 
 def get_entity_by_code(session, entity_code: str):
@@ -24,6 +88,7 @@ def get_entity_by_code(session, entity_code: str):
         ),
         {"entity_code": entity_code},
     ).mappings().first()
+
 
 
 def get_active_connection(session, entity_id: str):
@@ -40,6 +105,7 @@ def get_active_connection(session, entity_id: str):
         ),
         {"entity_id": entity_id},
     ).mappings().first()
+
 
 
 def get_or_create_accounting_period(session, entity_id: str, txn_date: date | None):
@@ -232,7 +298,6 @@ async def connect_company(session, entity_code: str, realm_id: str, code: str) -
     qb = QuickBooksClient()
     token_payload = await qb.exchange_code(code)
     upsert_connection(session, entity["id"], realm_id, token_payload)
-
     company_info = await qb.get_company_info(realm_id, token_payload["access_token"])
 
     return {
@@ -241,10 +306,12 @@ async def connect_company(session, entity_code: str, realm_id: str, code: str) -
     }
 
 
+
 def _safe_decimal(value: Any) -> Decimal:
     if value in (None, ""):
         return Decimal("0")
     return Decimal(str(value))
+
 
 
 def _line_account_ref(line: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -263,12 +330,63 @@ def _line_account_ref(line: dict[str, Any]) -> tuple[str | None, str | None]:
     return (value, account_ref.get("name"))
 
 
+
 def _txn_header_bank_ref(record: dict[str, Any]) -> tuple[str | None, str | None]:
     for key in ("AccountRef", "DepositToAccountRef", "CreditCardAccountRef", "ARAccountRef"):
         ref = record.get(key)
         if isinstance(ref, dict) and ref.get("value") is not None:
             return (str(ref.get("value")), ref.get("name"))
     return (None, None)
+
+
+
+def _derive_counterparty_name(record: dict[str, Any]) -> str | None:
+    for ref_key in ("VendorRef", "CustomerRef", "EntityRef"):
+        ref = record.get(ref_key)
+        if isinstance(ref, dict):
+            name = normalize_text(ref.get("name"))
+            if name:
+                return name
+
+    nested_txn = record.get("transaction") if isinstance(record.get("transaction"), dict) else None
+    if nested_txn:
+        return _derive_counterparty_name(nested_txn)
+
+    return None
+
+
+
+def _looks_unhelpful_description(value: Any) -> bool:
+    cleaned = normalize_text(value)
+    if not cleaned:
+        return True
+    if cleaned.isdigit():
+        return True
+    if len(cleaned) <= 2:
+        return True
+    return False
+
+
+
+def _derive_display_description(row: dict[str, Any]) -> str:
+    description = normalize_text(row.get("description"))
+    raw_json = parse_json_value(row.get("raw_json"))
+    counterparty = _derive_counterparty_name(raw_json)
+    reference = normalize_text(row.get("reference_number"))
+    source_type = normalize_text(row.get("source_transaction_type")) or "Transaction"
+
+    if description and not _looks_unhelpful_description(description):
+        return description
+    if counterparty and reference:
+        return f"{counterparty} / {reference}"
+    if counterparty:
+        return counterparty
+    if reference:
+        return f"{source_type} {reference}"
+    if description:
+        return description
+    return source_type
+
 
 
 def _extract_bank_hit(
@@ -296,14 +414,7 @@ def _extract_bank_hit(
     ) or "CAD"
 
     total_amt = _safe_decimal(record.get("TotalAmt") or record.get("HomeTotalAmt") or 0)
-
-    counterparty = None
-    for ref_key in ("VendorRef", "CustomerRef", "EntityRef"):
-        ref = record.get(ref_key)
-        if isinstance(ref, dict):
-            counterparty = ref.get("name")
-            if counterparty:
-                break
+    counterparty = _derive_counterparty_name(record)
 
     hits: list[dict[str, Any]] = []
 
@@ -321,7 +432,7 @@ def _extract_bank_hit(
         else:
             direction = "unknown"
 
-        description = private_note or doc_number or counterparty or txn_type
+        description = private_note or counterparty or doc_number or txn_type
 
         hits.append(
             {
@@ -360,7 +471,7 @@ def _extract_bank_hit(
 
         signed_amount = amount if posting_type == "Debit" else -amount
         direction = "inflow" if signed_amount > 0 else "outflow"
-        description = line.get("Description") or private_note or doc_number or txn_type
+        description = line.get("Description") or private_note or counterparty or doc_number or txn_type
 
         hits.append(
             {
@@ -638,6 +749,7 @@ async def sync_qbo_bank_transactions(
     }
 
 
+
 def list_bank_transactions(
     session,
     entity_code: str,
@@ -681,3 +793,684 @@ def list_bank_transactions(
         "count": len(rows),
         "transactions": [dict(row) for row in rows],
     }
+
+
+
+def _get_bank_transaction_row(session, transaction_id: str):
+    return session.execute(
+        text(
+            """
+            SELECT bt.*,
+                   e.entity_code,
+                   e.entity_name
+            FROM bank_transactions bt
+            JOIN entities e ON e.id = bt.entity_id
+            WHERE bt.id = :transaction_id
+            LIMIT 1
+            """
+        ),
+        {"transaction_id": transaction_id},
+    ).mappings().first()
+
+
+
+def _serialize_match_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    if payload.get("matched_amount") is not None:
+        payload["matched_amount"] = money_float(payload.get("matched_amount"))
+    if payload.get("created_at"):
+        payload["created_at"] = payload["created_at"].isoformat()
+    if payload.get("released_at"):
+        payload["released_at"] = payload["released_at"].isoformat()
+    payload["raw_json"] = parse_json_value(payload.get("raw_json"))
+    return payload
+
+
+
+def _serialize_review_event_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    if payload.get("created_at"):
+        payload["created_at"] = payload["created_at"].isoformat()
+    payload["payload_json"] = parse_json_value(payload.get("payload_json"))
+    return payload
+
+
+
+def _serialize_bank_transaction_row(row: dict[str, Any], *, include_raw_json: bool) -> dict[str, Any]:
+    payload = dict(row)
+    raw_json = parse_json_value(payload.get("raw_json"))
+    payload["display_description"] = _derive_display_description(payload)
+    payload["counterparty_name_guess"] = _derive_counterparty_name(raw_json)
+    payload["is_matched"] = bool(payload.get("active_match_id"))
+
+    for key in ("amount", "active_matched_amount"):
+        if payload.get(key) is not None:
+            payload[key] = money_float(payload.get(key))
+
+    for key in (
+        "transaction_date",
+        "posted_date",
+        "reviewed_at",
+        "imported_at",
+        "last_seen_at",
+    ):
+        if payload.get(key):
+            value = payload.get(key)
+            payload[key] = value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+    if include_raw_json:
+        payload["raw_json"] = raw_json
+    else:
+        payload.pop("raw_json", None)
+
+    return payload
+
+
+
+def _insert_bank_review_event(
+    session,
+    *,
+    bank_transaction_id: str,
+    entity_id: str,
+    action: str,
+    actor_email: str,
+    from_review_status: str | None,
+    to_review_status: str | None,
+    note: str | None,
+    payload_json: dict[str, Any] | None = None,
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO bank_transaction_review_events (
+                bank_transaction_id,
+                entity_id,
+                action,
+                actor_email,
+                from_review_status,
+                to_review_status,
+                note,
+                payload_json
+            ) VALUES (
+                :bank_transaction_id,
+                :entity_id,
+                :action,
+                :actor_email,
+                :from_review_status,
+                :to_review_status,
+                :note,
+                CAST(:payload_json AS jsonb)
+            )
+            """
+        ),
+        {
+            "bank_transaction_id": bank_transaction_id,
+            "entity_id": entity_id,
+            "action": action,
+            "actor_email": actor_email,
+            "from_review_status": from_review_status,
+            "to_review_status": to_review_status,
+            "note": note,
+            "payload_json": json.dumps(payload_json or {}, default=str),
+        },
+    )
+
+
+
+def list_bank_review_summary(session, entity_code: str, date_from: date, date_to: date) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    totals = session.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(bt.amount), 0) AS total_amount,
+                COALESCE(SUM(CASE WHEN bt.review_status = 'new' THEN 1 ELSE 0 END), 0) AS new_count,
+                COALESCE(SUM(CASE WHEN bt.review_status = 'needs_review' THEN 1 ELSE 0 END), 0) AS needs_review_count,
+                COALESCE(SUM(CASE WHEN bt.review_status = 'matched' THEN 1 ELSE 0 END), 0) AS matched_status_count,
+                COALESCE(SUM(CASE WHEN bt.review_status = 'ignored' THEN 1 ELSE 0 END), 0) AS ignored_count,
+                COALESCE(SUM(CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END), 0) AS active_match_count,
+                COALESCE(SUM(CASE WHEN m.id IS NULL THEN 1 ELSE 0 END), 0) AS unmatched_count
+            FROM bank_transactions bt
+            LEFT JOIN bank_transaction_matches m
+              ON m.bank_transaction_id = bt.id
+             AND m.active = TRUE
+            WHERE bt.entity_id = :entity_id
+              AND bt.transaction_date BETWEEN :date_from AND :date_to
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+    ).mappings().first()
+
+    by_status = session.execute(
+        text(
+            """
+            SELECT review_status, COUNT(*) AS row_count, COALESCE(SUM(amount), 0) AS total_amount
+            FROM bank_transactions
+            WHERE entity_id = :entity_id
+              AND transaction_date BETWEEN :date_from AND :date_to
+            GROUP BY review_status
+            ORDER BY review_status
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+    ).mappings().all()
+
+    by_account = session.execute(
+        text(
+            """
+            SELECT
+                bt.source_account_name,
+                COUNT(*) AS row_count,
+                COALESCE(SUM(bt.amount), 0) AS total_amount,
+                COALESCE(SUM(CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END), 0) AS matched_row_count
+            FROM bank_transactions bt
+            LEFT JOIN bank_transaction_matches m
+              ON m.bank_transaction_id = bt.id
+             AND m.active = TRUE
+            WHERE bt.entity_id = :entity_id
+              AND bt.transaction_date BETWEEN :date_from AND :date_to
+            GROUP BY bt.source_account_name
+            ORDER BY bt.source_account_name
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+    ).mappings().all()
+
+    by_match_type = session.execute(
+        text(
+            """
+            SELECT m.match_type, COUNT(*) AS row_count, COALESCE(SUM(m.matched_amount), 0) AS matched_amount
+            FROM bank_transaction_matches m
+            JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+            WHERE bt.entity_id = :entity_id
+              AND bt.transaction_date BETWEEN :date_from AND :date_to
+              AND m.active = TRUE
+            GROUP BY m.match_type
+            ORDER BY m.match_type
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+    ).mappings().all()
+
+    totals_payload = dict(totals or {})
+    for key in (
+        "total_amount",
+    ):
+        if totals_payload.get(key) is not None:
+            totals_payload[key] = money_float(totals_payload.get(key))
+
+    return {
+        "entity_code": entity_code,
+        "entity_name": entity.get("entity_name"),
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "totals": totals_payload,
+        "summary_by_status": [
+            {
+                **dict(row),
+                "total_amount": money_float(row.get("total_amount")),
+            }
+            for row in by_status
+        ],
+        "summary_by_account": [
+            {
+                **dict(row),
+                "total_amount": money_float(row.get("total_amount")),
+            }
+            for row in by_account
+        ],
+        "summary_by_match_type": [
+            {
+                **dict(row),
+                "matched_amount": money_float(row.get("matched_amount")),
+            }
+            for row in by_match_type
+        ],
+    }
+
+
+
+def list_bank_review_transactions(
+    session,
+    entity_code: str,
+    date_from: date,
+    date_to: date,
+    review_status: str | None = None,
+    match_state: str | None = None,
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    if review_status and review_status not in VALID_REVIEW_STATUSES:
+        raise ValueError(f"Unsupported review_status: {review_status}")
+
+    if match_state and match_state not in {"matched", "unmatched"}:
+        raise ValueError("match_state must be 'matched' or 'unmatched'")
+
+    sql = """
+        SELECT
+            bt.id,
+            bt.entity_id,
+            bt.source_system,
+            bt.source_account_name,
+            bt.source_account_code,
+            bt.source_transaction_id,
+            bt.source_transaction_type,
+            bt.transaction_date,
+            bt.posted_date,
+            bt.description,
+            bt.reference_number,
+            bt.amount,
+            bt.currency_code,
+            bt.direction,
+            bt.review_status,
+            bt.review_note,
+            bt.reviewed_by,
+            bt.reviewed_at,
+            bt.imported_at,
+            bt.last_seen_at,
+            bt.raw_json,
+            m.id AS active_match_id,
+            m.match_type AS active_match_type,
+            m.target_table_name AS active_target_table_name,
+            m.target_record_id AS active_target_record_id,
+            m.matched_amount AS active_matched_amount,
+            m.note AS active_match_note
+        FROM bank_transactions bt
+        LEFT JOIN bank_transaction_matches m
+          ON m.bank_transaction_id = bt.id
+         AND m.active = TRUE
+        WHERE bt.entity_id = :entity_id
+          AND bt.transaction_date BETWEEN :date_from AND :date_to
+    """
+
+    params: dict[str, Any] = {
+        "entity_id": entity["id"],
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+    if review_status:
+        sql += " AND bt.review_status = :review_status"
+        params["review_status"] = review_status
+
+    if match_state == "matched":
+        sql += " AND m.id IS NOT NULL"
+    elif match_state == "unmatched":
+        sql += " AND m.id IS NULL"
+
+    sql += " ORDER BY bt.transaction_date DESC, bt.imported_at DESC LIMIT 500"
+
+    rows = session.execute(text(sql), params).mappings().all()
+    serialized = [
+        _serialize_bank_transaction_row(dict(row), include_raw_json=False)
+        for row in rows
+    ]
+
+    return {
+        "entity_code": entity_code,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "review_status": review_status,
+        "match_state": match_state,
+        "count": len(serialized),
+        "transactions": serialized,
+    }
+
+
+
+def get_bank_transaction_detail(session, transaction_id: str) -> dict[str, Any]:
+    row = _get_bank_transaction_row(session, transaction_id)
+    if not row:
+        raise ValueError("Bank transaction not found")
+
+    matches = session.execute(
+        text(
+            """
+            SELECT id, bank_transaction_id, entity_id, match_type, target_table_name, target_record_id,
+                   matched_amount, note, active, created_by, created_at, released_by, released_at,
+                   released_note, raw_json
+            FROM bank_transaction_matches
+            WHERE bank_transaction_id = :bank_transaction_id
+            ORDER BY active DESC, created_at DESC
+            """
+        ),
+        {"bank_transaction_id": transaction_id},
+    ).mappings().all()
+
+    history = session.execute(
+        text(
+            """
+            SELECT id, bank_transaction_id, entity_id, action, actor_email,
+                   from_review_status, to_review_status, note, payload_json, created_at
+            FROM bank_transaction_review_events
+            WHERE bank_transaction_id = :bank_transaction_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"bank_transaction_id": transaction_id},
+    ).mappings().all()
+
+    payload = _serialize_bank_transaction_row(dict(row), include_raw_json=True)
+
+    return {
+        "entity_code": row["entity_code"],
+        "entity_name": row["entity_name"],
+        "transaction": payload,
+        "matches": [_serialize_match_row(dict(match)) for match in matches],
+        "history": [_serialize_review_event_row(dict(event)) for event in history],
+    }
+
+
+
+def set_bank_transaction_review_status(
+    session,
+    transaction_id: str,
+    actor_email: str,
+    review_status: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    normalized_status = normalize_text(review_status)
+    if normalized_status not in VALID_REVIEW_STATUSES:
+        raise ValueError(f"Unsupported review_status: {review_status}")
+
+    actor = normalize_actor_email(actor_email)
+    if not actor:
+        raise ValueError("actor_email is required")
+
+    row = _get_bank_transaction_row(session, transaction_id)
+    if not row:
+        raise ValueError("Bank transaction not found")
+
+    active_match = session.execute(
+        text(
+            """
+            SELECT id
+            FROM bank_transaction_matches
+            WHERE bank_transaction_id = :bank_transaction_id
+              AND active = TRUE
+            LIMIT 1
+            """
+        ),
+        {"bank_transaction_id": transaction_id},
+    ).mappings().first()
+
+    if normalized_status == REVIEW_STATUS_MATCHED and not active_match:
+        raise ValueError("Cannot set review_status to matched without an active bank transaction match")
+
+    if normalized_status in {REVIEW_STATUS_NEW, REVIEW_STATUS_NEEDS_REVIEW, REVIEW_STATUS_IGNORED} and active_match:
+        raise ValueError("This transaction has an active match. Unmatch it first before changing review_status away from matched")
+
+    current_status = row.get("review_status") or REVIEW_STATUS_NEW
+    cleaned_note = normalize_text(note)
+
+    session.execute(
+        text(
+            """
+            UPDATE bank_transactions
+            SET review_status = :review_status,
+                review_note = :review_note,
+                reviewed_by = :reviewed_by,
+                reviewed_at = NOW()
+            WHERE id = :bank_transaction_id
+            """
+        ),
+        {
+            "bank_transaction_id": transaction_id,
+            "review_status": normalized_status,
+            "review_note": cleaned_note,
+            "reviewed_by": actor,
+        },
+    )
+
+    _insert_bank_review_event(
+        session,
+        bank_transaction_id=transaction_id,
+        entity_id=str(row["entity_id"]),
+        action="set_review_status",
+        actor_email=actor,
+        from_review_status=current_status,
+        to_review_status=normalized_status,
+        note=cleaned_note,
+        payload_json={"active_match_exists": bool(active_match)},
+    )
+
+    return get_bank_transaction_detail(session, transaction_id)
+
+
+
+def match_bank_transaction(
+    session,
+    transaction_id: str,
+    actor_email: str,
+    match_type: str,
+    note: str | None = None,
+    matched_amount: Any | None = None,
+    target_table_name: str | None = None,
+    target_record_id: str | None = None,
+    raw_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_match_type = normalize_text(match_type)
+    if normalized_match_type not in VALID_MATCH_TYPES:
+        raise ValueError(f"Unsupported match_type: {match_type}")
+
+    actor = normalize_actor_email(actor_email)
+    if not actor:
+        raise ValueError("actor_email is required")
+
+    row = _get_bank_transaction_row(session, transaction_id)
+    if not row:
+        raise ValueError("Bank transaction not found")
+
+    active_match = session.execute(
+        text(
+            """
+            SELECT id
+            FROM bank_transaction_matches
+            WHERE bank_transaction_id = :bank_transaction_id
+              AND active = TRUE
+            LIMIT 1
+            """
+        ),
+        {"bank_transaction_id": transaction_id},
+    ).mappings().first()
+
+    if active_match:
+        raise ValueError("This bank transaction already has an active match. Unmatch it first before creating a new one")
+
+    current_status = row.get("review_status") or REVIEW_STATUS_NEW
+    cleaned_note = normalize_text(note)
+    effective_amount = matched_amount if matched_amount is not None else row.get("amount")
+    effective_amount = money_decimal(effective_amount)
+
+    session.execute(
+        text(
+            """
+            INSERT INTO bank_transaction_matches (
+                bank_transaction_id,
+                entity_id,
+                match_type,
+                target_table_name,
+                target_record_id,
+                matched_amount,
+                note,
+                active,
+                created_by,
+                raw_json
+            ) VALUES (
+                :bank_transaction_id,
+                :entity_id,
+                :match_type,
+                :target_table_name,
+                :target_record_id,
+                :matched_amount,
+                :note,
+                TRUE,
+                :created_by,
+                CAST(:raw_json AS jsonb)
+            )
+            """
+        ),
+        {
+            "bank_transaction_id": transaction_id,
+            "entity_id": row["entity_id"],
+            "match_type": normalized_match_type,
+            "target_table_name": normalize_text(target_table_name),
+            "target_record_id": normalize_text(target_record_id),
+            "matched_amount": effective_amount,
+            "note": cleaned_note,
+            "created_by": actor,
+            "raw_json": json.dumps(raw_json or {}, default=str),
+        },
+    )
+
+    session.execute(
+        text(
+            """
+            UPDATE bank_transactions
+            SET review_status = :review_status,
+                review_note = :review_note,
+                reviewed_by = :reviewed_by,
+                reviewed_at = NOW()
+            WHERE id = :bank_transaction_id
+            """
+        ),
+        {
+            "bank_transaction_id": transaction_id,
+            "review_status": REVIEW_STATUS_MATCHED,
+            "review_note": cleaned_note,
+            "reviewed_by": actor,
+        },
+    )
+
+    _insert_bank_review_event(
+        session,
+        bank_transaction_id=transaction_id,
+        entity_id=str(row["entity_id"]),
+        action="match",
+        actor_email=actor,
+        from_review_status=current_status,
+        to_review_status=REVIEW_STATUS_MATCHED,
+        note=cleaned_note,
+        payload_json={
+            "match_type": normalized_match_type,
+            "target_table_name": normalize_text(target_table_name),
+            "target_record_id": normalize_text(target_record_id),
+            "matched_amount": str(effective_amount),
+        },
+    )
+
+    return get_bank_transaction_detail(session, transaction_id)
+
+
+
+def unmatch_bank_transaction(
+    session,
+    transaction_id: str,
+    actor_email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    actor = normalize_actor_email(actor_email)
+    if not actor:
+        raise ValueError("actor_email is required")
+
+    row = _get_bank_transaction_row(session, transaction_id)
+    if not row:
+        raise ValueError("Bank transaction not found")
+
+    active_match = session.execute(
+        text(
+            """
+            SELECT id, match_type, target_table_name, target_record_id, matched_amount
+            FROM bank_transaction_matches
+            WHERE bank_transaction_id = :bank_transaction_id
+              AND active = TRUE
+            LIMIT 1
+            """
+        ),
+        {"bank_transaction_id": transaction_id},
+    ).mappings().first()
+
+    if not active_match:
+        raise ValueError("This bank transaction does not have an active match")
+
+    current_status = row.get("review_status") or REVIEW_STATUS_NEW
+    cleaned_note = normalize_text(note)
+
+    session.execute(
+        text(
+            """
+            UPDATE bank_transaction_matches
+            SET active = FALSE,
+                released_by = :released_by,
+                released_at = NOW(),
+                released_note = :released_note
+            WHERE id = :match_id
+            """
+        ),
+        {
+            "match_id": active_match["id"],
+            "released_by": actor,
+            "released_note": cleaned_note,
+        },
+    )
+
+    session.execute(
+        text(
+            """
+            UPDATE bank_transactions
+            SET review_status = :review_status,
+                review_note = :review_note,
+                reviewed_by = :reviewed_by,
+                reviewed_at = NOW()
+            WHERE id = :bank_transaction_id
+            """
+        ),
+        {
+            "bank_transaction_id": transaction_id,
+            "review_status": REVIEW_STATUS_NEEDS_REVIEW,
+            "review_note": cleaned_note,
+            "reviewed_by": actor,
+        },
+    )
+
+    _insert_bank_review_event(
+        session,
+        bank_transaction_id=transaction_id,
+        entity_id=str(row["entity_id"]),
+        action="unmatch",
+        actor_email=actor,
+        from_review_status=current_status,
+        to_review_status=REVIEW_STATUS_NEEDS_REVIEW,
+        note=cleaned_note,
+        payload_json={
+            "match_id": str(active_match["id"]),
+            "match_type": active_match.get("match_type"),
+            "target_table_name": active_match.get("target_table_name"),
+            "target_record_id": active_match.get("target_record_id"),
+            "matched_amount": str(active_match.get("matched_amount")),
+        },
+    )
+
+    return get_bank_transaction_detail(session, transaction_id)
