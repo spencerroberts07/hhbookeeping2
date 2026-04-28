@@ -1346,7 +1346,7 @@ def _get_hh_ap_remittance_row(session, remittance_uuid: UUID):
                 FROM bank_transaction_matches m
                 JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
                 WHERE m.active = TRUE
-                  AND m.target_table = :target_table
+                  AND m.target_table_name = :target_table
                   AND m.target_record_id = :remittance_id_text
                 LIMIT 1
             )
@@ -1660,7 +1660,7 @@ def list_hh_ap_remittances_for_bank_matching(
                 FROM bank_transaction_matches m
                 JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
                 WHERE m.active = TRUE
-                  AND m.target_table = :target_table
+                  AND m.target_table_name = :target_table
             )
             SELECT
                 r.id,
