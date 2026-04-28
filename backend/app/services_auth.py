@@ -57,10 +57,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
 from sqlalchemy import text
 
 from .config import settings
@@ -102,21 +102,31 @@ EVENT_ROLE_REVOKED = "role_revoked"
 # --------------------------------------------------------------------------
 # Password hashing
 # --------------------------------------------------------------------------
-
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+#
+# We call bcrypt directly rather than going through passlib. passlib 1.7.4
+# probes bcrypt.__about__.__version__ at import time, which was removed in
+# bcrypt 4.1+, and the resulting AttributeError surfaces as
+# "trapped error reading bcrypt version" plus a 500 on /api/auth/register
+# under Python 3.13. Direct bcrypt avoids the whole probe.
 
 
 def hash_password(plain_password: str) -> str:
     if not plain_password or len(plain_password) < 8:
         raise ValueError("password must be at least 8 characters long")
-    return _pwd_context.hash(plain_password)
+    return bcrypt.hashpw(
+        plain_password.encode("utf-8"),
+        bcrypt.gensalt(rounds=12),
+    ).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed: str) -> bool:
     if not plain_password or not hashed:
         return False
     try:
-        return _pwd_context.verify(plain_password, hashed)
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed.encode("utf-8"),
+        )
     except Exception:
         return False
 

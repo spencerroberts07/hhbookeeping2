@@ -9,7 +9,7 @@ psycopg[binary]==3.2.3
 python-multipart==0.0.12
 PyJWT[crypto]==2.10.1
 cryptography==44.0.1
-passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
 email-validator==2.2.0
 pypdf==5.9.0
 PyMuPDF==1.27.2.2
