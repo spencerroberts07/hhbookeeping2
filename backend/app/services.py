@@ -887,11 +887,11 @@ def get_bank_transaction_detail(session, entity_code: str, transaction_id: str) 
             """
             SELECT id,
                    match_type,
-                   target_table,
+                   target_table_name,
                    target_record_id,
                    target_label,
                    matched_amount,
-                   match_status,
+                   active,
                    note,
                    payload_json,
                    created_by,
@@ -1017,7 +1017,7 @@ def create_bank_transaction_match(
     target_table: str | None,
     target_record_id: str | None,
     target_label: str,
-    matched_amount: Decimal | None,
+    amount_matched: Decimal | None,
     actor_email: str,
     note: str | None = None,
     payload_json: dict[str, Any] | None = None,
@@ -1032,10 +1032,10 @@ def create_bank_transaction_match(
     transaction_uuid = _parse_uuid(transaction_id, "transaction_id")
     transaction_amount = abs(Decimal(str(transaction["amount"] or 0)))
 
-    amount_to_match = matched_amount if matched_amount is not None else transaction_amount
+    amount_to_match = amount_matched if amount_matched is not None else transaction_amount
     amount_to_match = abs(Decimal(str(amount_to_match)))
     if amount_to_match <= 0:
-        raise ValueError("matched_amount must be greater than zero")
+        raise ValueError("amount_matched must be greater than zero")
 
     duplicate = session.execute(
         text(
@@ -1045,7 +1045,7 @@ def create_bank_transaction_match(
             WHERE bank_transaction_id = :bank_transaction_id
               AND active = TRUE
               AND COALESCE(match_type, '') = COALESCE(:match_type, '')
-              AND COALESCE(target_table, '') = COALESCE(:target_table, '')
+              AND COALESCE(target_table_name, '') = COALESCE(:target_table, '')
               AND COALESCE(target_record_id, '') = COALESCE(:target_record_id, '')
               AND COALESCE(target_label, '') = COALESCE(:target_label, '')
             LIMIT 1
@@ -1069,11 +1069,11 @@ def create_bank_transaction_match(
                 entity_id,
                 bank_transaction_id,
                 match_type,
-                target_table,
+                target_table_name,
                 target_record_id,
                 target_label,
                 matched_amount,
-                match_status,
+                active,
                 note,
                 payload_json,
                 created_by
@@ -1085,8 +1085,8 @@ def create_bank_transaction_match(
                 :target_table,
                 :target_record_id,
                 :target_label,
-                :matched_amount,
-                'active',
+                :amount_matched,
+                TRUE,
                 :note,
                 CAST(:payload_json AS jsonb),
                 :created_by
@@ -1100,7 +1100,7 @@ def create_bank_transaction_match(
             "target_table": target_table,
             "target_record_id": target_record_id,
             "target_label": target_label,
-            "matched_amount": amount_to_match,
+            "amount_matched": amount_to_match,
             "note": note,
             "payload_json": json.dumps(payload_json or {}, default=str),
             "created_by": actor_email,
@@ -1192,7 +1192,7 @@ def release_bank_transaction_match(
     match_row = session.execute(
         text(
             """
-            SELECT id, bank_transaction_id, match_status, match_type, target_table, target_record_id, target_label, matched_amount
+            SELECT id, bank_transaction_id, active, match_type, target_table_name, target_record_id, target_label, matched_amount
             FROM bank_transaction_matches
             WHERE id = :match_id
             """
@@ -1204,14 +1204,14 @@ def release_bank_transaction_match(
         raise ValueError("Bank transaction match not found")
     if match_row["bank_transaction_id"] != transaction_uuid:
         raise ValueError("That match does not belong to the supplied bank transaction")
-    if match_row["match_status"] != "active":
+    if not match_row["active"]:
         raise ValueError("That match is already released")
 
     session.execute(
         text(
             """
             UPDATE bank_transaction_matches
-            SET match_status = 'released',
+            SET active = FALSE,
                 note = COALESCE(:note, note),
                 released_by = :released_by,
                 released_at = NOW()
@@ -1282,7 +1282,7 @@ def release_bank_transaction_match(
                 {
                     "released_match_id": str(match_uuid),
                     "match_type": match_row["match_type"],
-                    "target_table": match_row["target_table"],
+                    "target_table": match_row["target_table_name"],
                     "target_record_id": match_row["target_record_id"],
                     "target_label": match_row["target_label"],
                     "matched_amount": str(match_row["matched_amount"]),
@@ -1366,7 +1366,7 @@ def _get_hh_ap_remittance_row(session, remittance_uuid: UUID):
                 CASE WHEN abm.match_id IS NULL THEN 'unmatched' ELSE 'matched' END AS bank_match_status,
                 abm.match_id,
                 abm.bank_transaction_id,
-                abm.matched_amount AS bank_matched_amount,
+                abm.matched_amount AS bank_amount_matched,
                 abm.matched_at AS bank_matched_at,
                 abm.matched_by AS bank_matched_by,
                 abm.match_note AS bank_match_note,
@@ -1677,7 +1677,7 @@ def list_hh_ap_remittances_for_bank_matching(
                 CASE WHEN abm.match_id IS NULL THEN 'unmatched' ELSE 'matched' END AS bank_match_status,
                 abm.match_id,
                 abm.bank_transaction_id,
-                abm.matched_amount AS bank_matched_amount,
+                abm.matched_amount AS bank_amount_matched,
                 abm.matched_at AS bank_matched_at,
                 abm.matched_by AS bank_matched_by,
                 abm.match_note AS bank_match_note,
@@ -1814,7 +1814,7 @@ def create_hh_ap_remittance_bank_match(
     remittance_id: str,
     bank_transaction_id: str,
     actor_email: str,
-    matched_amount: Decimal | None = None,
+    amount_matched: Decimal | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
     detail = get_hh_ap_remittance_bank_match_detail(session, entity_code, remittance_id)
@@ -1835,7 +1835,7 @@ def create_hh_ap_remittance_bank_match(
 
     remittance_amount = abs(Decimal(str(remittance.get("total_amount") or 0)))
     bank_amount = abs(Decimal(str(bank_transaction.get("amount") or 0)))
-    amount_to_match = abs(Decimal(str(matched_amount))) if matched_amount is not None else remittance_amount
+    amount_to_match = abs(Decimal(str(amount_matched))) if amount_matched is not None else remittance_amount
 
     match_result = create_bank_transaction_match(
         session=session,
@@ -1845,7 +1845,7 @@ def create_hh_ap_remittance_bank_match(
         target_table=REMITTANCE_BANK_TARGET_TABLE,
         target_record_id=remittance_id,
         target_label=_build_hh_ap_remittance_target_label(remittance),
-        matched_amount=amount_to_match,
+        amount_matched=amount_to_match,
         actor_email=actor_email,
         note=note,
         payload_json={
@@ -1864,7 +1864,7 @@ def create_hh_ap_remittance_bank_match(
             FROM bank_transaction_matches
             WHERE bank_transaction_id = :bank_transaction_id
               AND active = TRUE
-              AND target_table = :target_table
+              AND target_table_name = :target_table
               AND target_record_id = :target_record_id
             ORDER BY created_at DESC
             LIMIT 1
@@ -2002,7 +2002,7 @@ def auto_match_hh_ap_remittances_to_bank(
             remittance_id=str(remittance["id"]),
             bank_transaction_id=selected["bank_transaction_id"],
             actor_email=actor_email,
-            matched_amount=abs(Decimal(str(remittance.get("total_amount") or 0))),
+            amount_matched=abs(Decimal(str(remittance.get("total_amount") or 0))),
             note=match_note,
         )
 
@@ -2043,3 +2043,1781 @@ def auto_match_hh_ap_remittances_to_bank(
         "amount_tolerance": str(amount_tolerance),
         "max_to_apply": max_to_apply,
     }
+
+
+DIRECT_VENDOR_INVOICE_STATUSES = {"open", "needs_review", "approved", "scheduled", "paid", "void"}
+DIRECT_VENDOR_PAYMENT_STATUSES = {"unpaid", "partially_paid", "paid"}
+DIRECT_VENDOR_PRIORITIES = {"low", "normal", "high", "urgent"}
+DIRECT_VENDOR_MATCH_TYPE = "direct_vendor_ap_invoice"
+DIRECT_VENDOR_TARGET_TABLE = "direct_vendor_ap_invoices"
+
+CARD_SETTLEMENT_RECON_STATUSES = {"new", "needs_review", "reconciled", "ignored"}
+CARD_SETTLEMENT_MATCH_TYPE = "card_settlement_batch"
+CARD_SETTLEMENT_TARGET_TABLE = "card_settlement_batches"
+
+
+def _today_utc_date() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _safe_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _normalize_match_state(active_match_count: int | None) -> str:
+    return "matched" if int(active_match_count or 0) > 0 else "unmatched"
+
+
+def _compute_due_state(due_date: date | None, payment_status: str, as_of_date: date | None = None) -> str:
+    if payment_status == "paid":
+        return "paid"
+    if due_date is None:
+        return "no_due_date"
+    as_of = as_of_date or _today_utc_date()
+    if due_date < as_of:
+        return "overdue"
+    if due_date == as_of:
+        return "due_today"
+    if due_date <= as_of + timedelta(days=7):
+        return "due_soon"
+    return "upcoming"
+
+
+def _vendor_name_match_score(vendor_name: str | None, candidate_text: str | None) -> int:
+    vendor = (_safe_text(vendor_name) or "").lower()
+    candidate = (_safe_text(candidate_text) or "").lower()
+    if not vendor or not candidate:
+        return 0
+    if vendor == candidate:
+        return 4
+    if vendor in candidate:
+        return 3
+    vendor_words = [word for word in vendor.replace("&", " ").replace("/", " ").split() if len(word) >= 4]
+    overlaps = sum(1 for word in vendor_words if word in candidate)
+    if overlaps >= 2:
+        return 2
+    if overlaps == 1:
+        return 1
+    return 0
+
+
+def _has_table(session, table_name: str) -> bool:
+    row = session.execute(
+        text("SELECT to_regclass(:table_name) AS table_name"),
+        {"table_name": f"public.{table_name}"},
+    ).mappings().first()
+    return bool(row and row["table_name"])
+
+
+def _build_direct_vendor_target_label(invoice_row: dict[str, Any]) -> str:
+    parts = ["Direct vendor invoice"]
+    vendor_name = _safe_text(invoice_row.get("vendor_name"))
+    invoice_number = _safe_text(invoice_row.get("invoice_number"))
+    if vendor_name:
+        parts.append(vendor_name)
+    if invoice_number:
+        parts.append(invoice_number)
+    return " - ".join(parts)
+
+
+def _insert_direct_vendor_invoice_event(
+    session,
+    entity_id: UUID,
+    invoice_id: UUID,
+    action: str,
+    actor_email: str,
+    from_status: str | None = None,
+    to_status: str | None = None,
+    note: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO direct_vendor_ap_invoice_events (
+                entity_id,
+                invoice_id,
+                action,
+                actor_email,
+                from_status,
+                to_status,
+                note,
+                payload_json
+            )
+            VALUES (
+                :entity_id,
+                :invoice_id,
+                :action,
+                :actor_email,
+                :from_status,
+                :to_status,
+                :note,
+                CAST(:payload_json AS jsonb)
+            )
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "invoice_id": invoice_id,
+            "action": action,
+            "actor_email": actor_email,
+            "from_status": from_status,
+            "to_status": to_status,
+            "note": note,
+            "payload_json": json.dumps(payload_json or {}, default=str),
+        },
+    )
+
+
+def _get_direct_vendor_invoice_matches(session, invoice_uuid: UUID) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                m.id,
+                m.bank_transaction_id,
+                m.match_type,
+                m.target_table_name AS target_table,
+                m.target_record_id,
+                m.target_label,
+                m.matched_amount,
+                m.active,
+                m.note,
+                m.payload_json,
+                m.created_by,
+                m.created_at,
+                m.released_by,
+                m.released_at,
+                bt.transaction_date AS bank_transaction_date,
+                bt.posted_date AS bank_posted_date,
+                bt.amount AS bank_transaction_amount,
+                bt.source_account_name AS bank_source_account_name,
+                bt.source_account_code AS bank_source_account_code,
+                bt.description AS bank_description,
+                bt.normalized_description AS bank_normalized_description,
+                bt.counterparty_name AS bank_counterparty_name,
+                bt.reference_number AS bank_reference_number,
+                bt.review_status AS bank_review_status
+            FROM bank_transaction_matches m
+            LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+            WHERE m.target_table_name = :target_table
+              AND m.target_record_id = :target_record_id
+            ORDER BY m.created_at DESC
+            """
+        ),
+        {
+            "target_table": DIRECT_VENDOR_TARGET_TABLE,
+            "target_record_id": str(invoice_uuid),
+        },
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _get_direct_vendor_invoice_history(session, invoice_uuid: UUID) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                id,
+                invoice_id,
+                action,
+                actor_email,
+                from_status,
+                to_status,
+                note,
+                payload_json,
+                created_at
+            FROM direct_vendor_ap_invoice_events
+            WHERE invoice_id = :invoice_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"invoice_id": invoice_uuid},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _hydrate_direct_vendor_invoice_row(row: dict[str, Any]) -> dict[str, Any]:
+    hydrated = dict(row)
+    total_amount_abs = abs(Decimal(str(row.get("total_amount") or 0)))
+    matched_amount = abs(Decimal(str(row.get("active_matched_amount") or 0)))
+    open_amount = total_amount_abs - matched_amount
+    if open_amount < Decimal("0.00"):
+        open_amount = Decimal("0.00")
+
+    if matched_amount == Decimal("0.00"):
+        derived_payment_status = "unpaid"
+    elif open_amount <= Decimal("0.05"):
+        derived_payment_status = "paid"
+    else:
+        derived_payment_status = "partially_paid"
+
+    due_date_value = row.get("due_date")
+    if isinstance(due_date_value, str):
+        due_date_value = date.fromisoformat(due_date_value)
+
+    hydrated["active_matched_amount"] = matched_amount
+    hydrated["open_amount"] = open_amount
+    hydrated["derived_payment_status"] = derived_payment_status
+    hydrated["match_state"] = _normalize_match_state(row.get("active_match_count"))
+    hydrated["due_state"] = _compute_due_state(due_date_value, derived_payment_status)
+    return hydrated
+
+
+def _get_direct_vendor_invoice_row(session, invoice_uuid: UUID):
+    row = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT
+                    m.target_record_id,
+                    COUNT(*) AS active_match_count,
+                    COALESCE(SUM(m.matched_amount), 0) AS active_matched_amount,
+                    MAX(bt.transaction_date) AS last_payment_date
+                FROM bank_transaction_matches m
+                LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+                WHERE m.active = TRUE
+                  AND m.target_table_name = :target_table
+                GROUP BY m.target_record_id
+            )
+            SELECT
+                i.*,
+                COALESCE(am.active_match_count, 0) AS active_match_count,
+                COALESCE(am.active_matched_amount, 0) AS active_matched_amount,
+                am.last_payment_date
+            FROM direct_vendor_ap_invoices i
+            LEFT JOIN active_matches am ON am.target_record_id = i.id::text
+            WHERE i.id = :invoice_id
+              AND i.active = TRUE
+            """
+        ),
+        {
+            "invoice_id": invoice_uuid,
+            "target_table": DIRECT_VENDOR_TARGET_TABLE,
+        },
+    ).mappings().first()
+    return _hydrate_direct_vendor_invoice_row(row) if row else None
+
+
+def _recalculate_direct_vendor_invoice_payment_fields(session, invoice_uuid: UUID) -> None:
+    invoice_row = _get_direct_vendor_invoice_row(session, invoice_uuid)
+    if not invoice_row:
+        return
+
+    derived_payment_status = invoice_row["derived_payment_status"]
+    current_status = invoice_row.get("status")
+    next_status = current_status
+    if current_status != "void":
+        if derived_payment_status == "paid":
+            next_status = "paid"
+        elif current_status == "paid" and derived_payment_status != "paid":
+            next_status = "needs_review"
+
+    session.execute(
+        text(
+            """
+            UPDATE direct_vendor_ap_invoices
+            SET paid_amount = :paid_amount,
+                open_amount = :open_amount,
+                payment_status = :payment_status,
+                last_payment_date = :last_payment_date,
+                status = :status,
+                updated_at = NOW()
+            WHERE id = :invoice_id
+            """
+        ),
+        {
+            "invoice_id": invoice_uuid,
+            "paid_amount": invoice_row["active_matched_amount"],
+            "open_amount": invoice_row["open_amount"],
+            "payment_status": derived_payment_status,
+            "last_payment_date": invoice_row.get("last_payment_date"),
+            "status": next_status,
+        },
+    )
+
+
+def _suggest_bank_transactions_for_direct_vendor_invoice(
+    session,
+    entity_id: UUID,
+    invoice_row: dict[str, Any],
+    date_window_days: int = 14,
+    amount_tolerance: Decimal = Decimal("0.05"),
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    target_amount = abs(Decimal(str(invoice_row.get("total_amount") or 0)))
+    if target_amount <= Decimal("0.00"):
+        return []
+
+    anchor_date = invoice_row.get("due_date") or invoice_row.get("invoice_date")
+    if isinstance(anchor_date, str):
+        anchor_date = date.fromisoformat(anchor_date)
+    if not anchor_date:
+        return []
+
+    date_start = anchor_date - timedelta(days=max(0, int(date_window_days)))
+    date_end = anchor_date + timedelta(days=max(0, int(date_window_days)))
+    rows = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT bank_transaction_id, COUNT(*) AS active_match_count
+                FROM bank_transaction_matches
+                WHERE active = TRUE
+                GROUP BY bank_transaction_id
+            )
+            SELECT
+                bt.id,
+                bt.transaction_date,
+                bt.posted_date,
+                bt.amount,
+                bt.source_account_name,
+                bt.source_account_code,
+                bt.description,
+                bt.normalized_description,
+                bt.counterparty_name,
+                bt.reference_number,
+                bt.review_status,
+                COALESCE(am.active_match_count, 0) AS active_match_count
+            FROM bank_transactions bt
+            LEFT JOIN active_matches am ON am.bank_transaction_id = bt.id
+            WHERE bt.entity_id = :entity_id
+              AND bt.direction = 'outflow'
+              AND COALESCE(bt.review_status, 'new') <> 'ignored'
+              AND bt.transaction_date BETWEEN :date_start AND :date_end
+            ORDER BY bt.transaction_date, bt.id
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "date_start": date_start,
+            "date_end": date_end,
+        },
+    ).mappings().all()
+
+    vendor_name = invoice_row.get("vendor_name")
+    suggestions: list[dict[str, Any]] = []
+    for row in rows:
+        bank_amount_abs = abs(Decimal(str(row["amount"] or 0)))
+        amount_diff = abs(bank_amount_abs - target_amount)
+        vendor_score = max(
+            _vendor_name_match_score(vendor_name, row.get("counterparty_name")),
+            _vendor_name_match_score(vendor_name, row.get("normalized_description")),
+            _vendor_name_match_score(vendor_name, row.get("description")),
+        )
+        threshold = max(amount_tolerance, target_amount * Decimal("0.15"))
+        if amount_diff > threshold and vendor_score == 0:
+            continue
+
+        transaction_date = row.get("transaction_date")
+        if isinstance(transaction_date, str):
+            transaction_date = date.fromisoformat(transaction_date)
+        date_diff_days = abs((transaction_date - anchor_date).days) if transaction_date else None
+
+        suggestion = dict(row)
+        suggestion["amount_diff"] = amount_diff
+        suggestion["date_diff_days"] = date_diff_days
+        suggestion["vendor_name_match_score"] = vendor_score
+        suggestion["suggestion_score"] = (
+            (100 - min(99, int(amount_diff * 100)))
+            + (vendor_score * 25)
+            + (0 if date_diff_days is None else max(0, 14 - min(date_diff_days, 14)))
+        )
+        suggestions.append(suggestion)
+
+    suggestions.sort(
+        key=lambda row: (
+            -row["suggestion_score"],
+            row["amount_diff"],
+            row["date_diff_days"] if row["date_diff_days"] is not None else 999,
+            row["id"],
+        )
+    )
+    return suggestions[:limit]
+
+
+def list_direct_vendor_ap_invoices(
+    session,
+    entity_code: str,
+    date_from: date,
+    date_to: date,
+    status: str | None = None,
+    payment_status: str | None = None,
+    due_state: str | None = None,
+    match_state: str | None = None,
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    rows = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT
+                    m.target_record_id,
+                    COUNT(*) AS active_match_count,
+                    COALESCE(SUM(m.matched_amount), 0) AS active_matched_amount,
+                    MAX(bt.transaction_date) AS last_payment_date
+                FROM bank_transaction_matches m
+                LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+                WHERE m.active = TRUE
+                  AND m.target_table_name = :target_table
+                GROUP BY m.target_record_id
+            )
+            SELECT
+                i.*,
+                COALESCE(am.active_match_count, 0) AS active_match_count,
+                COALESCE(am.active_matched_amount, 0) AS active_matched_amount,
+                am.last_payment_date
+            FROM direct_vendor_ap_invoices i
+            LEFT JOIN active_matches am ON am.target_record_id = i.id::text
+            WHERE i.entity_id = :entity_id
+              AND i.active = TRUE
+              AND i.invoice_date BETWEEN :date_from AND :date_to
+            ORDER BY COALESCE(i.due_date, i.invoice_date), i.vendor_name, i.invoice_number
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+            "target_table": DIRECT_VENDOR_TARGET_TABLE,
+        },
+    ).mappings().all()
+
+    hydrated_rows = [_hydrate_direct_vendor_invoice_row(dict(row)) for row in rows]
+    filtered_rows: list[dict[str, Any]] = []
+    for row in hydrated_rows:
+        if status and row.get("status") != status:
+            continue
+        if payment_status and row.get("derived_payment_status") != payment_status:
+            continue
+        if due_state and row.get("due_state") != due_state:
+            continue
+        if match_state and row.get("match_state") != match_state:
+            continue
+        filtered_rows.append(row)
+
+    summary = {
+        "total_count": len(filtered_rows),
+        "total_amount": sum(Decimal(str(row.get("total_amount") or 0)) for row in filtered_rows),
+        "unpaid_count": sum(1 for row in filtered_rows if row["derived_payment_status"] == "unpaid"),
+        "partially_paid_count": sum(1 for row in filtered_rows if row["derived_payment_status"] == "partially_paid"),
+        "paid_count": sum(1 for row in filtered_rows if row["derived_payment_status"] == "paid"),
+        "overdue_count": sum(1 for row in filtered_rows if row["due_state"] == "overdue"),
+        "due_today_count": sum(1 for row in filtered_rows if row["due_state"] == "due_today"),
+        "due_soon_count": sum(1 for row in filtered_rows if row["due_state"] == "due_soon"),
+        "matched_count": sum(1 for row in filtered_rows if row["match_state"] == "matched"),
+        "unmatched_count": sum(1 for row in filtered_rows if row["match_state"] == "unmatched"),
+        "open_amount_total": sum(Decimal(str(row.get("open_amount") or 0)) for row in filtered_rows),
+    }
+
+    by_status: dict[str, dict[str, Any]] = {}
+    by_due_state: dict[str, dict[str, Any]] = {}
+    for row in filtered_rows:
+        status_key = row.get("status") or "unknown"
+        by_status.setdefault(status_key, {"status": status_key, "row_count": 0, "total_amount": Decimal("0.00")})
+        by_status[status_key]["row_count"] += 1
+        by_status[status_key]["total_amount"] += Decimal(str(row.get("total_amount") or 0))
+
+        due_key = row.get("due_state") or "unknown"
+        by_due_state.setdefault(due_key, {"due_state": due_key, "row_count": 0, "open_amount": Decimal("0.00")})
+        by_due_state[due_key]["row_count"] += 1
+        by_due_state[due_key]["open_amount"] += Decimal(str(row.get("open_amount") or 0))
+
+    summary["by_status"] = list(by_status.values())
+    summary["by_due_state"] = list(by_due_state.values())
+
+    return {
+        "entity_code": entity_code,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "status": status,
+        "payment_status": payment_status,
+        "due_state": due_state,
+        "match_state": match_state,
+        "count": len(filtered_rows),
+        "summary": summary,
+        "invoices": filtered_rows,
+    }
+
+
+def get_direct_vendor_ap_invoice_detail(
+    session,
+    entity_code: str,
+    invoice_id: str,
+    suggestion_date_window_days: int = 14,
+    amount_tolerance: Decimal = Decimal("0.05"),
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    invoice_uuid = _parse_uuid(invoice_id, "invoice_id")
+    invoice_row = _get_direct_vendor_invoice_row(session, invoice_uuid)
+    if not invoice_row:
+        raise ValueError("Direct vendor invoice not found")
+    if invoice_row["entity_id"] != entity["id"]:
+        raise ValueError("Direct vendor invoice does not belong to that entity")
+
+    matches = _get_direct_vendor_invoice_matches(session, invoice_uuid)
+    history = _get_direct_vendor_invoice_history(session, invoice_uuid)
+    suggestions = _suggest_bank_transactions_for_direct_vendor_invoice(
+        session=session,
+        entity_id=entity["id"],
+        invoice_row=invoice_row,
+        date_window_days=suggestion_date_window_days,
+        amount_tolerance=amount_tolerance,
+        limit=10,
+    )
+
+    return {
+        "entity_code": entity_code,
+        "invoice": invoice_row,
+        "matches": matches,
+        "history": history,
+        "suggestions": suggestions,
+    }
+
+
+def upsert_direct_vendor_ap_invoice(
+    session,
+    entity_code: str,
+    actor_email: str,
+    vendor_name: str,
+    invoice_number: str,
+    invoice_date: date,
+    total_amount: Decimal,
+    due_date: date | None = None,
+    received_date: date | None = None,
+    vendor_code: str | None = None,
+    subtotal_amount: Decimal | None = None,
+    tax_amount: Decimal | None = None,
+    currency_code: str | None = None,
+    priority: str = "normal",
+    status: str = "open",
+    payment_status: str = "unpaid",
+    source_document_name: str | None = None,
+    note: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+    if priority not in DIRECT_VENDOR_PRIORITIES:
+        raise ValueError(f"Invalid priority: {priority}")
+    if status not in DIRECT_VENDOR_INVOICE_STATUSES:
+        raise ValueError(f"Invalid status: {status}")
+    if payment_status not in DIRECT_VENDOR_PAYMENT_STATUSES:
+        raise ValueError(f"Invalid payment_status: {payment_status}")
+
+    vendor_name_clean = _safe_text(vendor_name)
+    invoice_number_clean = _safe_text(invoice_number)
+    if not vendor_name_clean:
+        raise ValueError("vendor_name is required")
+    if not invoice_number_clean:
+        raise ValueError("invoice_number is required")
+
+    accounting_period_id = get_or_create_accounting_period(session, entity["id"], invoice_date)
+    total_amount = Decimal(str(total_amount))
+    subtotal_amount = Decimal(str(subtotal_amount or 0))
+    tax_amount = Decimal(str(tax_amount or 0))
+    open_amount = abs(total_amount)
+
+    existing = session.execute(
+        text(
+            """
+            SELECT id, status
+            FROM direct_vendor_ap_invoices
+            WHERE entity_id = :entity_id
+              AND active = TRUE
+              AND vendor_name = :vendor_name
+              AND invoice_number = :invoice_number
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "vendor_name": vendor_name_clean,
+            "invoice_number": invoice_number_clean,
+        },
+    ).mappings().first()
+
+    if existing:
+        invoice_uuid = existing["id"]
+        previous_status = existing["status"]
+        session.execute(
+            text(
+                """
+                UPDATE direct_vendor_ap_invoices
+                SET accounting_period_id = :accounting_period_id,
+                    vendor_code = :vendor_code,
+                    invoice_date = :invoice_date,
+                    due_date = :due_date,
+                    received_date = :received_date,
+                    currency_code = :currency_code,
+                    subtotal_amount = :subtotal_amount,
+                    tax_amount = :tax_amount,
+                    total_amount = :total_amount,
+                    priority = :priority,
+                    status = :status,
+                    payment_status = :payment_status,
+                    source_document_name = :source_document_name,
+                    note = :note,
+                    raw_json = CAST(:raw_json AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :invoice_id
+                """
+            ),
+            {
+                "invoice_id": invoice_uuid,
+                "accounting_period_id": accounting_period_id,
+                "vendor_code": _safe_text(vendor_code),
+                "invoice_date": invoice_date,
+                "due_date": due_date,
+                "received_date": received_date,
+                "currency_code": _safe_text(currency_code) or "CAD",
+                "subtotal_amount": subtotal_amount,
+                "tax_amount": tax_amount,
+                "total_amount": total_amount,
+                "priority": priority,
+                "status": status,
+                "payment_status": payment_status,
+                "source_document_name": _safe_text(source_document_name),
+                "note": note,
+                "raw_json": json.dumps(payload_json or {}, default=str),
+            },
+        )
+        action = "update"
+    else:
+        invoice_uuid = session.execute(
+            text(
+                """
+                INSERT INTO direct_vendor_ap_invoices (
+                    entity_id,
+                    accounting_period_id,
+                    vendor_name,
+                    vendor_code,
+                    invoice_number,
+                    invoice_date,
+                    due_date,
+                    received_date,
+                    currency_code,
+                    subtotal_amount,
+                    tax_amount,
+                    total_amount,
+                    paid_amount,
+                    open_amount,
+                    status,
+                    payment_status,
+                    priority,
+                    source_document_name,
+                    note,
+                    raw_json,
+                    created_by
+                )
+                VALUES (
+                    :entity_id,
+                    :accounting_period_id,
+                    :vendor_name,
+                    :vendor_code,
+                    :invoice_number,
+                    :invoice_date,
+                    :due_date,
+                    :received_date,
+                    :currency_code,
+                    :subtotal_amount,
+                    :tax_amount,
+                    :total_amount,
+                    0,
+                    :open_amount,
+                    :status,
+                    :payment_status,
+                    :priority,
+                    :source_document_name,
+                    :note,
+                    CAST(:raw_json AS jsonb),
+                    :created_by
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "accounting_period_id": accounting_period_id,
+                "vendor_name": vendor_name_clean,
+                "vendor_code": _safe_text(vendor_code),
+                "invoice_number": invoice_number_clean,
+                "invoice_date": invoice_date,
+                "due_date": due_date,
+                "received_date": received_date,
+                "currency_code": _safe_text(currency_code) or "CAD",
+                "subtotal_amount": subtotal_amount,
+                "tax_amount": tax_amount,
+                "total_amount": total_amount,
+                "open_amount": open_amount,
+                "status": status,
+                "payment_status": payment_status,
+                "priority": priority,
+                "source_document_name": _safe_text(source_document_name),
+                "note": note,
+                "raw_json": json.dumps(payload_json or {}, default=str),
+                "created_by": actor_email,
+            },
+        ).scalar_one()
+        previous_status = None
+        action = "create"
+
+    _recalculate_direct_vendor_invoice_payment_fields(session, invoice_uuid)
+    invoice_row = _get_direct_vendor_invoice_row(session, invoice_uuid)
+    _insert_direct_vendor_invoice_event(
+        session=session,
+        entity_id=entity["id"],
+        invoice_id=invoice_uuid,
+        action=action,
+        actor_email=actor_email,
+        from_status=previous_status,
+        to_status=invoice_row.get("status") if invoice_row else status,
+        note=note,
+        payload_json={
+            "invoice_number": invoice_number_clean,
+            "vendor_name": vendor_name_clean,
+            "total_amount": str(total_amount),
+        },
+    )
+
+    return get_direct_vendor_ap_invoice_detail(session, entity_code, str(invoice_uuid))
+
+
+def set_direct_vendor_ap_invoice_status(
+    session,
+    entity_code: str,
+    invoice_id: str,
+    status: str,
+    actor_email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    if status not in DIRECT_VENDOR_INVOICE_STATUSES:
+        raise ValueError(f"Invalid status: {status}")
+
+    detail = get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+    invoice_row = detail["invoice"]
+    invoice_uuid = _parse_uuid(invoice_id, "invoice_id")
+    previous_status = invoice_row.get("status")
+
+    approved_by = actor_email if status == "approved" else invoice_row.get("approved_by")
+    approved_at = datetime.now(timezone.utc) if status == "approved" else invoice_row.get("approved_at")
+
+    session.execute(
+        text(
+            """
+            UPDATE direct_vendor_ap_invoices
+            SET status = :status,
+                note = COALESCE(:note, note),
+                approved_by = :approved_by,
+                approved_at = :approved_at,
+                updated_at = NOW()
+            WHERE id = :invoice_id
+            """
+        ),
+        {
+            "invoice_id": invoice_uuid,
+            "status": status,
+            "note": note,
+            "approved_by": approved_by,
+            "approved_at": approved_at,
+        },
+    )
+
+    _insert_direct_vendor_invoice_event(
+        session=session,
+        entity_id=invoice_row["entity_id"],
+        invoice_id=invoice_uuid,
+        action="set_status",
+        actor_email=actor_email,
+        from_status=previous_status,
+        to_status=status,
+        note=note,
+        payload_json={},
+    )
+
+    return get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+
+
+def create_direct_vendor_ap_invoice_bank_match(
+    session,
+    entity_code: str,
+    invoice_id: str,
+    bank_transaction_id: str,
+    actor_email: str,
+    amount_matched: Decimal | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    detail = get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+    invoice_row = detail["invoice"]
+    invoice_uuid = _parse_uuid(invoice_id, "invoice_id")
+
+    remaining_amount = Decimal(str(invoice_row.get("open_amount") or 0))
+    amount_to_match = amount_matched if amount_matched is not None else remaining_amount
+    amount_to_match = abs(Decimal(str(amount_to_match)))
+    if amount_to_match <= Decimal("0.00"):
+        raise ValueError("No open amount remains to match")
+
+    create_bank_transaction_match(
+        session=session,
+        entity_code=entity_code,
+        transaction_id=bank_transaction_id,
+        match_type=DIRECT_VENDOR_MATCH_TYPE,
+        target_table=DIRECT_VENDOR_TARGET_TABLE,
+        target_record_id=str(invoice_uuid),
+        target_label=_build_direct_vendor_target_label(invoice_row),
+        amount_matched=amount_to_match,
+        actor_email=actor_email,
+        note=note,
+        payload_json={
+            "vendor_name": invoice_row.get("vendor_name"),
+            "invoice_number": invoice_row.get("invoice_number"),
+        },
+    )
+
+    _recalculate_direct_vendor_invoice_payment_fields(session, invoice_uuid)
+    refreshed = _get_direct_vendor_invoice_row(session, invoice_uuid)
+
+    _insert_direct_vendor_invoice_event(
+        session=session,
+        entity_id=invoice_row["entity_id"],
+        invoice_id=invoice_uuid,
+        action="match",
+        actor_email=actor_email,
+        from_status=invoice_row.get("status"),
+        to_status=refreshed.get("status") if refreshed else invoice_row.get("status"),
+        note=note,
+        payload_json={
+            "bank_transaction_id": bank_transaction_id,
+            "matched_amount": str(amount_to_match),
+        },
+    )
+
+    return get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+
+
+def release_direct_vendor_ap_invoice_bank_match(
+    session,
+    entity_code: str,
+    invoice_id: str,
+    match_id: str,
+    actor_email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    detail = get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+    invoice_row = detail["invoice"]
+    invoice_uuid = _parse_uuid(invoice_id, "invoice_id")
+    match_uuid = _parse_uuid(match_id, "match_id")
+
+    match_row = session.execute(
+        text(
+            """
+            SELECT id, bank_transaction_id, active, matched_amount
+            FROM bank_transaction_matches
+            WHERE id = :match_id
+              AND target_table_name = :target_table
+              AND target_record_id = :target_record_id
+            LIMIT 1
+            """
+        ),
+        {
+            "match_id": match_uuid,
+            "target_table": DIRECT_VENDOR_TARGET_TABLE,
+            "target_record_id": str(invoice_uuid),
+        },
+    ).mappings().first()
+    if not match_row:
+        raise ValueError("Direct vendor invoice match not found")
+
+    release_bank_transaction_match(
+        session=session,
+        entity_code=entity_code,
+        transaction_id=str(match_row["bank_transaction_id"]),
+        match_id=match_id,
+        actor_email=actor_email,
+        note=note,
+    )
+
+    _recalculate_direct_vendor_invoice_payment_fields(session, invoice_uuid)
+    refreshed = _get_direct_vendor_invoice_row(session, invoice_uuid)
+
+    _insert_direct_vendor_invoice_event(
+        session=session,
+        entity_id=invoice_row["entity_id"],
+        invoice_id=invoice_uuid,
+        action="unmatch",
+        actor_email=actor_email,
+        from_status=invoice_row.get("status"),
+        to_status=refreshed.get("status") if refreshed else invoice_row.get("status"),
+        note=note,
+        payload_json={
+            "match_id": match_id,
+            "amount_released": str(match_row.get("matched_amount") or 0),
+        },
+    )
+
+    return get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+
+
+def _cash_balancing_card_totals(session, entity_id: UUID, business_date: date | None) -> dict[str, Any] | None:
+    if business_date is None:
+        return None
+    if not _has_table(session, "cash_balancing_rows"):
+        return None
+
+    row = session.execute(
+        text(
+            """
+            SELECT
+                COALESCE(SUM(debit_amount), 0) AS debit_amount,
+                COALESCE(SUM(credit_amount), 0) AS credit_amount,
+                COALESCE(SUM(COALESCE(debit_amount, 0) + COALESCE(credit_amount, 0)), 0) AS total_card_amount
+            FROM cash_balancing_rows
+            WHERE entity_id = :entity_id
+              AND business_date = :business_date
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "business_date": business_date,
+        },
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _build_card_settlement_target_label(batch_row: dict[str, Any]) -> str:
+    parts = ["Card settlement", _safe_text(batch_row.get("processor_name")) or "processor"]
+    reference = _safe_text(batch_row.get("settlement_reference"))
+    if reference:
+        parts.append(reference)
+    business_date = batch_row.get("business_date")
+    if business_date:
+        parts.append(str(business_date))
+    return " - ".join(parts)
+
+
+def _insert_card_settlement_event(
+    session,
+    entity_id: UUID,
+    batch_id: UUID,
+    action: str,
+    actor_email: str,
+    from_status: str | None = None,
+    to_status: str | None = None,
+    note: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO card_settlement_events (
+                entity_id,
+                batch_id,
+                action,
+                actor_email,
+                from_status,
+                to_status,
+                note,
+                payload_json
+            )
+            VALUES (
+                :entity_id,
+                :batch_id,
+                :action,
+                :actor_email,
+                :from_status,
+                :to_status,
+                :note,
+                CAST(:payload_json AS jsonb)
+            )
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "batch_id": batch_id,
+            "action": action,
+            "actor_email": actor_email,
+            "from_status": from_status,
+            "to_status": to_status,
+            "note": note,
+            "payload_json": json.dumps(payload_json or {}, default=str),
+        },
+    )
+
+
+def _get_card_settlement_matches(session, batch_uuid: UUID) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                m.id,
+                m.bank_transaction_id,
+                m.match_type,
+                m.target_table_name AS target_table,
+                m.target_record_id,
+                m.target_label,
+                m.matched_amount,
+                m.active,
+                m.note,
+                m.payload_json,
+                m.created_by,
+                m.created_at,
+                m.released_by,
+                m.released_at,
+                bt.transaction_date AS bank_transaction_date,
+                bt.posted_date AS bank_posted_date,
+                bt.amount AS bank_transaction_amount,
+                bt.source_account_name AS bank_source_account_name,
+                bt.source_account_code AS bank_source_account_code,
+                bt.description AS bank_description,
+                bt.normalized_description AS bank_normalized_description,
+                bt.counterparty_name AS bank_counterparty_name,
+                bt.reference_number AS bank_reference_number,
+                bt.review_status AS bank_review_status
+            FROM bank_transaction_matches m
+            LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+            WHERE m.target_table_name = :target_table
+              AND m.target_record_id = :target_record_id
+            ORDER BY m.created_at DESC
+            """
+        ),
+        {
+            "target_table": CARD_SETTLEMENT_TARGET_TABLE,
+            "target_record_id": str(batch_uuid),
+        },
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _get_card_settlement_history(session, batch_uuid: UUID) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                id,
+                batch_id,
+                action,
+                actor_email,
+                from_status,
+                to_status,
+                note,
+                payload_json,
+                created_at
+            FROM card_settlement_events
+            WHERE batch_id = :batch_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"batch_id": batch_uuid},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _hydrate_card_settlement_batch_row(session, row: dict[str, Any]) -> dict[str, Any]:
+    hydrated = dict(row)
+    business_date = row.get("business_date")
+    if isinstance(business_date, str):
+        business_date = date.fromisoformat(business_date)
+
+    cash_totals = _cash_balancing_card_totals(session, row["entity_id"], business_date)
+    expected_cash_amount = Decimal(str((cash_totals or {}).get("total_card_amount") or row.get("expected_cash_balancing_amount") or 0))
+    gross_amount = Decimal(str(row.get("gross_sales_amount") or 0))
+    net_amount = abs(Decimal(str(row.get("net_deposit_amount") or 0)))
+    matched_bank_amount = abs(Decimal(str(row.get("active_matched_amount") or 0)))
+    bank_difference = net_amount - matched_bank_amount
+    if bank_difference < Decimal("0.00"):
+        bank_difference = Decimal("0.00")
+    cash_variance = gross_amount - expected_cash_amount if expected_cash_amount != Decimal("0.00") else None
+    bank_match_state = "matched" if bank_difference <= Decimal("0.05") and matched_bank_amount > 0 else ("partially_matched" if matched_bank_amount > 0 else "unmatched")
+    hydrated["expected_cash_balancing_amount"] = expected_cash_amount if cash_totals is not None else row.get("expected_cash_balancing_amount")
+    hydrated["cash_balancing_totals"] = cash_totals
+    hydrated["cash_variance_amount"] = cash_variance
+    hydrated["active_matched_amount"] = matched_bank_amount
+    hydrated["bank_unmatched_amount"] = bank_difference
+    hydrated["bank_match_state"] = bank_match_state
+    return hydrated
+
+
+def _get_card_settlement_batch_row(session, batch_uuid: UUID):
+    row = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT
+                    m.target_record_id,
+                    COUNT(*) AS active_match_count,
+                    COALESCE(SUM(m.matched_amount), 0) AS active_matched_amount,
+                    MAX(bt.transaction_date) AS last_bank_match_date
+                FROM bank_transaction_matches m
+                LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+                WHERE m.active = TRUE
+                  AND m.target_table_name = :target_table
+                GROUP BY m.target_record_id
+            )
+            SELECT
+                b.*,
+                COALESCE(am.active_match_count, 0) AS active_match_count,
+                COALESCE(am.active_matched_amount, 0) AS active_matched_amount,
+                am.last_bank_match_date
+            FROM card_settlement_batches b
+            LEFT JOIN active_matches am ON am.target_record_id = b.id::text
+            WHERE b.id = :batch_id
+              AND b.active = TRUE
+            """
+        ),
+        {
+            "batch_id": batch_uuid,
+            "target_table": CARD_SETTLEMENT_TARGET_TABLE,
+        },
+    ).mappings().first()
+    return _hydrate_card_settlement_batch_row(session, row) if row else None
+
+
+def _recalculate_card_settlement_metrics(session, batch_uuid: UUID) -> None:
+    row = _get_card_settlement_batch_row(session, batch_uuid)
+    if not row:
+        return
+
+    current_status = row.get("reconciliation_status")
+    next_status = current_status
+    cash_variance = row.get("cash_variance_amount")
+    bank_match_state = row.get("bank_match_state")
+
+    if current_status != "ignored":
+        if bank_match_state == "matched" and (cash_variance is None or abs(Decimal(str(cash_variance))) <= Decimal("0.05")):
+            next_status = "reconciled"
+        elif current_status == "reconciled":
+            next_status = "needs_review"
+
+    session.execute(
+        text(
+            """
+            UPDATE card_settlement_batches
+            SET expected_cash_balancing_amount = :expected_cash_balancing_amount,
+                matched_bank_amount = :matched_bank_amount,
+                reconciliation_status = :reconciliation_status,
+                updated_at = NOW()
+            WHERE id = :batch_id
+            """
+        ),
+        {
+            "batch_id": batch_uuid,
+            "expected_cash_balancing_amount": row.get("expected_cash_balancing_amount"),
+            "matched_bank_amount": row.get("active_matched_amount"),
+            "reconciliation_status": next_status,
+        },
+    )
+
+
+def _suggest_bank_transactions_for_card_settlement(
+    session,
+    entity_id: UUID,
+    batch_row: dict[str, Any],
+    date_window_days: int = 7,
+    amount_tolerance: Decimal = Decimal("0.05"),
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    target_amount = abs(Decimal(str(batch_row.get("net_deposit_amount") or 0)))
+    if target_amount <= Decimal("0.00"):
+        return []
+
+    anchor_date = batch_row.get("deposit_date") or batch_row.get("business_date")
+    if isinstance(anchor_date, str):
+        anchor_date = date.fromisoformat(anchor_date)
+    if not anchor_date:
+        return []
+
+    date_start = anchor_date - timedelta(days=max(0, int(date_window_days)))
+    date_end = anchor_date + timedelta(days=max(0, int(date_window_days)))
+
+    rows = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT bank_transaction_id, COUNT(*) AS active_match_count
+                FROM bank_transaction_matches
+                WHERE active = TRUE
+                GROUP BY bank_transaction_id
+            )
+            SELECT
+                bt.id,
+                bt.transaction_date,
+                bt.posted_date,
+                bt.amount,
+                bt.source_account_name,
+                bt.source_account_code,
+                bt.description,
+                bt.normalized_description,
+                bt.counterparty_name,
+                bt.reference_number,
+                bt.review_status,
+                COALESCE(am.active_match_count, 0) AS active_match_count
+            FROM bank_transactions bt
+            LEFT JOIN active_matches am ON am.bank_transaction_id = bt.id
+            WHERE bt.entity_id = :entity_id
+              AND COALESCE(bt.review_status, 'new') <> 'ignored'
+              AND bt.transaction_date BETWEEN :date_start AND :date_end
+            ORDER BY bt.transaction_date, bt.id
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "date_start": date_start,
+            "date_end": date_end,
+        },
+    ).mappings().all()
+
+    processor_name = (_safe_text(batch_row.get("processor_name")) or "").lower()
+    suggestions: list[dict[str, Any]] = []
+    for row in rows:
+        bank_amount_abs = abs(Decimal(str(row.get("amount") or 0)))
+        amount_diff = abs(bank_amount_abs - target_amount)
+        direction = "inflow" if Decimal(str(row.get("amount") or 0)) >= 0 else "outflow"
+        if direction != "inflow":
+            continue
+
+        desc_blob = " ".join(
+            [
+                _safe_text(row.get("counterparty_name")) or "",
+                _safe_text(row.get("normalized_description")) or "",
+                _safe_text(row.get("description")) or "",
+            ]
+        ).lower()
+        processor_match = 1 if processor_name and processor_name in desc_blob else 0
+        threshold = max(amount_tolerance, target_amount * Decimal("0.05"))
+        if amount_diff > threshold and processor_match == 0:
+            continue
+
+        transaction_date = row.get("transaction_date")
+        if isinstance(transaction_date, str):
+            transaction_date = date.fromisoformat(transaction_date)
+        date_diff_days = abs((transaction_date - anchor_date).days) if transaction_date else None
+
+        suggestion = dict(row)
+        suggestion["amount_diff"] = amount_diff
+        suggestion["date_diff_days"] = date_diff_days
+        suggestion["processor_match"] = bool(processor_match)
+        suggestion["suggestion_score"] = (
+            (100 - min(99, int(amount_diff * 100)))
+            + (processor_match * 20)
+            + (0 if date_diff_days is None else max(0, 10 - min(date_diff_days, 10)))
+        )
+        suggestions.append(suggestion)
+
+    suggestions.sort(
+        key=lambda row: (
+            -row["suggestion_score"],
+            row["amount_diff"],
+            row["date_diff_days"] if row["date_diff_days"] is not None else 999,
+            row["id"],
+        )
+    )
+    return suggestions[:limit]
+
+
+def list_card_settlement_batches(
+    session,
+    entity_code: str,
+    date_from: date,
+    date_to: date,
+    reconciliation_status: str | None = None,
+    bank_match_state: str | None = None,
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    rows = session.execute(
+        text(
+            """
+            WITH active_matches AS (
+                SELECT
+                    m.target_record_id,
+                    COUNT(*) AS active_match_count,
+                    COALESCE(SUM(m.matched_amount), 0) AS active_matched_amount,
+                    MAX(bt.transaction_date) AS last_bank_match_date
+                FROM bank_transaction_matches m
+                LEFT JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+                WHERE m.active = TRUE
+                  AND m.target_table_name = :target_table
+                GROUP BY m.target_record_id
+            )
+            SELECT
+                b.*,
+                COALESCE(am.active_match_count, 0) AS active_match_count,
+                COALESCE(am.active_matched_amount, 0) AS active_matched_amount,
+                am.last_bank_match_date
+            FROM card_settlement_batches b
+            LEFT JOIN active_matches am ON am.target_record_id = b.id::text
+            WHERE b.entity_id = :entity_id
+              AND b.active = TRUE
+              AND b.business_date BETWEEN :date_from AND :date_to
+            ORDER BY b.business_date, b.processor_name, b.id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "date_from": date_from,
+            "date_to": date_to,
+            "target_table": CARD_SETTLEMENT_TARGET_TABLE,
+        },
+    ).mappings().all()
+
+    hydrated_rows = [_hydrate_card_settlement_batch_row(session, dict(row)) for row in rows]
+    filtered_rows: list[dict[str, Any]] = []
+    for row in hydrated_rows:
+        if reconciliation_status and row.get("reconciliation_status") != reconciliation_status:
+            continue
+        if bank_match_state and row.get("bank_match_state") != bank_match_state:
+            continue
+        filtered_rows.append(row)
+
+    summary = {
+        "total_count": len(filtered_rows),
+        "gross_sales_amount_total": sum(Decimal(str(row.get("gross_sales_amount") or 0)) for row in filtered_rows),
+        "net_deposit_amount_total": sum(Decimal(str(row.get("net_deposit_amount") or 0)) for row in filtered_rows),
+        "matched_bank_amount_total": sum(Decimal(str(row.get("active_matched_amount") or 0)) for row in filtered_rows),
+        "reconciled_count": sum(1 for row in filtered_rows if row.get("reconciliation_status") == "reconciled"),
+        "needs_review_count": sum(1 for row in filtered_rows if row.get("reconciliation_status") == "needs_review"),
+        "new_count": sum(1 for row in filtered_rows if row.get("reconciliation_status") == "new"),
+        "ignored_count": sum(1 for row in filtered_rows if row.get("reconciliation_status") == "ignored"),
+        "bank_matched_count": sum(1 for row in filtered_rows if row.get("bank_match_state") == "matched"),
+        "bank_partially_matched_count": sum(1 for row in filtered_rows if row.get("bank_match_state") == "partially_matched"),
+        "bank_unmatched_count": sum(1 for row in filtered_rows if row.get("bank_match_state") == "unmatched"),
+    }
+    return {
+        "entity_code": entity_code,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "reconciliation_status": reconciliation_status,
+        "bank_match_state": bank_match_state,
+        "count": len(filtered_rows),
+        "summary": summary,
+        "batches": filtered_rows,
+    }
+
+
+def get_card_settlement_batch_detail(
+    session,
+    entity_code: str,
+    batch_id: str,
+    suggestion_date_window_days: int = 7,
+    amount_tolerance: Decimal = Decimal("0.05"),
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    batch_uuid = _parse_uuid(batch_id, "batch_id")
+    batch_row = _get_card_settlement_batch_row(session, batch_uuid)
+    if not batch_row:
+        raise ValueError("Card settlement batch not found")
+    if batch_row["entity_id"] != entity["id"]:
+        raise ValueError("Card settlement batch does not belong to that entity")
+
+    matches = _get_card_settlement_matches(session, batch_uuid)
+    history = _get_card_settlement_history(session, batch_uuid)
+    suggestions = _suggest_bank_transactions_for_card_settlement(
+        session=session,
+        entity_id=entity["id"],
+        batch_row=batch_row,
+        date_window_days=suggestion_date_window_days,
+        amount_tolerance=amount_tolerance,
+        limit=10,
+    )
+
+    return {
+        "entity_code": entity_code,
+        "batch": batch_row,
+        "matches": matches,
+        "history": history,
+        "suggestions": suggestions,
+    }
+
+
+def upsert_card_settlement_batch(
+    session,
+    entity_code: str,
+    actor_email: str,
+    processor_name: str,
+    business_date: date,
+    net_deposit_amount: Decimal,
+    deposit_date: date | None = None,
+    merchant_account: str | None = None,
+    settlement_reference: str | None = None,
+    currency_code: str | None = None,
+    gross_sales_amount: Decimal | None = None,
+    refunds_amount: Decimal | None = None,
+    chargebacks_amount: Decimal | None = None,
+    fees_amount: Decimal | None = None,
+    tax_on_fees_amount: Decimal | None = None,
+    reconciliation_status: str = "new",
+    source_file_name: str | None = None,
+    note: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+    if reconciliation_status not in CARD_SETTLEMENT_RECON_STATUSES:
+        raise ValueError(f"Invalid reconciliation_status: {reconciliation_status}")
+
+    processor_name_clean = _safe_text(processor_name)
+    if not processor_name_clean:
+        raise ValueError("processor_name is required")
+
+    accounting_period_id = get_or_create_accounting_period(session, entity["id"], deposit_date or business_date)
+    gross_sales_amount = Decimal(str(gross_sales_amount or 0))
+    refunds_amount = Decimal(str(refunds_amount or 0))
+    chargebacks_amount = Decimal(str(chargebacks_amount or 0))
+    fees_amount = Decimal(str(fees_amount or 0))
+    tax_on_fees_amount = Decimal(str(tax_on_fees_amount or 0))
+    net_deposit_amount = Decimal(str(net_deposit_amount))
+    expected_cash = (_cash_balancing_card_totals(session, entity["id"], business_date) or {}).get("total_card_amount")
+
+    existing = session.execute(
+        text(
+            """
+            SELECT id, reconciliation_status
+            FROM card_settlement_batches
+            WHERE entity_id = :entity_id
+              AND active = TRUE
+              AND processor_name = :processor_name
+              AND business_date = :business_date
+              AND settlement_reference IS NOT DISTINCT FROM :settlement_reference
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "processor_name": processor_name_clean,
+            "business_date": business_date,
+            "settlement_reference": _safe_text(settlement_reference),
+        },
+    ).mappings().first()
+
+    if existing:
+        batch_uuid = existing["id"]
+        previous_status = existing["reconciliation_status"]
+        session.execute(
+            text(
+                """
+                UPDATE card_settlement_batches
+                SET accounting_period_id = :accounting_period_id,
+                    deposit_date = :deposit_date,
+                    merchant_account = :merchant_account,
+                    currency_code = :currency_code,
+                    gross_sales_amount = :gross_sales_amount,
+                    refunds_amount = :refunds_amount,
+                    chargebacks_amount = :chargebacks_amount,
+                    fees_amount = :fees_amount,
+                    tax_on_fees_amount = :tax_on_fees_amount,
+                    net_deposit_amount = :net_deposit_amount,
+                    expected_cash_balancing_amount = :expected_cash_balancing_amount,
+                    reconciliation_status = :reconciliation_status,
+                    source_file_name = :source_file_name,
+                    note = :note,
+                    raw_json = CAST(:raw_json AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :batch_id
+                """
+            ),
+            {
+                "batch_id": batch_uuid,
+                "accounting_period_id": accounting_period_id,
+                "deposit_date": deposit_date,
+                "merchant_account": _safe_text(merchant_account),
+                "currency_code": _safe_text(currency_code) or "CAD",
+                "gross_sales_amount": gross_sales_amount,
+                "refunds_amount": refunds_amount,
+                "chargebacks_amount": chargebacks_amount,
+                "fees_amount": fees_amount,
+                "tax_on_fees_amount": tax_on_fees_amount,
+                "net_deposit_amount": net_deposit_amount,
+                "expected_cash_balancing_amount": expected_cash,
+                "reconciliation_status": reconciliation_status,
+                "source_file_name": _safe_text(source_file_name),
+                "note": note,
+                "raw_json": json.dumps(payload_json or {}, default=str),
+            },
+        )
+        action = "update"
+    else:
+        batch_uuid = session.execute(
+            text(
+                """
+                INSERT INTO card_settlement_batches (
+                    entity_id,
+                    accounting_period_id,
+                    processor_name,
+                    merchant_account,
+                    settlement_reference,
+                    business_date,
+                    deposit_date,
+                    currency_code,
+                    gross_sales_amount,
+                    refunds_amount,
+                    chargebacks_amount,
+                    fees_amount,
+                    tax_on_fees_amount,
+                    net_deposit_amount,
+                    expected_cash_balancing_amount,
+                    matched_bank_amount,
+                    reconciliation_status,
+                    source_file_name,
+                    note,
+                    raw_json,
+                    created_by
+                )
+                VALUES (
+                    :entity_id,
+                    :accounting_period_id,
+                    :processor_name,
+                    :merchant_account,
+                    :settlement_reference,
+                    :business_date,
+                    :deposit_date,
+                    :currency_code,
+                    :gross_sales_amount,
+                    :refunds_amount,
+                    :chargebacks_amount,
+                    :fees_amount,
+                    :tax_on_fees_amount,
+                    :net_deposit_amount,
+                    :expected_cash_balancing_amount,
+                    0,
+                    :reconciliation_status,
+                    :source_file_name,
+                    :note,
+                    CAST(:raw_json AS jsonb),
+                    :created_by
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "accounting_period_id": accounting_period_id,
+                "processor_name": processor_name_clean,
+                "merchant_account": _safe_text(merchant_account),
+                "settlement_reference": _safe_text(settlement_reference),
+                "business_date": business_date,
+                "deposit_date": deposit_date,
+                "currency_code": _safe_text(currency_code) or "CAD",
+                "gross_sales_amount": gross_sales_amount,
+                "refunds_amount": refunds_amount,
+                "chargebacks_amount": chargebacks_amount,
+                "fees_amount": fees_amount,
+                "tax_on_fees_amount": tax_on_fees_amount,
+                "net_deposit_amount": net_deposit_amount,
+                "expected_cash_balancing_amount": expected_cash,
+                "reconciliation_status": reconciliation_status,
+                "source_file_name": _safe_text(source_file_name),
+                "note": note,
+                "raw_json": json.dumps(payload_json or {}, default=str),
+                "created_by": actor_email,
+            },
+        ).scalar_one()
+        previous_status = None
+        action = "create"
+
+    _recalculate_card_settlement_metrics(session, batch_uuid)
+    batch_row = _get_card_settlement_batch_row(session, batch_uuid)
+    _insert_card_settlement_event(
+        session=session,
+        entity_id=entity["id"],
+        batch_id=batch_uuid,
+        action=action,
+        actor_email=actor_email,
+        from_status=previous_status,
+        to_status=batch_row.get("reconciliation_status") if batch_row else reconciliation_status,
+        note=note,
+        payload_json={
+            "processor_name": processor_name_clean,
+            "business_date": str(business_date),
+            "net_deposit_amount": str(net_deposit_amount),
+        },
+    )
+
+    return get_card_settlement_batch_detail(session, entity_code, str(batch_uuid))
+
+
+def set_card_settlement_status(
+    session,
+    entity_code: str,
+    batch_id: str,
+    reconciliation_status: str,
+    actor_email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    if reconciliation_status not in CARD_SETTLEMENT_RECON_STATUSES:
+        raise ValueError(f"Invalid reconciliation_status: {reconciliation_status}")
+
+    detail = get_card_settlement_batch_detail(session, entity_code, batch_id)
+    batch_row = detail["batch"]
+    batch_uuid = _parse_uuid(batch_id, "batch_id")
+    previous_status = batch_row.get("reconciliation_status")
+
+    session.execute(
+        text(
+            """
+            UPDATE card_settlement_batches
+            SET reconciliation_status = :reconciliation_status,
+                reviewed_by = :reviewed_by,
+                reviewed_at = NOW(),
+                note = COALESCE(:note, note),
+                updated_at = NOW()
+            WHERE id = :batch_id
+            """
+        ),
+        {
+            "batch_id": batch_uuid,
+            "reconciliation_status": reconciliation_status,
+            "reviewed_by": actor_email,
+            "note": note,
+        },
+    )
+
+    _insert_card_settlement_event(
+        session=session,
+        entity_id=batch_row["entity_id"],
+        batch_id=batch_uuid,
+        action="set_status",
+        actor_email=actor_email,
+        from_status=previous_status,
+        to_status=reconciliation_status,
+        note=note,
+        payload_json={},
+    )
+
+    return get_card_settlement_batch_detail(session, entity_code, batch_id)
+
+
+def create_card_settlement_bank_match(
+    session,
+    entity_code: str,
+    batch_id: str,
+    bank_transaction_id: str,
+    actor_email: str,
+    amount_matched: Decimal | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    detail = get_card_settlement_batch_detail(session, entity_code, batch_id)
+    batch_row = detail["batch"]
+    batch_uuid = _parse_uuid(batch_id, "batch_id")
+
+    remaining_amount = Decimal(str(batch_row.get("bank_unmatched_amount") or 0))
+    amount_to_match = amount_matched if amount_matched is not None else remaining_amount
+    amount_to_match = abs(Decimal(str(amount_to_match)))
+    if amount_to_match <= Decimal("0.00"):
+        raise ValueError("No bank amount remains to match")
+
+    create_bank_transaction_match(
+        session=session,
+        entity_code=entity_code,
+        transaction_id=bank_transaction_id,
+        match_type=CARD_SETTLEMENT_MATCH_TYPE,
+        target_table=CARD_SETTLEMENT_TARGET_TABLE,
+        target_record_id=str(batch_uuid),
+        target_label=_build_card_settlement_target_label(batch_row),
+        amount_matched=amount_to_match,
+        actor_email=actor_email,
+        note=note,
+        payload_json={
+            "processor_name": batch_row.get("processor_name"),
+            "business_date": str(batch_row.get("business_date")),
+            "settlement_reference": batch_row.get("settlement_reference"),
+        },
+    )
+
+    _recalculate_card_settlement_metrics(session, batch_uuid)
+    refreshed = _get_card_settlement_batch_row(session, batch_uuid)
+
+    _insert_card_settlement_event(
+        session=session,
+        entity_id=batch_row["entity_id"],
+        batch_id=batch_uuid,
+        action="match",
+        actor_email=actor_email,
+        from_status=batch_row.get("reconciliation_status"),
+        to_status=refreshed.get("reconciliation_status") if refreshed else batch_row.get("reconciliation_status"),
+        note=note,
+        payload_json={
+            "bank_transaction_id": bank_transaction_id,
+            "matched_amount": str(amount_to_match),
+        },
+    )
+
+    return get_card_settlement_batch_detail(session, entity_code, batch_id)
+
+
+def release_card_settlement_bank_match(
+    session,
+    entity_code: str,
+    batch_id: str,
+    match_id: str,
+    actor_email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    detail = get_card_settlement_batch_detail(session, entity_code, batch_id)
+    batch_row = detail["batch"]
+    batch_uuid = _parse_uuid(batch_id, "batch_id")
+    match_uuid = _parse_uuid(match_id, "match_id")
+
+    match_row = session.execute(
+        text(
+            """
+            SELECT id, bank_transaction_id, active, matched_amount
+            FROM bank_transaction_matches
+            WHERE id = :match_id
+              AND target_table_name = :target_table
+              AND target_record_id = :target_record_id
+            LIMIT 1
+            """
+        ),
+        {
+            "match_id": match_uuid,
+            "target_table": CARD_SETTLEMENT_TARGET_TABLE,
+            "target_record_id": str(batch_uuid),
+        },
+    ).mappings().first()
+    if not match_row:
+        raise ValueError("Card settlement match not found")
+
+    release_bank_transaction_match(
+        session=session,
+        entity_code=entity_code,
+        transaction_id=str(match_row["bank_transaction_id"]),
+        match_id=match_id,
+        actor_email=actor_email,
+        note=note,
+    )
+
+    _recalculate_card_settlement_metrics(session, batch_uuid)
+    refreshed = _get_card_settlement_batch_row(session, batch_uuid)
+
+    _insert_card_settlement_event(
+        session=session,
+        entity_id=batch_row["entity_id"],
+        batch_id=batch_uuid,
+        action="unmatch",
+        actor_email=actor_email,
+        from_status=batch_row.get("reconciliation_status"),
+        to_status=refreshed.get("reconciliation_status") if refreshed else batch_row.get("reconciliation_status"),
+        note=note,
+        payload_json={
+            "match_id": match_id,
+            "amount_released": str(match_row.get("matched_amount") or 0),
+        },
+    )
+
+    return get_card_settlement_batch_detail(session, entity_code, batch_id)

@@ -12,9 +12,11 @@ from .routes.hh_ap import router as hh_ap_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
 from .routes.month_end_workflow import router as month_end_workflow_router
 from .routes.hh_ap_remittance_bank_match import router as hh_ap_remittance_bank_match_router
+from .routes.direct_vendor_ap import router as direct_vendor_ap_router
+from .routes.card_settlement import router as card_settlement_router
 from .routes import hh_ap_overrides
 
-app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.3.0")
+app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.5.0")
 
 app.include_router(auth_router)
 app.include_router(sync_router)
@@ -26,6 +28,8 @@ app.include_router(hh_ap_router)
 app.include_router(month_end_hh_ap_router)
 app.include_router(month_end_workflow_router)
 app.include_router(hh_ap_remittance_bank_match_router)
+app.include_router(direct_vendor_ap_router)
+app.include_router(card_settlement_router)
 app.include_router(hh_ap_overrides.router)
 
 

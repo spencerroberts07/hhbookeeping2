@@ -149,3 +149,145 @@ class HHAPRemittanceBankSummaryResponse(BaseModel):
     date_from: str
     date_to: str
     summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectVendorAPInvoiceUpsertRequest(BaseModel):
+    actor_email: str
+    vendor_name: str
+    invoice_number: str
+    invoice_date: date
+    total_amount: Decimal
+    due_date: date | None = None
+    received_date: date | None = None
+    vendor_code: str | None = None
+    subtotal_amount: Decimal | None = None
+    tax_amount: Decimal | None = None
+    currency_code: str | None = "CAD"
+    priority: str = "normal"
+    status: str = "open"
+    payment_status: str = "unpaid"
+    source_document_name: str | None = None
+    note: str | None = None
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectVendorAPInvoiceStatusRequest(BaseModel):
+    actor_email: str
+    status: str
+    note: str | None = None
+
+
+class DirectVendorAPInvoiceMatchRequest(BaseModel):
+    actor_email: str
+    bank_transaction_id: str
+    amount_matched: Decimal | None = None
+    note: str | None = None
+
+
+class DirectVendorAPInvoiceUnmatchRequest(BaseModel):
+    actor_email: str
+    note: str | None = None
+
+
+class DirectVendorAPSummaryResponse(BaseModel):
+    entity_code: str
+    date_from: str
+    date_to: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectVendorAPListResponse(BaseModel):
+    entity_code: str
+    date_from: str
+    date_to: str
+    status: str | None = None
+    payment_status: str | None = None
+    due_state: str | None = None
+    match_state: str | None = None
+    count: int
+    summary: dict[str, Any] = Field(default_factory=dict)
+    invoices: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DirectVendorAPDetailResponse(BaseModel):
+    entity_code: str
+    invoice: dict[str, Any]
+    matches: list[dict[str, Any]] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    suggestions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DirectVendorAPActionResponse(BaseModel):
+    ok: bool = True
+    invoice_id: str
+    summary: dict[str, Any]
+
+
+class CardSettlementBatchUpsertRequest(BaseModel):
+    actor_email: str
+    processor_name: str
+    business_date: date
+    net_deposit_amount: Decimal
+    deposit_date: date | None = None
+    merchant_account: str | None = None
+    settlement_reference: str | None = None
+    currency_code: str | None = "CAD"
+    gross_sales_amount: Decimal | None = None
+    refunds_amount: Decimal | None = None
+    chargebacks_amount: Decimal | None = None
+    fees_amount: Decimal | None = None
+    tax_on_fees_amount: Decimal | None = None
+    reconciliation_status: str = "new"
+    source_file_name: str | None = None
+    note: str | None = None
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class CardSettlementStatusRequest(BaseModel):
+    actor_email: str
+    reconciliation_status: str
+    note: str | None = None
+
+
+class CardSettlementMatchRequest(BaseModel):
+    actor_email: str
+    bank_transaction_id: str
+    amount_matched: Decimal | None = None
+    note: str | None = None
+
+
+class CardSettlementUnmatchRequest(BaseModel):
+    actor_email: str
+    note: str | None = None
+
+
+class CardSettlementSummaryResponse(BaseModel):
+    entity_code: str
+    date_from: str
+    date_to: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class CardSettlementListResponse(BaseModel):
+    entity_code: str
+    date_from: str
+    date_to: str
+    reconciliation_status: str | None = None
+    bank_match_state: str | None = None
+    count: int
+    summary: dict[str, Any] = Field(default_factory=dict)
+    batches: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CardSettlementDetailResponse(BaseModel):
+    entity_code: str
+    batch: dict[str, Any]
+    matches: list[dict[str, Any]] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    suggestions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CardSettlementActionResponse(BaseModel):
+    ok: bool = True
+    batch_id: str
+    summary: dict[str, Any]
