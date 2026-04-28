@@ -15,6 +15,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
+from ..services_period_close import (
+    PeriodLockedError,
+    is_date_in_locked_period,
+)
 
 router = APIRouter(prefix="/api/hh-ap", tags=["hh-ap"])
 
@@ -2772,6 +2776,34 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
 
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
+
+        # Period lock guard — refuse if any invoice's invoice_date falls in a
+        # closed_locked period. Reopen the period first.
+        for invoice in payload.invoices:
+            if invoice.invoice_date is None:
+                continue
+            is_locked, period = is_date_in_locked_period(
+                session, entity_id=entity["id"], when=invoice.invoice_date
+            )
+            if is_locked and period:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "Cannot upsert HH AP invoice: invoice_date falls "
+                            "in a closed_locked accounting period."
+                        ),
+                        "invoice_number": invoice.invoice_number,
+                        "invoice_date": invoice.invoice_date.isoformat(),
+                        "period_label": period.get("period_label"),
+                        "period_end": (
+                            period["period_end"].isoformat()
+                            if period.get("period_end")
+                            else None
+                        ),
+                    },
+                )
+
         upserted: list[dict[str, Any]] = []
 
         for invoice in payload.invoices:

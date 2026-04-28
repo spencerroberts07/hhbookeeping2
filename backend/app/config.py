@@ -22,4 +22,8 @@ class Settings(BaseSettings):
     google_sheets_spreadsheet_id: str = "replace_me"
     cash_balancing_lookback_days: int = 56
 
+    jwt_secret: str = "dev_jwt_secret_replace_in_production_minimum_32_chars_long"
+    jwt_algorithm: str = "HS256"
+    jwt_expiry_hours: int = 8
+
 settings = Settings()

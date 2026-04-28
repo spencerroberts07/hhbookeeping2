@@ -7,6 +7,11 @@ from typing import Any, Mapping
 from fastapi import HTTPException
 from sqlalchemy import text
 
+from .services_period_close import (
+    PeriodLockedError,
+    is_period_locked,
+)
+
 WORKFLOW_STATUS_DRAFT_EXCEPTION = "draft_exception"
 WORKFLOW_STATUS_DRAFT_READY = "draft_ready"
 WORKFLOW_STATUS_SUBMITTED_FOR_REVIEW = "submitted_for_review"
@@ -397,6 +402,26 @@ def transition_journal_batch_workflow(
     current_status = resolve_workflow_status(batch_row)
     cleaned_note = normalize_text(note)
     summary_json = parse_summary_json(batch_row.get("summary_json"))
+
+    # Period lock guard: even if the batch's own workflow_status would allow
+    # the transition, refuse if the underlying accounting period is locked.
+    # Reopen the period first.
+    accounting_period_id = batch_row.get("accounting_period_id")
+    if accounting_period_id is not None and is_period_locked(
+        session,
+        entity_id=batch_row.get("entity_id"),
+        accounting_period_id=accounting_period_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "The accounting period for this journal batch is closed_locked. "
+                    "Reopen the period before changing the journal workflow."
+                ),
+                "accounting_period_id": str(accounting_period_id),
+            },
+        )
 
     if action == "submit":
         validate_batch_ready_for_submission(batch_row)

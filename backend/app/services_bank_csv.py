@@ -44,6 +44,10 @@ from .services import (
     get_entity_by_code,
     get_or_create_accounting_period,
 )
+from .services_period_close import (
+    PeriodLockedError,
+    is_date_in_locked_period,
+)
 
 
 SOURCE_SYSTEM = "statement_csv"
@@ -673,6 +677,7 @@ def run_bank_csv_import(
     column_map_override: dict[str, Any] | None,
     actor_email: str,
     note: str | None = None,
+    run_auto_match_after: bool = True,
 ) -> dict[str, Any]:
     entity = get_entity_by_code(session, entity_code)
     if not entity:
@@ -703,6 +708,33 @@ def run_bank_csv_import(
 
     earliest = min((r["transaction_date"] for r in valid_rows if r["transaction_date"]), default=None)
     latest = max((r["transaction_date"] for r in valid_rows if r["transaction_date"]), default=None)
+
+    # Period lock guard: refuse the import if any valid row's transaction_date
+    # falls inside a closed_locked period. Period close is a hard wall — the
+    # user must reopen the period before importing into it.
+    locked_periods_seen: dict[str, dict[str, Any]] = {}
+    for row in valid_rows:
+        is_locked, period = is_date_in_locked_period(
+            session, entity_id=entity["id"], when=row["transaction_date"]
+        )
+        if is_locked and period:
+            locked_periods_seen[str(period["id"])] = {
+                "period_label": period.get("period_label"),
+                "period_end": (
+                    period["period_end"].isoformat() if period.get("period_end") else None
+                ),
+                "status": period.get("status"),
+            }
+    if locked_periods_seen:
+        raise PeriodLockedError(
+            next(iter(locked_periods_seen.values())),
+            message=(
+                "Bank CSV import refused: one or more rows fall in a "
+                "closed_locked accounting period. "
+                f"Locked periods affected: {list(locked_periods_seen.values())}. "
+                "Reopen the period(s) before importing."
+            ),
+        )
 
     # Insert the run record first so we can stamp source_import_run_id on rows
     run_row = session.execute(
@@ -888,6 +920,29 @@ def run_bank_csv_import(
         },
     )
 
+    # Optional: run the auto-match runner over the date range of the imported
+    # rows. Imported into a function here (not at module top) to avoid a
+    # circular import: services_auto_match imports things from services.py,
+    # which is unrelated to this module but is a heavier import surface.
+    auto_match_summary: dict[str, Any] | None = None
+    if run_auto_match_after and inserted > 0 and earliest and latest:
+        from .services_auto_match import TRIGGER_CSV_IMPORT, run_auto_match  # noqa: WPS433
+
+        try:
+            auto_match_summary = run_auto_match(
+                session=session,
+                entity_code=entity_code,
+                period_start=earliest,
+                period_end=latest,
+                actor_email=actor_email,
+                triggered_by=TRIGGER_CSV_IMPORT,
+                trigger_source_id=run_id,
+            )
+        except Exception as exc:
+            # Don't fail the CSV import if auto-match has a problem; surface
+            # the error in the response so the caller can investigate.
+            auto_match_summary = {"error": str(exc), "status": "failed"}
+
     return {
         "entity_code": entity_code,
         "import_run_id": str(run_id),
@@ -905,6 +960,7 @@ def run_bank_csv_import(
         "status": final_status,
         "warnings": file_warnings,
         "error_rows_first_20": summary["error_rows_first_20"],
+        "auto_match": auto_match_summary,
     }
 
 

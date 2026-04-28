@@ -29,6 +29,7 @@ from ..services_bank_csv import (
     preview_bank_csv_import,
     run_bank_csv_import,
 )
+from ..services_period_close import PeriodLockedError
 
 
 router = APIRouter(prefix="/api/bank-csv", tags=["bank-csv"])
@@ -130,6 +131,8 @@ async def bank_csv_upload(
             )
     except HTTPException:
         raise
+    except PeriodLockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

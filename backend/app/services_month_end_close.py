@@ -866,6 +866,43 @@ def _section_journal_batches(
 
 
 # ----------------------------------------------------------------------
+# Section: payroll control
+# ----------------------------------------------------------------------
+
+
+def _section_payroll(
+    session,
+    entity_code: str,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Wraps services_payroll.get_payroll_summary() into the standard section
+    shape used by this aggregator. Imported lazily to avoid forcing the
+    payroll module to load when the close control center is read on
+    environments where 013_payroll_control.sql has not been applied yet.
+    """
+    if not _has_table(session, "payroll_runs"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "payroll_runs table not present",
+        }
+    from .services_payroll import get_payroll_summary  # noqa: WPS433
+
+    summary = get_payroll_summary(
+        session,
+        entity_code=entity_code,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    # services_payroll.get_payroll_summary already returns a dict with a
+    # 'status' field that uses the same vocabulary as our other sections,
+    # so we can return it directly with the right key.
+    return summary
+
+
+# ----------------------------------------------------------------------
 # Roll-up
 # ----------------------------------------------------------------------
 
@@ -997,6 +1034,9 @@ def get_month_end_close_status(
         ),
         "journal_batches": _section_journal_batches(
             session, entity["id"], accounting_period_id
+        ),
+        "payroll": _section_payroll(
+            session, entity_code, period_start, period_end_date
         ),
     }
 

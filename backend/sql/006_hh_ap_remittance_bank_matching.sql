@@ -1,3 +1,20 @@
+-- Migration 006: HH AP remittance -> bank match indexes + audit table
+--
+-- Adds:
+--   1. hh_ap_remittance_bank_match_events  - per-remittance audit log
+--   2. supporting indexes on hh_ap_remittances and bank_transactions
+--   3. partial unique indexes on bank_transaction_matches that prevent
+--      double-matching the same remittance or the same bank withdrawal.
+--
+-- IMPORTANT — column naming:
+--   This file originally referenced bank_transaction_matches.target_table
+--   and match_status = 'active'. Those columns/values do NOT exist on
+--   the live DB; the canonical columns are target_table_name and
+--   active = TRUE. The file has been corrected.
+--   See backend/sql/000_baseline_schema_audit.md for history.
+--
+-- Safe to re-run.
+
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 CREATE TABLE IF NOT EXISTS hh_ap_remittance_bank_match_events (
@@ -25,10 +42,12 @@ CREATE INDEX IF NOT EXISTS idx_hh_ap_remittances_entity_withdrawal
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_entity_direction_date_amount
     ON bank_transactions(entity_id, direction, transaction_date, amount);
 
+-- Partial unique index: at most one active match per HH remittance.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bank_transaction_matches_active_hh_ap_remittance_target
-    ON bank_transaction_matches(target_table, target_record_id)
-    WHERE match_status = 'active' AND target_table = 'hh_ap_remittances';
+    ON bank_transaction_matches(target_record_id)
+    WHERE active = TRUE AND target_table_name = 'hh_ap_remittances';
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_bank_transaction_matches_active_hh_ap_remittance_bank_tx
-    ON bank_transaction_matches(bank_transaction_id)
-    WHERE match_status = 'active' AND target_table = 'hh_ap_remittances';
+-- Lookup support index for "find the active HH remittance match for an entity".
+CREATE INDEX IF NOT EXISTS idx_bank_transaction_matches_hh_remittance_lookup
+    ON bank_transaction_matches(entity_id, target_record_id)
+    WHERE active = TRUE AND target_table_name = 'hh_ap_remittances';
