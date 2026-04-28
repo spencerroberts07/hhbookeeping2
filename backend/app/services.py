@@ -698,8 +698,8 @@ def _get_transaction_with_match_summary(session, transaction_id: UUID):
             """
             WITH match_summary AS (
                 SELECT bank_transaction_id,
-                       COUNT(*) FILTER (WHERE match_status = 'active') AS active_match_count,
-                       COALESCE(SUM(amount_matched) FILTER (WHERE match_status = 'active'), 0) AS matched_amount
+                       COUNT(*) FILTER (WHERE active = TRUE) AS active_match_count,
+                       COALESCE(SUM(matched_amount) FILTER (WHERE active = TRUE), 0) AS matched_amount
                 FROM bank_transaction_matches
                 GROUP BY bank_transaction_id
             )
@@ -770,8 +770,8 @@ def list_bank_transactions(
     sql = """
         WITH match_summary AS (
             SELECT bank_transaction_id,
-                   COUNT(*) FILTER (WHERE match_status = 'active') AS active_match_count,
-                   COALESCE(SUM(amount_matched) FILTER (WHERE match_status = 'active'), 0) AS matched_amount
+                   COUNT(*) FILTER (WHERE active = TRUE) AS active_match_count,
+                   COALESCE(SUM(matched_amount) FILTER (WHERE active = TRUE), 0) AS matched_amount
             FROM bank_transaction_matches
             GROUP BY bank_transaction_id
         )
@@ -890,7 +890,7 @@ def get_bank_transaction_detail(session, entity_code: str, transaction_id: str) 
                    target_table,
                    target_record_id,
                    target_label,
-                   amount_matched,
+                   matched_amount,
                    match_status,
                    note,
                    payload_json,
@@ -1017,7 +1017,7 @@ def create_bank_transaction_match(
     target_table: str | None,
     target_record_id: str | None,
     target_label: str,
-    amount_matched: Decimal | None,
+    matched_amount: Decimal | None,
     actor_email: str,
     note: str | None = None,
     payload_json: dict[str, Any] | None = None,
@@ -1032,10 +1032,10 @@ def create_bank_transaction_match(
     transaction_uuid = _parse_uuid(transaction_id, "transaction_id")
     transaction_amount = abs(Decimal(str(transaction["amount"] or 0)))
 
-    amount_to_match = amount_matched if amount_matched is not None else transaction_amount
+    amount_to_match = matched_amount if matched_amount is not None else transaction_amount
     amount_to_match = abs(Decimal(str(amount_to_match)))
     if amount_to_match <= 0:
-        raise ValueError("amount_matched must be greater than zero")
+        raise ValueError("matched_amount must be greater than zero")
 
     duplicate = session.execute(
         text(
@@ -1043,7 +1043,7 @@ def create_bank_transaction_match(
             SELECT id
             FROM bank_transaction_matches
             WHERE bank_transaction_id = :bank_transaction_id
-              AND match_status = 'active'
+              AND active = TRUE
               AND COALESCE(match_type, '') = COALESCE(:match_type, '')
               AND COALESCE(target_table, '') = COALESCE(:target_table, '')
               AND COALESCE(target_record_id, '') = COALESCE(:target_record_id, '')
@@ -1072,7 +1072,7 @@ def create_bank_transaction_match(
                 target_table,
                 target_record_id,
                 target_label,
-                amount_matched,
+                matched_amount,
                 match_status,
                 note,
                 payload_json,
@@ -1085,7 +1085,7 @@ def create_bank_transaction_match(
                 :target_table,
                 :target_record_id,
                 :target_label,
-                :amount_matched,
+                :matched_amount,
                 'active',
                 :note,
                 CAST(:payload_json AS jsonb),
@@ -1100,7 +1100,7 @@ def create_bank_transaction_match(
             "target_table": target_table,
             "target_record_id": target_record_id,
             "target_label": target_label,
-            "amount_matched": amount_to_match,
+            "matched_amount": amount_to_match,
             "note": note,
             "payload_json": json.dumps(payload_json or {}, default=str),
             "created_by": actor_email,
@@ -1166,7 +1166,7 @@ def create_bank_transaction_match(
                     "target_table": target_table,
                     "target_record_id": target_record_id,
                     "target_label": target_label,
-                    "amount_matched": str(amount_to_match),
+                    "matched_amount": str(amount_to_match),
                 },
                 default=str,
             ),
@@ -1192,7 +1192,7 @@ def release_bank_transaction_match(
     match_row = session.execute(
         text(
             """
-            SELECT id, bank_transaction_id, match_status, match_type, target_table, target_record_id, target_label, amount_matched
+            SELECT id, bank_transaction_id, match_status, match_type, target_table, target_record_id, target_label, matched_amount
             FROM bank_transaction_matches
             WHERE id = :match_id
             """
@@ -1285,7 +1285,7 @@ def release_bank_transaction_match(
                     "target_table": match_row["target_table"],
                     "target_record_id": match_row["target_record_id"],
                     "target_label": match_row["target_label"],
-                    "amount_matched": str(match_row["amount_matched"]),
+                    "matched_amount": str(match_row["matched_amount"]),
                 },
                 default=str,
             ),
@@ -1329,7 +1329,7 @@ def _get_hh_ap_remittance_row(session, remittance_uuid: UUID):
                     m.id AS match_id,
                     m.target_record_id,
                     m.bank_transaction_id,
-                    m.amount_matched,
+                    m.matched_amount,
                     m.created_at AS matched_at,
                     m.created_by AS matched_by,
                     m.note AS match_note,
@@ -1345,7 +1345,7 @@ def _get_hh_ap_remittance_row(session, remittance_uuid: UUID):
                     bt.review_status AS bank_review_status
                 FROM bank_transaction_matches m
                 JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
-                WHERE m.match_status = 'active'
+                WHERE m.active = TRUE
                   AND m.target_table = :target_table
                   AND m.target_record_id = :remittance_id_text
                 LIMIT 1
@@ -1366,7 +1366,7 @@ def _get_hh_ap_remittance_row(session, remittance_uuid: UUID):
                 CASE WHEN abm.match_id IS NULL THEN 'unmatched' ELSE 'matched' END AS bank_match_status,
                 abm.match_id,
                 abm.bank_transaction_id,
-                abm.amount_matched AS bank_amount_matched,
+                abm.matched_amount AS bank_matched_amount,
                 abm.matched_at AS bank_matched_at,
                 abm.matched_by AS bank_matched_by,
                 abm.match_note AS bank_match_note,
@@ -1515,7 +1515,7 @@ def _suggest_bank_transactions_for_remittance(
             WITH active_matches AS (
                 SELECT bank_transaction_id, COUNT(*) AS active_match_count
                 FROM bank_transaction_matches
-                WHERE match_status = 'active'
+                WHERE active = TRUE
                 GROUP BY bank_transaction_id
             )
             SELECT
@@ -1646,7 +1646,7 @@ def list_hh_ap_remittances_for_bank_matching(
                     m.id AS match_id,
                     m.target_record_id,
                     m.bank_transaction_id,
-                    m.amount_matched,
+                    m.matched_amount,
                     m.created_at AS matched_at,
                     m.created_by AS matched_by,
                     m.note AS match_note,
@@ -1659,7 +1659,7 @@ def list_hh_ap_remittances_for_bank_matching(
                     bt.review_status AS bank_review_status
                 FROM bank_transaction_matches m
                 JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
-                WHERE m.match_status = 'active'
+                WHERE m.active = TRUE
                   AND m.target_table = :target_table
             )
             SELECT
@@ -1677,7 +1677,7 @@ def list_hh_ap_remittances_for_bank_matching(
                 CASE WHEN abm.match_id IS NULL THEN 'unmatched' ELSE 'matched' END AS bank_match_status,
                 abm.match_id,
                 abm.bank_transaction_id,
-                abm.amount_matched AS bank_amount_matched,
+                abm.matched_amount AS bank_matched_amount,
                 abm.matched_at AS bank_matched_at,
                 abm.matched_by AS bank_matched_by,
                 abm.match_note AS bank_match_note,
@@ -1814,7 +1814,7 @@ def create_hh_ap_remittance_bank_match(
     remittance_id: str,
     bank_transaction_id: str,
     actor_email: str,
-    amount_matched: Decimal | None = None,
+    matched_amount: Decimal | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
     detail = get_hh_ap_remittance_bank_match_detail(session, entity_code, remittance_id)
@@ -1835,7 +1835,7 @@ def create_hh_ap_remittance_bank_match(
 
     remittance_amount = abs(Decimal(str(remittance.get("total_amount") or 0)))
     bank_amount = abs(Decimal(str(bank_transaction.get("amount") or 0)))
-    amount_to_match = abs(Decimal(str(amount_matched))) if amount_matched is not None else remittance_amount
+    amount_to_match = abs(Decimal(str(matched_amount))) if matched_amount is not None else remittance_amount
 
     match_result = create_bank_transaction_match(
         session=session,
@@ -1845,7 +1845,7 @@ def create_hh_ap_remittance_bank_match(
         target_table=REMITTANCE_BANK_TARGET_TABLE,
         target_record_id=remittance_id,
         target_label=_build_hh_ap_remittance_target_label(remittance),
-        amount_matched=amount_to_match,
+        matched_amount=amount_to_match,
         actor_email=actor_email,
         note=note,
         payload_json={
@@ -1863,7 +1863,7 @@ def create_hh_ap_remittance_bank_match(
             SELECT id
             FROM bank_transaction_matches
             WHERE bank_transaction_id = :bank_transaction_id
-              AND match_status = 'active'
+              AND active = TRUE
               AND target_table = :target_table
               AND target_record_id = :target_record_id
             ORDER BY created_at DESC
@@ -2002,7 +2002,7 @@ def auto_match_hh_ap_remittances_to_bank(
             remittance_id=str(remittance["id"]),
             bank_transaction_id=selected["bank_transaction_id"],
             actor_email=actor_email,
-            amount_matched=abs(Decimal(str(remittance.get("total_amount") or 0))),
+            matched_amount=abs(Decimal(str(remittance.get("total_amount") or 0))),
             note=match_note,
         )
 
