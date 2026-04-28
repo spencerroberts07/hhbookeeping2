@@ -1,36 +1,26 @@
-from datetime import date
-from typing import Any
-
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Path, Query
 
 from ..db import db_session
-from ..services import list_bank_transactions, sync_qbo_bank_transactions
+from ..schemas import (
+    BankSyncRequest,
+    BankSyncResponse,
+    BankTransactionActionResponse,
+    BankTransactionDetailResponse,
+    BankTransactionListResponse,
+    BankTransactionMatchRequest,
+    BankTransactionReviewStatusRequest,
+    BankTransactionUnmatchRequest,
+)
+from ..services import (
+    create_bank_transaction_match,
+    get_bank_transaction_detail,
+    list_bank_transactions,
+    release_bank_transaction_match,
+    set_bank_transaction_review_status,
+    sync_qbo_bank_transactions,
+)
 
 router = APIRouter(prefix="/api/qbo-bank-sync", tags=["qbo-bank-sync"])
-
-
-class BankSyncRequest(BaseModel):
-    entity_code: str = Field(default="1877-8", examples=["1877-8"])
-    date_from: date
-    date_to: date
-
-
-class BankSyncResponse(BaseModel):
-    entity_code: str
-    sync_type: str
-    imported_count: int
-    updated_count: int = 0
-    summary: dict[str, Any]
-
-
-class BankTransactionListResponse(BaseModel):
-    entity_code: str
-    date_from: str
-    date_to: str
-    review_status: str | None = None
-    count: int
-    transactions: list[dict[str, Any]]
 
 
 @router.post("/sync", response_model=BankSyncResponse)
@@ -62,8 +52,11 @@ def get_qbo_bank_transactions(
     review_status: str | None = Query(default=None),
 ) -> BankTransactionListResponse:
     try:
+        from datetime import date
+
         parsed_from = date.fromisoformat(date_from)
         parsed_to = date.fromisoformat(date_to)
+
         with db_session() as session:
             result = list_bank_transactions(
                 session=session,
@@ -73,5 +66,106 @@ def get_qbo_bank_transactions(
                 review_status=review_status,
             )
             return BankTransactionListResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/transactions/{transaction_id}", response_model=BankTransactionDetailResponse)
+def get_qbo_bank_transaction_detail(
+    transaction_id: str = Path(...),
+    entity_code: str = Query(...),
+) -> BankTransactionDetailResponse:
+    try:
+        with db_session() as session:
+            result = get_bank_transaction_detail(
+                session=session,
+                entity_code=entity_code,
+                transaction_id=transaction_id,
+            )
+            return BankTransactionDetailResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/transactions/{transaction_id}/review-status",
+    response_model=BankTransactionActionResponse,
+)
+def set_qbo_bank_transaction_review_status(
+    request: BankTransactionReviewStatusRequest,
+    transaction_id: str = Path(...),
+    entity_code: str = Query(...),
+) -> BankTransactionActionResponse:
+    try:
+        with db_session() as session:
+            result = set_bank_transaction_review_status(
+                session=session,
+                entity_code=entity_code,
+                transaction_id=transaction_id,
+                review_status=request.review_status,
+                actor_email=request.actor_email,
+                note=request.note,
+            )
+            return BankTransactionActionResponse(
+                transaction_id=transaction_id,
+                summary=result,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/transactions/{transaction_id}/match", response_model=BankTransactionActionResponse)
+def match_qbo_bank_transaction(
+    request: BankTransactionMatchRequest,
+    transaction_id: str = Path(...),
+    entity_code: str = Query(...),
+) -> BankTransactionActionResponse:
+    try:
+        with db_session() as session:
+            result = create_bank_transaction_match(
+                session=session,
+                entity_code=entity_code,
+                transaction_id=transaction_id,
+                match_type=request.match_type,
+                target_table=request.target_table,
+                target_record_id=request.target_record_id,
+                target_label=request.target_label,
+                amount_matched=request.amount_matched,
+                actor_email=request.actor_email,
+                note=request.note,
+                payload_json=request.payload_json,
+            )
+            return BankTransactionActionResponse(
+                transaction_id=transaction_id,
+                summary=result,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/transactions/{transaction_id}/unmatch/{match_id}",
+    response_model=BankTransactionActionResponse,
+)
+def unmatch_qbo_bank_transaction(
+    request: BankTransactionUnmatchRequest,
+    transaction_id: str = Path(...),
+    match_id: str = Path(...),
+    entity_code: str = Query(...),
+) -> BankTransactionActionResponse:
+    try:
+        with db_session() as session:
+            result = release_bank_transaction_match(
+                session=session,
+                entity_code=entity_code,
+                transaction_id=transaction_id,
+                match_id=match_id,
+                actor_email=request.actor_email,
+                note=request.note,
+            )
+            return BankTransactionActionResponse(
+                transaction_id=transaction_id,
+                summary=result,
+            )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
