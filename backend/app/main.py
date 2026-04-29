@@ -2,13 +2,17 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
 from .config import settings
+from .routes.accruals import router as accruals_router
 from .routes.auth import router as auth_router
 from .routes.auto_match import router as auto_match_router
 from .routes.bank_csv import router as bank_csv_router
+from .routes.bank_pdf import router as bank_pdf_router
 from .routes.card_settlement import router as card_settlement_router
 from .routes.cash_balancing import router as cash_balancing_router
 from .routes.dashboard import router as dashboard_router
+from .routes.depreciation import router as depreciation_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
+from .routes.gl_import import router as gl_import_router
 from .routes.hh_ap import router as hh_ap_router
 from .routes import hh_ap_overrides
 from .routes.hh_ap_remittance_bank_match import router as hh_ap_remittance_bank_match_router
@@ -53,6 +57,13 @@ app.include_router(payroll_router)
 
 # v0.8 module: month-end POS imports + inventory adjustment journal builders.
 app.include_router(pos_import_router)
+
+# v0.9 modules: GL trial-balance comparison, PDF bank parser, fixed-asset
+# depreciation, monthly accruals.
+app.include_router(gl_import_router)
+app.include_router(bank_pdf_router)
+app.include_router(depreciation_router)
+app.include_router(accruals_router)
 
 
 @app.get("/health", response_model=HealthResponse)

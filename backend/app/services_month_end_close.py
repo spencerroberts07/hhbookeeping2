@@ -935,6 +935,78 @@ def _section_pos_reports(
 
 
 # ----------------------------------------------------------------------
+# Sections: GL import / depreciation / accruals (lazy-imported so close
+# control center keeps working when those migrations haven't run yet)
+# ----------------------------------------------------------------------
+
+
+def _section_gl_import_wrapper(
+    session,
+    entity_id: UUID,
+    accounting_period_id: UUID,
+    period_end: date,
+) -> dict[str, Any]:
+    if not _has_table(session, "gl_import_runs"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "gl_import_runs table not present",
+        }
+    from .services_gl_import import section_gl_import  # noqa: WPS433
+
+    return section_gl_import(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        period_end=period_end,
+    )
+
+
+def _section_depreciation_wrapper(
+    session,
+    entity_id: UUID,
+    accounting_period_id: UUID,
+    period_end: date,
+) -> dict[str, Any]:
+    if not _has_table(session, "fixed_assets"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "fixed_assets table not present",
+        }
+    from .services_depreciation import section_depreciation  # noqa: WPS433
+
+    return section_depreciation(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        period_end=period_end,
+    )
+
+
+def _section_accruals_wrapper(
+    session,
+    entity_id: UUID,
+    accounting_period_id: UUID,
+    period_end: date,
+) -> dict[str, Any]:
+    if not _has_table(session, "accrual_templates"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "accrual_templates table not present",
+        }
+    from .services_accruals import section_accruals  # noqa: WPS433
+
+    return section_accruals(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        period_end=period_end,
+    )
+
+
+# ----------------------------------------------------------------------
 # Roll-up
 # ----------------------------------------------------------------------
 
@@ -1072,6 +1144,15 @@ def get_month_end_close_status(
         ),
         "pos_reports": _section_pos_reports(
             session, entity["id"], period_start, period_end_date
+        ),
+        "gl_import": _section_gl_import_wrapper(
+            session, entity["id"], accounting_period_id, period_end_date
+        ),
+        "depreciation": _section_depreciation_wrapper(
+            session, entity["id"], accounting_period_id, period_end_date
+        ),
+        "accruals": _section_accruals_wrapper(
+            session, entity["id"], accounting_period_id, period_end_date
         ),
     }
 

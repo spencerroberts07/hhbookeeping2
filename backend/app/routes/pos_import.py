@@ -6,8 +6,10 @@ Endpoints:
     POST /api/pos-import/pos-financial          (multipart upload)
     POST /api/pos-import/inventory-value        (multipart upload)
     POST /api/pos-import/aged-ar                (multipart upload)
+    POST /api/pos-import/ar-adjustment          (multipart upload)
     POST /api/pos-import/build-store-use-journal
     POST /api/pos-import/build-donation-journal
+    POST /api/pos-import/build-ar-adjustment-journal
     GET  /api/pos-import/runs?entity_code=...&period_start=...&period_end=...
     GET  /api/pos-import/runs/{run_id}?entity_code=...
     GET  /api/pos-import/inventory-value/latest?entity_code=...
@@ -27,6 +29,7 @@ from pydantic import BaseModel, Field
 from ..db import db_session
 from ..services_auth import require_role
 from ..services_pos_import import (
+    build_ar_adjustment_journal,
     build_donation_journal,
     build_store_use_journal,
     extract_text_from_upload,
@@ -35,6 +38,7 @@ from ..services_pos_import import (
     get_latest_pos_financial_snapshot,
     get_pos_import_run_detail,
     import_aged_ar,
+    import_ar_adjustment,
     import_inventory_adjustment,
     import_inventory_value,
     import_pos_financial,
@@ -203,6 +207,29 @@ async def post_import_aged_ar(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/ar-adjustment")
+async def post_import_ar_adjustment(
+    entity_code: str = Form(...),
+    actor_email: str = Form(...),
+    file: UploadFile = File(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    file_text, source = await _read_file_text(file)
+    try:
+        with db_session() as session:
+            result = import_ar_adjustment(
+                session,
+                entity_code=entity_code,
+                file_text=file_text,
+                file_name=file.filename or "ar_adjustment.txt",
+                actor_email=actor_email,
+            )
+            result["extraction_source"] = source
+            return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # --------------------------------------------------------------------------
 # Journal builders
 # --------------------------------------------------------------------------
@@ -246,6 +273,43 @@ def post_build_donation_journal(
             if body.inventory_account_code:
                 kwargs["inventory_account_code"] = body.inventory_account_code
             return build_donation_journal(session, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class BuildArAdjustmentJournalRequest(BaseModel):
+    entity_code: str = Field(..., examples=["1877-8"])
+    import_run_id: str = Field(
+        ..., examples=["a3c7e0d2-9c4f-4d87-9c8b-2f1a8eb1b001"]
+    )
+    actor_email: str = Field(..., examples=["controller@bridlewood.ca"])
+    bad_debt_account_code: str | None = Field(
+        default=None,
+        description="Override for the debit-side bad-debt expense account. Defaults to 6550.",
+    )
+    ar_account_code: str | None = Field(
+        default=None,
+        description="Override for the credit-side AR account. Defaults to 1085.",
+    )
+
+
+@router.post("/build-ar-adjustment-journal")
+def post_build_ar_adjustment_journal(
+    body: BuildArAdjustmentJournalRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            kwargs: dict[str, Any] = {
+                "entity_code": body.entity_code,
+                "import_run_id": body.import_run_id,
+                "actor_email": body.actor_email,
+            }
+            if body.bad_debt_account_code:
+                kwargs["bad_debt_account_code"] = body.bad_debt_account_code
+            if body.ar_account_code:
+                kwargs["ar_account_code"] = body.ar_account_code
+            return build_ar_adjustment_journal(session, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

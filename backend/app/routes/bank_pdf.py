@@ -1,0 +1,81 @@
+"""
+Bank PDF importer (TD Canada Trust) — HTTP routes.
+
+Endpoints:
+    POST /api/bank-pdf/preview
+    POST /api/bank-pdf/upload
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+
+from ..db import db_session
+from ..services_auth import require_role
+from ..services_bank_pdf import (
+    preview_bank_pdf_import,
+    run_bank_pdf_import,
+)
+from ..services_period_close import PeriodLockedError
+
+
+router = APIRouter(prefix="/api/bank-pdf", tags=["bank-pdf"])
+
+
+@router.post("/preview")
+async def post_preview(
+    entity_code: str = Form(...),
+    file: UploadFile = File(...),
+    source_account_code: str | None = Form(default=None),
+    source_account_name: str | None = Form(default=None),
+    sample_limit: int = Form(default=25),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    file_bytes = await file.read()
+    try:
+        with db_session() as session:
+            return preview_bank_pdf_import(
+                session=session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                file_name=file.filename or "statement.pdf",
+                source_account_code=source_account_code,
+                source_account_name=source_account_name,
+                sample_limit=int(sample_limit),
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/upload")
+async def post_upload(
+    entity_code: str = Form(...),
+    actor_email: str = Form(...),
+    file: UploadFile = File(...),
+    source_account_code: str | None = Form(default=None),
+    source_account_name: str | None = Form(default=None),
+    note: str | None = Form(default=None),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    file_bytes = await file.read()
+    try:
+        with db_session() as session:
+            return run_bank_pdf_import(
+                session=session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                file_name=file.filename or "statement.pdf",
+                source_account_code=source_account_code,
+                source_account_name=source_account_name,
+                actor_email=actor_email,
+                note=note,
+            )
+    except HTTPException:
+        raise
+    except PeriodLockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
