@@ -1,4 +1,15 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Sentinel to detect any leftover dev placeholder still floating around in
+# someone's environment. We never want this to be the live signing key.
+_REJECTED_JWT_SECRETS = {
+    "",
+    "dev_jwt_secret_replace_in_production_minimum_32_chars_long",
+    "replace_me",
+    "changeme",
+}
 
 
 class Settings(BaseSettings):
@@ -22,8 +33,27 @@ class Settings(BaseSettings):
     google_sheets_spreadsheet_id: str = "replace_me"
     cash_balancing_lookback_days: int = 56
 
-    jwt_secret: str = "dev_jwt_secret_replace_in_production_minimum_32_chars_long"
+    # JWT_SECRET must be set in the environment. We deliberately do NOT
+    # provide a fallback default: a fallback caused issued-then-401 incidents
+    # where the token was signed under one secret and verified under another
+    # after a deploy that finally injected JWT_SECRET. Fail at boot instead.
+    jwt_secret: str
     jwt_algorithm: str = "HS256"
     jwt_expiry_hours: int = 8
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def _validate_jwt_secret(cls, value: str) -> str:
+        if value in _REJECTED_JWT_SECRETS:
+            raise ValueError(
+                "JWT_SECRET is unset or matches a known placeholder. "
+                "Set a real secret (>=32 chars) in the environment."
+            )
+        if len(value) < 32:
+            raise ValueError(
+                f"JWT_SECRET must be at least 32 characters (got {len(value)})."
+            )
+        return value
+
 
 settings = Settings()

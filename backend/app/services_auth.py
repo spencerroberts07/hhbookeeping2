@@ -173,6 +173,14 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",
         ) from exc
+    except jwt.InvalidSignatureError as exc:
+        # Distinguished from generic InvalidTokenError so a JWT_SECRET
+        # rotation/mismatch is identifiable from the response, not just a
+        # blanket "Invalid token".
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token signature invalid (signing key mismatch — please log in again)",
+        ) from exc
     except jwt.InvalidTokenError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
