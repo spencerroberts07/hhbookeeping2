@@ -127,11 +127,48 @@ def _pypdf_extract_text(file_bytes: bytes) -> str:
     return "\n".join(pages)
 
 
+# Common install locations for the Tesseract binary on Windows. We
+# probe these so OCR works even when the backend was started before
+# Tesseract was added to PATH.
+_TESSERACT_BINARY_CANDIDATES = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    # User-scope install (Mannheim installer's "for me only" option)
+    None,  # placeholder; filled in below
+)
+
+
+def _resolve_tesseract_cmd() -> str | None:
+    """
+    Return a path to a usable tesseract executable, or None if we can't
+    find one. Honors $TESSERACT_CMD, then falls back to the installer's
+    standard install paths on Windows, then PATH.
+    """
+    import os
+    import shutil
+
+    explicit = os.environ.get("TESSERACT_CMD")
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    via_path = shutil.which("tesseract")
+    if via_path:
+        return via_path
+    for candidate in _TESSERACT_BINARY_CANDIDATES:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    user_local = os.path.expandvars(
+        r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"
+    )
+    if os.path.isfile(user_local):
+        return user_local
+    return None
+
+
 def _ocr_pdf_text(file_bytes: bytes) -> str:
     """
     Rasterize the PDF with PyMuPDF and OCR each page with pytesseract.
-    Returns '' if either dependency is unavailable or the install lacks
-    a Tesseract binary on PATH.
+    Returns '' if any dependency is unavailable, including a missing
+    Tesseract binary.
     """
     try:
         import fitz  # type: ignore
@@ -146,19 +183,33 @@ def _ocr_pdf_text(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
+    tess_cmd = _resolve_tesseract_cmd()
+    if not tess_cmd:
+        return ""
+    # Tell pytesseract exactly where the binary is — works even if the
+    # current process started before Tesseract was added to PATH.
+    pytesseract.pytesseract.tesseract_cmd = tess_cmd
+
     pages: list[str] = []
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception:
         return ""
+    # 3x rasterization keeps small digits sharp; psm 6 ('uniform block
+    # of text') is the right segmentation for the Prism/POS reports
+    # where rows are columnar and Tesseract's default psm splits
+    # columns into separate top-to-bottom blocks.
+    ocr_config = "--psm 6 -c preserve_interword_spaces=1"
     try:
         for page in doc:
             try:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
                 img = Image.frombytes(
                     "RGB", [pix.width, pix.height], pix.samples
                 )
-                pages.append(pytesseract.image_to_string(img) or "")
+                pages.append(
+                    pytesseract.image_to_string(img, config=ocr_config) or ""
+                )
             except Exception:
                 pages.append("")
     finally:
