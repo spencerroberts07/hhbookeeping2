@@ -624,7 +624,15 @@ def revoke_user_entity_role(
 # FastAPI dependency
 # --------------------------------------------------------------------------
 
-_bearer_scheme = HTTPBearer(auto_error=False)
+_bearer_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="BearerAuth",
+    bearerFormat="JWT",
+    description=(
+        "Paste the access_token returned by POST /api/auth/login. "
+        "Do not include the 'Bearer ' prefix — Swagger adds it automatically."
+    ),
+)
 
 
 def _meets_role(user_role: str | None, is_superadmin: bool, min_role: str) -> bool:

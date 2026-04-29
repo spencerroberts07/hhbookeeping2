@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.openapi.utils import get_openapi
 
 from .config import settings
 from .routes.auth import router as auth_router
@@ -53,3 +54,42 @@ app.include_router(payroll_router)
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(environment=settings.app_env)
+
+
+# --------------------------------------------------------------------------
+# OpenAPI / Swagger UI — register a Bearer security scheme so the
+# Authorize button at /docs sends `Authorization: Bearer <token>` on every
+# request. Without this, protected endpoints can only be exercised via
+# curl/PowerShell. The scheme name matches HTTPBearer(scheme_name=...) in
+# services_auth.py so per-operation security and the global default agree.
+# --------------------------------------------------------------------------
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": (
+            "Paste the access_token returned by POST /api/auth/login. "
+            "Do not include the 'Bearer ' prefix — Swagger adds it."
+        ),
+    }
+    schema["security"] = [{"BearerAuth": []}]
+
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
