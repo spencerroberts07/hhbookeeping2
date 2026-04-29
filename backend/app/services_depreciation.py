@@ -6,9 +6,12 @@ Canadian CCA declining-balance method:
     half-year rule (year of acquisition only): annual_dep *= 0.5
 
 Bridlewood asset classes (seeded by seed_fixed_assets):
-    Equipment / Furniture & Fixtures  Class 8   15%   GL 1510 / 1610 / 6810
-    Computer Equipment                Class 8   15%   GL 1540 / 1640 / 6830
-    Vehicles                          Class 10  30%   GL 1520 / 1620 / 6820
+    Equipment / Furniture & Fixtures  Class 8   15%   GL 1510 / 1610 / 6900
+    Computer Equipment                Class 8   15%   GL 1540 / 1640 / 6900
+    Vehicles                          Class 10  30%   GL 1520 / 1620 / 6900
+
+Depreciation expense rolls up to a single P&L account (6900); only
+accumulated-depn (1610/1620/1640) splits per class on the balance sheet.
 """
 from __future__ import annotations
 
@@ -35,6 +38,10 @@ CCA_CLASS_8_EQUIPMENT = "class_8_equipment"
 CCA_CLASS_8_COMPUTER = "class_8_computer"
 CCA_CLASS_10_VEHICLE = "class_10_vehicle"
 
+# Bridlewood collapses depreciation expense into a single P&L account.
+# Accumulated depreciation stays split per class on the balance sheet.
+DEPN_EXPENSE_GL_ACCOUNT = "6900"
+
 # Canonical Bridlewood seed list (driven from the actual fixed-asset
 # schedule the user supplied). opening_nbv_date = fiscal year start.
 _BRIDLEWOOD_SEED = [
@@ -45,7 +52,7 @@ _BRIDLEWOOD_SEED = [
         "cca_rate": Decimal("0.15"),
         "asset_gl_account": "1510",
         "accum_depn_gl_account": "1610",
-        "depn_expense_gl_account": "6810",
+        "depn_expense_gl_account": DEPN_EXPENSE_GL_ACCOUNT,
         "cost": Decimal("386378.00"),
         "opening_nbv": Decimal("357400.00"),
         "opening_nbv_date": date(2024, 9, 30),
@@ -57,7 +64,7 @@ _BRIDLEWOOD_SEED = [
         "cca_rate": Decimal("0.15"),
         "asset_gl_account": "1540",
         "accum_depn_gl_account": "1640",
-        "depn_expense_gl_account": "6830",
+        "depn_expense_gl_account": DEPN_EXPENSE_GL_ACCOUNT,
         "cost": Decimal("13098.00"),
         "opening_nbv": Decimal("12116.00"),
         "opening_nbv_date": date(2024, 9, 30),
@@ -69,7 +76,7 @@ _BRIDLEWOOD_SEED = [
         "cca_rate": Decimal("0.30"),
         "asset_gl_account": "1520",
         "accum_depn_gl_account": "1620",
-        "depn_expense_gl_account": "6820",
+        "depn_expense_gl_account": DEPN_EXPENSE_GL_ACCOUNT,
         "cost": Decimal("30000.00"),
         "opening_nbv": Decimal("21000.00"),
         "opening_nbv_date": date(2024, 9, 30),
