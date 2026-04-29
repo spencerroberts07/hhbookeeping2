@@ -496,62 +496,185 @@ _POS_FINANCIAL_LABEL_MAP: dict[str, str] = {
     "ecommercenet": "ecommerce_net",
     "giftcardsnet": "gift_card_net",
     "giftcardnet": "gift_card_net",
-    # Sales / COGS / tax (credit-side)
-    "merchandisesalesother": "merchandise_sales",
-    "merchandisesalesha": "non_merchandise_sales",
-    "merchandisesales": "merchandise_sales",
-    "nonmerchandisesales": "non_merchandise_sales",
+    # The store has two distinct gift-card lines in the report
+    # ("Home Gift Card (net)" and "e-Gift (net)"). Both roll into the
+    # single gift_card_net column on pos_financial_snapshots.
+    "homegiftcardnet": "gift_card_net",
+    "egiftnet": "gift_card_net",
+    # COGS — parent rows on the credit side
     "costofgoodssold": "cogs_merchandise",
+    "costofgoodssoldnonmerch": "cogs_non_merchandise",
     "costofgoodssoldnonmerchandise": "cogs_non_merchandise",
+    # Tax
     "hst": "hst_collected",
     "hst5": "hst_5pct",
     "hst5pct": "hst_5pct",
 }
 
-# Period range from the report header
+# Sales rows are bucketed via section-context (the parent label has no
+# numbers; the indented child rows carry the credit amounts), so they
+# are NOT in _POS_FINANCIAL_LABEL_MAP. The section labels themselves:
+_POS_SECTION_LABELS: dict[str, str] = {
+    "merchandisesales": "merchandise_sales",
+    "nonmerchandisesales": "non_merchandise_sales",
+}
+
+# Labels of the indented "Cost of Sales - X" debit rows that mirror the
+# COGS credit total. Their debits must contribute to total_debit_side
+# (so the report balances) but should NOT be bucketed into
+# other_tender — they're internal offsets to COGS, not separate items.
+_POS_COST_OF_SALES_PREFIX = "costofsales"
+
+# Period range from the report header. The store actually emits
+# "For: <start> - <end>" on its POS Financial History Report. Other
+# Prism / POS variants use "From:" or "Date Range:". Match all of them.
 _RE_POS_PERIOD = re.compile(
-    r"(?:From|Date\s*Range)\s*[:.]?\s*"
-    r"([0-9/\-]+)\s*(?:to|through|-|–|—)\s*([0-9/\-]+)",
+    r"(?:For|From|Period|Date\s*Range)\s*[:.]?\s*"
+    r"([0-9/\-]+)\s*(?:to|through|thru|and|-|–|—)\s*([0-9/\-]+)",
     re.IGNORECASE,
 )
+# Fallback: any line whose label is "For" / "For:" / "Period" /
+# "Period:" — even if the separator between the two dates is something
+# unusual (multiple spaces, "Through", etc.), we can still pull the
+# first two date-shaped tokens off the line.
+_RE_DATE_TOKEN = re.compile(r"\d{1,4}[/\-]\d{1,2}[/\-]\d{1,4}")
+_PERIOD_LINE_PREFIXES = ("for:", "for ", "period:", "period ", "from:", "from ")
+
+
+def _extract_pos_period(
+    raw_lines: list[str],
+) -> tuple[date | None, date | None]:
+    for raw in raw_lines[:80]:
+        m = _RE_POS_PERIOD.search(raw)
+        if m:
+            ds = _parse_yy_mm_dd(m.group(1))
+            de = _parse_yy_mm_dd(m.group(2))
+            if ds and de:
+                return ds, de
+
+    for raw in raw_lines[:80]:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if not any(lower.startswith(p) for p in _PERIOD_LINE_PREFIXES):
+            continue
+        tokens = _RE_DATE_TOKEN.findall(stripped)
+        if len(tokens) >= 2:
+            ds = _parse_yy_mm_dd(tokens[0])
+            de = _parse_yy_mm_dd(tokens[1])
+            if ds and de:
+                return ds, de
+        if len(tokens) == 1:
+            d = _parse_yy_mm_dd(tokens[0])
+            if d:
+                return d, d
+    return None, None
 
 
 def _normalize_pos_label(raw: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (raw or "").lower())
 
 
+_POS_MONEY_TOKEN = re.compile(r"\(?-?\$?-?\s?[\d,]*\.\d{2}\-?\)?")
+_POS_HEADER_RE = re.compile(r"\bDEBIT\b.*\bCREDIT\b")
+_POS_STOP_TOKENS = (
+    "loyalty:",
+    "net h.s.t",
+    "paid in/out breakdown",
+    "end of report",
+)
+
+
+def _detect_pos_columns(raw_lines: list[str]) -> dict[str, int] | None:
+    """
+    Find the column-header row ("DEBIT  CREDIT  COUNT") and return the
+    end-positions of each header word. Right-aligned amounts in the data
+    rows end at (or just past) those positions, so we can place each
+    money token into the correct column by its end-offset rather than
+    by token order.
+    """
+    for raw in raw_lines[:80]:
+        if not _POS_HEADER_RE.search(raw):
+            continue
+        debit_m = re.search(r"\bDEBIT\b", raw)
+        credit_m = re.search(r"\bCREDIT\b", raw)
+        count_m = re.search(r"\bCOUNT\b", raw)
+        if not debit_m or not credit_m:
+            continue
+        return {
+            "debit_end": debit_m.end(),
+            "credit_end": credit_m.end(),
+            "count_end": count_m.end() if count_m else credit_m.end() + 20,
+        }
+    return None
+
+
+def _assign_pos_amount(
+    line: str,
+    cols: dict[str, int] | None,
+) -> tuple[Decimal, Decimal, list[str]]:
+    """
+    Bucket each money token in `line` into debit / credit / (ignored)
+    using the column end-offsets from _detect_pos_columns(), with a
+    positional first/second fallback if the header wasn't located.
+    """
+    matches = list(_POS_MONEY_TOKEN.finditer(line))
+    if not matches:
+        return Decimal("0.00"), Decimal("0.00"), []
+
+    debit_amount = Decimal("0.00")
+    credit_amount = Decimal("0.00")
+    raw_tokens: list[str] = []
+
+    if cols is not None:
+        # Allow tokens to extend a couple of chars past the header end —
+        # right-aligned amounts wider than "DEBIT" / "CREDIT" spill left,
+        # but the END usually still sits at the header end.
+        debit_cutoff = cols["debit_end"] + 2
+        credit_cutoff = cols["credit_end"] + 2
+        for m in matches:
+            tok = m.group()
+            value = _parse_signed_money_token(tok)
+            end_col = m.end()
+            raw_tokens.append(tok)
+            if end_col <= debit_cutoff:
+                debit_amount += value
+            elif end_col <= credit_cutoff:
+                credit_amount += value
+            # tokens past credit_cutoff are COUNT / decimal noise — ignore
+        return debit_amount, credit_amount, raw_tokens
+
+    raw_tokens = [m.group() for m in matches]
+    if len(raw_tokens) >= 1:
+        debit_amount = _parse_signed_money_token(raw_tokens[0])
+    if len(raw_tokens) >= 2:
+        credit_amount = _parse_signed_money_token(raw_tokens[1])
+    return debit_amount, credit_amount, raw_tokens
+
+
 def parse_pos_financial_report(file_text: str) -> dict[str, Any]:
     """
-    Parse the POS Financial History Report.
+    Parse the POS Financial History Report (Prism finhstrp-1 layout).
 
     Strategy:
-        - Walk the lines top to bottom.
-        - Lines that have a label on the left and 2-3 right-aligned
-          numeric columns are treated as data.
-        - Map the label (after normalization) to a canonical field via
-          _POS_FINANCIAL_LABEL_MAP. Unmapped labels go into other_tender_json.
-        - Track the running debit / credit totals so we can flag is_balanced.
-        - Detect period_start / period_end from a "From: X to Y" header.
-
-    Returns:
-        {
-            "period_start": date | None,
-            "period_end": date | None,
-            "fields": dict[str, Decimal],          # canonical -> amount
-            "house_account_debit": Decimal,
-            "house_account_credit": Decimal,
-            "other_tender": dict[str, Decimal],    # raw_label -> debit-credit
-            "total_debit_side": Decimal,
-            "total_credit_side": Decimal,
-            "is_balanced": bool,
-            "warnings": list[str],
-            "raw_rows": list[dict],
-        }
+        1. Pull period from the "FOR: <start> to <end>" header.
+        2. Use the "DEBIT  CREDIT  COUNT" header line to locate the
+           end-offsets of the debit and credit columns; bucket each
+           money token in subsequent rows by its end offset, so a row
+           with just one amount lands in the correct column instead of
+           always being treated as the debit.
+        3. Track section context: a label-only line whose normalized
+           form is "merchandisesales" or "nonmerchandisesales" sets the
+           current section. Indented child rows then roll up to that
+           parent's canonical field.
+        4. Stop at the "$  total  $  total" totals block — page-2
+           "Paid In/Out" detail is not double-counted.
     """
     raw_lines = _split_lines(file_text or "")
+    period_start, period_end = _extract_pos_period(raw_lines)
+    cols = _detect_pos_columns(raw_lines)
 
-    period_start: date | None = None
-    period_end: date | None = None
     fields: dict[str, Decimal] = {}
     other_tender: dict[str, Decimal] = {}
     house_account_debit = Decimal("0.00")
@@ -561,89 +684,105 @@ def parse_pos_financial_report(file_text: str) -> dict[str, Any]:
     raw_rows: list[dict[str, Any]] = []
     warnings: list[str] = []
 
-    # Header period
-    for raw in raw_lines[:50]:
-        m = _RE_POS_PERIOD.search(raw)
-        if m:
-            period_start = _parse_yy_mm_dd(m.group(1))
-            period_end = _parse_yy_mm_dd(m.group(2))
-            if period_start or period_end:
-                break
-
-    # Money token regex — fixed-width money: optional $, digits/commas, dot,
-    # cents, optional trailing minus or parentheses.
-    money_token_re = re.compile(
-        r"\(?-?\$?-?[\d,]*\.\d{2}\-?\)?"
-    )
+    current_section: str | None = None
 
     for raw in raw_lines:
         line = raw.rstrip()
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
             continue
-        # Skip obvious header/footer noise
-        lower = line.lower()
-        if any(
-            tag in lower
-            for tag in (
-                "page ",
-                "report id",
-                "store ",
-                "from date",
-                "to date",
+        lower = stripped.lower()
+
+        # End-of-data sentinels
+        if stripped.startswith("$") and "$" in stripped[1:]:
+            break
+        if set(stripped) <= set("- ") and stripped.count("-") >= 5:
+            break
+        if set(stripped) <= set("= "):
+            break
+        if any(tag in lower for tag in _POS_STOP_TOKENS):
+            break
+
+        # Page banners / metadata lines we always skip
+        if "finhstrp" in lower or "page:" in lower:
+            current_section = None
+            continue
+        if lower.startswith("store:") or lower.startswith("for:"):
+            continue
+        if "continued on page" in lower:
+            continue
+        if _POS_HEADER_RE.search(line):
+            # The DEBIT / CREDIT / COUNT header itself
+            continue
+
+        debit_amount, credit_amount, tokens = _assign_pos_amount(line, cols)
+
+        if tokens:
+            first_match = _POS_MONEY_TOKEN.search(line)
+            label_raw = (
+                line[: first_match.start()].strip() if first_match else stripped
             )
-        ):
-            continue
-        # Find numeric tokens
-        tokens = money_token_re.findall(line)
-        if not tokens:
-            continue
-        # Label is everything to the left of the first numeric token.
-        first_token = tokens[0]
-        first_idx = line.find(first_token)
-        if first_idx <= 0:
-            continue
-        label_raw = line[:first_idx].strip()
+        else:
+            label_raw = stripped
+
         if not label_raw:
             continue
-        # Drop anything that's clearly not a tender/sales label
         norm_label = _normalize_pos_label(label_raw)
         if not norm_label:
             continue
 
-        # Numeric columns: <debit> <credit> <count?> — sometimes only one
-        # of (debit, credit) is non-zero. Normalize zero/blank to 0.
-        nums = [_parse_signed_money_token(t) for t in tokens]
-        # The "count" column (if present) is integer-like and not money.
-        # Heuristic: drop trailing tokens that have no decimal.
-        debit_amount = nums[0] if len(nums) >= 1 else Decimal("0")
-        credit_amount = nums[1] if len(nums) >= 2 else Decimal("0")
+        is_indented = line.startswith(" ") or line.startswith("\t")
+
+        if not tokens:
+            # Section header: no numeric tokens
+            if norm_label in _POS_SECTION_LABELS:
+                current_section = _POS_SECTION_LABELS[norm_label]
+            else:
+                current_section = None
+            continue
 
         raw_rows.append(
             {
                 "label": label_raw,
                 "label_normalized": norm_label,
+                "section": current_section,
+                "indented": is_indented,
                 "debit": str(debit_amount),
                 "credit": str(credit_amount),
             }
         )
 
-        # House Account is special: debit (charges) + credit (payments) live
-        # on the same row but go to different DB columns.
+        # Every data row counts toward the column totals, including the
+        # COGS-offset Cost-of-Sales children — that's how the report
+        # itself balances.
+        total_debit_side += debit_amount
+        total_credit_side += credit_amount
+
         if "houseaccount" in norm_label:
             house_account_debit += debit_amount
             house_account_credit += credit_amount
-            total_debit_side += debit_amount
-            total_credit_side += credit_amount
+            continue
+
+        # Cost-of-Sales children mirror the COGS credit total on the
+        # debit side. Don't bucket them into other_tender — they're
+        # internal offsets, not separate tender items.
+        if norm_label.startswith(_POS_COST_OF_SALES_PREFIX):
+            continue
+
+        # Indented children of the Merchandise / Non-Merchandise Sales
+        # section headers carry the credit amounts the parent line
+        # itself doesn't.
+        if is_indented and current_section in {
+            "merchandise_sales",
+            "non_merchandise_sales",
+        }:
+            fields[current_section] = (
+                fields.get(current_section, Decimal("0.00")) + credit_amount
+            )
             continue
 
         canonical = _POS_FINANCIAL_LABEL_MAP.get(norm_label)
         if canonical:
-            net = debit_amount - credit_amount
-            # For credit-side rows (sales, COGS, HST), the magnitude is
-            # the credit amount. For debit-side (tender), the magnitude
-            # is the debit amount. We store the absolute net under the
-            # canonical name; sign convention: positive = the natural
-            # direction for that column.
             if canonical in {
                 "merchandise_sales",
                 "non_merchandise_sales",
@@ -664,9 +803,6 @@ def parse_pos_financial_report(file_text: str) -> dict[str, Any]:
             other_tender[label_raw] = (
                 other_tender.get(label_raw, Decimal("0.00")) + net
             )
-
-        total_debit_side += debit_amount
-        total_credit_side += credit_amount
 
     is_balanced = (
         total_debit_side != Decimal("0")
