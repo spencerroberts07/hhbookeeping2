@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiry_hours: int = 8
 
+    # Optional. When set, services_claude_classifier uses it as Layer 3
+    # of the bank-auto-journal classifier. Leave unset to skip the LLM
+    # fallback — Layers 1 (rules) and 2 (vendor memory) still run.
+    anthropic_api_key: str | None = None
+
     @field_validator("jwt_secret")
     @classmethod
     def _validate_jwt_secret(cls, value: str) -> str:

@@ -37,6 +37,20 @@ from .services import (
     get_entity_by_code,
     get_or_create_accounting_period,
 )
+from .services_vendor_classification import (
+    LAYER_CLAUDE,
+    LAYER_RULES,
+    LAYER_VENDOR_MEMORY,
+    VENDOR_MEMORY_AUTO_DRAFT_THRESHOLD,
+    CLAUDE_MIN_CONFIDENCE,
+    record_suggestion,
+    vendor_memory_lookup,
+    vendor_memory_similar,
+)
+from .services_claude_classifier import (
+    classify_with_claude,
+    is_claude_available,
+)
 
 
 SOURCE_MODULE_AUTO_JOURNAL = "bank_auto_journal"
@@ -623,6 +637,31 @@ def run_auto_journal(
     skipped_rows: list[dict[str, Any]] = []
     split_required_rows: list[dict[str, Any]] = []
 
+    # Per-layer counters so the run summary can show the human where
+    # each match came from (rule vs memory vs LLM).
+    layer_counts = {
+        LAYER_RULES: 0,
+        LAYER_VENDOR_MEMORY: 0,
+        LAYER_CLAUDE: 0,
+    }
+
+    # Pull the chart of accounts once for Layer 3 (Claude). Done outside
+    # the loop so the prompt-cache hit-rate is high for a run.
+    chart_of_accounts: list[dict[str, Any]] = []
+    if is_claude_available() and _has_table(session, "accounts"):
+        chart_rows = session.execute(
+            text(
+                """
+                SELECT account_code, account_name, account_class
+                FROM accounts
+                WHERE entity_id = :entity_id AND is_active = TRUE
+                ORDER BY account_code
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().all()
+        chart_of_accounts = [dict(r) for r in chart_rows]
+
     for txn in txns:
         desc = txn["description"] or ""
         desc_upper = desc.upper()
@@ -663,6 +702,128 @@ def run_auto_journal(
             continue
 
         rule = _find_matching_rule(rules, desc)
+        if rule is None:
+            # Layer 2: vendor memory.
+            mem = vendor_memory_lookup(
+                session,
+                entity_id=entity["id"],
+                description=desc,
+            )
+            if (
+                mem is not None
+                and mem["confidence_score"] >= VENDOR_MEMORY_AUTO_DRAFT_THRESHOLD
+            ):
+                # Synthesize a rule-like dict for the matched_rows path.
+                # For outflows: Dr expense / Cr 1020. For inflows we
+                # flip in the prepared_lines block below using
+                # rule['debit_account'] vs rule['credit_account'].
+                rule = {
+                    "id": None,
+                    "rule_code": f"VENDOR_MEMORY:{mem['normalized_vendor_key']}",
+                    "debit_account": (
+                        mem["account_code"]
+                        if mem["debit_or_credit"] == "debit"
+                        else DEFAULT_BANK_ACCOUNT_CODE
+                    ),
+                    "credit_account": (
+                        DEFAULT_BANK_ACCOUNT_CODE
+                        if mem["debit_or_credit"] == "debit"
+                        else mem["account_code"]
+                    ),
+                    "transaction_type": "vendor_memory",
+                    "requires_split": False,
+                }
+                record_suggestion(
+                    session,
+                    entity_id=entity["id"],
+                    bank_transaction_id=txn["id"],
+                    auto_journal_run_id=run_id,
+                    layer=LAYER_VENDOR_MEMORY,
+                    suggested_account_code=mem["account_code"],
+                    suggested_debit_or_credit=mem["debit_or_credit"],
+                    confidence_score=mem["confidence_score"],
+                    reasoning=(
+                        f"Vendor memory: matched key "
+                        f"{mem['normalized_vendor_key']} "
+                        f"(seen {mem['occurrences_count']}x, "
+                        f"source={mem['source']})"
+                    ),
+                )
+                layer_counts[LAYER_VENDOR_MEMORY] += 1
+            # Layer 3: Claude API.
+            elif is_claude_available() and chart_of_accounts:
+                similar = vendor_memory_similar(
+                    session, entity_id=entity["id"], description=desc, limit=5
+                )
+                claude_result = classify_with_claude(
+                    description=desc,
+                    amount=txn["amount"] or Decimal("0"),
+                    direction=txn["direction"] or "outflow",
+                    chart_of_accounts=chart_of_accounts,
+                    similar_past=similar,
+                )
+                if (
+                    claude_result is not None
+                    and claude_result["account_code"] not in (None, "", "UNCLASSIFIED")
+                    and claude_result["confidence"] >= CLAUDE_MIN_CONFIDENCE
+                ):
+                    dr_or_cr = claude_result["debit_or_credit"]
+                    rule = {
+                        "id": None,
+                        "rule_code": f"CLAUDE:{claude_result['account_code']}",
+                        "debit_account": (
+                            claude_result["account_code"]
+                            if dr_or_cr == "debit"
+                            else DEFAULT_BANK_ACCOUNT_CODE
+                        ),
+                        "credit_account": (
+                            DEFAULT_BANK_ACCOUNT_CODE
+                            if dr_or_cr == "debit"
+                            else claude_result["account_code"]
+                        ),
+                        "transaction_type": "claude",
+                        "requires_split": False,
+                    }
+                    record_suggestion(
+                        session,
+                        entity_id=entity["id"],
+                        bank_transaction_id=txn["id"],
+                        auto_journal_run_id=run_id,
+                        layer=LAYER_CLAUDE,
+                        suggested_account_code=claude_result["account_code"],
+                        suggested_debit_or_credit=dr_or_cr,
+                        confidence_score=claude_result["confidence"],
+                        reasoning=claude_result["reasoning"],
+                        raw_response=claude_result.get("raw_response"),
+                    )
+                    layer_counts[LAYER_CLAUDE] += 1
+                else:
+                    # Claude was indecisive — record the failed attempt
+                    # so the review queue surfaces it.
+                    record_suggestion(
+                        session,
+                        entity_id=entity["id"],
+                        bank_transaction_id=txn["id"],
+                        auto_journal_run_id=run_id,
+                        layer=LAYER_CLAUDE,
+                        suggested_account_code=None,
+                        suggested_debit_or_credit=None,
+                        confidence_score=(
+                            claude_result["confidence"] if claude_result else None
+                        ),
+                        reasoning=(
+                            claude_result["reasoning"]
+                            if claude_result
+                            else "Claude API unavailable"
+                        ),
+                        raw_response=(
+                            claude_result.get("raw_response")
+                            if claude_result
+                            else None
+                        ),
+                    )
+                    rule = None  # stay unmatched
+
         if rule is None:
             session.execute(
                 text(
@@ -729,6 +890,16 @@ def run_auto_journal(
                 }
             )
             continue
+
+        # If rule['id'] is a real UUID, this came from Layer 1 (the
+        # bank_transaction_rules table). We don't record a
+        # bank_classification_suggestions row for Layer 1 — that table
+        # is for Layers 2/3 where the human reviews the AI's answer.
+        # Layer 1 is deterministic, no review needed, and skipping the
+        # write keeps the per-transaction round-trip count low enough
+        # for Render's free-tier Postgres.
+        if rule.get("id") is not None:
+            layer_counts[LAYER_RULES] += 1
 
         matched_rows.append(
             {
@@ -842,7 +1013,9 @@ def run_auto_journal(
                         "source_module": SOURCE_MODULE_AUTO_JOURNAL,
                         "auto_journal_run_id": str(run_id),
                         "bank_transaction_id": str(ln["txn_id"]),
-                        "rule_id": str(ln["rule_id"]),
+                        "rule_id": (
+                            str(ln["rule_id"]) if ln.get("rule_id") else None
+                        ),
                         "rule_code": ln["rule_code"],
                     }
                 )
@@ -932,6 +1105,7 @@ def run_auto_journal(
         "unmatched_count": len(unmatched_rows),
         "skipped_count": len(skipped_rows),
         "split_required_count": len(split_required_rows),
+        "matched_by_layer": layer_counts,
         "total_debits": str(total_debits),
         "total_credits": str(total_credits),
         "unmatched_sample": unmatched_rows[:50],
@@ -972,6 +1146,8 @@ def run_auto_journal(
         "transactions_unmatched": len(unmatched_rows),
         "transactions_skipped": len(skipped_rows),
         "transactions_split_required": len(split_required_rows),
+        "matched_by_layer": layer_counts,
+        "claude_available": is_claude_available(),
         "journal_batch_id": str(journal_batch_id) if journal_batch_id else None,
         "total_debits": str(total_debits),
         "total_credits": str(total_credits),

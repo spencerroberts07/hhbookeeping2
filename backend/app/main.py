@@ -27,6 +27,7 @@ from .routes.pos_import import router as pos_import_router
 from .routes.qbo_auth import router as qbo_auth_router
 from .routes.qbo_bank_sync import router as qbo_bank_sync_router
 from .routes.sync import router as sync_router
+from .routes.vendor_classification import router as vendor_classification_router
 from .schemas import HealthResponse
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.7.0")
@@ -66,6 +67,10 @@ app.include_router(bank_pdf_router)
 app.include_router(depreciation_router)
 app.include_router(accruals_router)
 app.include_router(bank_auto_journal_router)
+
+# v1.0 module: self-improving vendor classification (Layers 2 + 3 of
+# the bank auto-journal classifier — vendor memory + Claude API).
+app.include_router(vendor_classification_router)
 
 
 @app.get("/health", response_model=HealthResponse)
