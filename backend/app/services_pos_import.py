@@ -144,7 +144,12 @@ def _parse_signed_money_token(token: str) -> Decimal:
 
 
 def _parse_yy_mm_dd(token: str) -> date | None:
-    """Accept YY/MM/DD, YYYY/MM/DD, YYYY-MM-DD, MM/DD/YY, MM/DD/YYYY."""
+    """
+    Accept the date formats that show up across the store's reports:
+      YY/MM/DD, YYYY/MM/DD, YYYY-MM-DD, MM/DD/YY, MM/DD/YYYY
+      Mmm DD/YY (e.g. 'Feb 28/26'), Mmm DD/YYYY,
+      Mmm DD, YYYY, Month DD, YYYY, etc.
+    """
     if not token:
         return None
     s = str(token).strip()
@@ -156,6 +161,14 @@ def _parse_yy_mm_dd(token: str) -> date | None:
         "%y/%m/%d",
         "%m/%d/%Y",
         "%m/%d/%y",
+        "%b %d/%y",
+        "%b %d/%Y",
+        "%b %d, %y",
+        "%b %d, %Y",
+        "%B %d/%y",
+        "%B %d/%Y",
+        "%B %d, %y",
+        "%B %d, %Y",
     )
     for fmt in fmts:
         try:
@@ -968,8 +981,13 @@ def parse_inventory_value_report(file_text: str) -> dict[str, Any]:
 
 
 _RE_AGED_TOTALS = re.compile(r"^\s*Totals?\s*[:.]?\s*(.*)$", re.IGNORECASE)
+# Captures both numeric date forms (YY/MM/DD etc.) AND alpha-month forms
+# (e.g. 'Feb 28/26'). The second branch is non-greedy and stops before
+# any double-space so trailing "Page: 1" / time stamps don't get pulled
+# into the date string.
 _RE_AGED_AS_OF = re.compile(
-    r"(?:As\s+of|Aging\s+Date|Report\s+Date|Snapshot\s+Date)\s*[:.]?\s*([0-9/\-]+)",
+    r"(?:As\s+of|Aging\s+Date|Report\s+Date|Snapshot\s+Date)\s*[:.]?\s*"
+    r"([A-Za-z]{3,9}\s+\d{1,2}(?:[/,]\s*)\d{2,4}|[0-9/\-]+)",
     re.IGNORECASE,
 )
 
