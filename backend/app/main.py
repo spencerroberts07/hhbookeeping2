@@ -5,6 +5,7 @@ from .config import settings
 from .routes.accruals import router as accruals_router
 from .routes.auth import router as auth_router
 from .routes.auto_match import router as auto_match_router
+from .routes.bank_auto_journal import router as bank_auto_journal_router
 from .routes.bank_csv import router as bank_csv_router
 from .routes.bank_pdf import router as bank_pdf_router
 from .routes.card_settlement import router as card_settlement_router
@@ -64,6 +65,7 @@ app.include_router(gl_import_router)
 app.include_router(bank_pdf_router)
 app.include_router(depreciation_router)
 app.include_router(accruals_router)
+app.include_router(bank_auto_journal_router)
 
 
 @app.get("/health", response_model=HealthResponse)

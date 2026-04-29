@@ -623,20 +623,41 @@ def run_bank_pdf_import(
         default=None,
     )
 
-    # Period-lock guard
+    # Period-lock guard — fetch all closed/locked periods that overlap
+    # the import range in ONE query, then check each row in-memory.
+    # Doing N round-trips per row would deadline-out on Render Postgres
+    # for 100+ rows.
     locked_periods_seen: dict[str, dict[str, Any]] = {}
-    for t in valid:
-        is_locked, period = is_date_in_locked_period(
-            session, entity_id=entity["id"], when=t["transaction_date"]
-        )
-        if is_locked and period:
-            locked_periods_seen[str(period["id"])] = {
-                "period_label": period.get("period_label"),
-                "period_end": (
-                    period["period_end"].isoformat() if period.get("period_end") else None
-                ),
-                "status": period.get("status"),
-            }
+    if earliest and latest:
+        locked_rows = session.execute(
+            text(
+                """
+                SELECT id, period_label, period_start, period_end, status
+                FROM accounting_periods
+                WHERE entity_id = :entity_id
+                  AND status IN ('closed_locked', 'closed', 'locked')
+                  AND period_start <= :latest
+                  AND period_end >= :earliest
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "earliest": earliest,
+                "latest": latest,
+            },
+        ).mappings().all()
+        for period in locked_rows:
+            for t in valid:
+                d = t["transaction_date"]
+                if d and period["period_start"] <= d <= period["period_end"]:
+                    locked_periods_seen[str(period["id"])] = {
+                        "period_label": period.get("period_label"),
+                        "period_end": (
+                            period["period_end"].isoformat() if period.get("period_end") else None
+                        ),
+                        "status": period.get("status"),
+                    }
+                    break
     if locked_periods_seen:
         raise PeriodLockedError(
             next(iter(locked_periods_seen.values())),
@@ -648,35 +669,66 @@ def run_bank_pdf_import(
             ),
         )
 
-    inserted = 0
-    duplicates = 0
-    for t in valid:
-        accounting_period_id = get_or_create_accounting_period(
-            session, entity["id"], t["transaction_date"]
-        )
+    # Pre-fetch the accounting_periods that overlap the import range so
+    # we can resolve accounting_period_id per row without N round-trips.
+    period_lookup_rows = session.execute(
+        text(
+            """
+            SELECT id, period_start, period_end
+            FROM accounting_periods
+            WHERE entity_id = :entity_id
+              AND period_start <= :latest
+              AND period_end >= :earliest
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "earliest": earliest,
+            "latest": latest,
+        },
+    ).mappings().all() if earliest and latest else []
 
-        existing = session.execute(
+    def _resolve_period(d: date | None) -> Any:
+        if d is None:
+            return None
+        for p in period_lookup_rows:
+            if p["period_start"] <= d <= p["period_end"]:
+                return p["id"]
+        return None
+
+    # Pre-fetch existing source_transaction_ids in ONE query so we don't
+    # round-trip per row.
+    existing_ids: dict[str, Any] = {}
+    if valid:
+        ids = [t["source_transaction_id"] for t in valid]
+        rows = session.execute(
             text(
                 """
-                SELECT id
+                SELECT id, source_transaction_id
                 FROM bank_transactions
                 WHERE entity_id = :entity_id
                   AND source_system = :source_system
-                  AND source_transaction_id = :source_transaction_id
-                LIMIT 1
+                  AND source_transaction_id = ANY(:ids)
                 """
             ),
             {
                 "entity_id": entity["id"],
                 "source_system": SOURCE_SYSTEM,
-                "source_transaction_id": t["source_transaction_id"],
+                "ids": ids,
             },
-        ).mappings().first()
-        if existing:
+        ).mappings().all()
+        existing_ids = {r["source_transaction_id"]: r["id"] for r in rows}
+
+    inserted = 0
+    duplicates = 0
+    for t in valid:
+        accounting_period_id = _resolve_period(t["transaction_date"])
+
+        if t["source_transaction_id"] in existing_ids:
             duplicates += 1
             session.execute(
                 text("UPDATE bank_transactions SET last_seen_at = NOW() WHERE id = :id"),
-                {"id": existing["id"]},
+                {"id": existing_ids[t["source_transaction_id"]]},
             )
             continue
 

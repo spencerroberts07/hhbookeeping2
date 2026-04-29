@@ -41,6 +41,27 @@ from .services import (
 REPORT_TYPE_GL = "general_ledger"
 VARIANCE_TOLERANCE = Decimal("0.05")  # within 5 cents = no variance flag
 
+# QBO General Ledger reports use a "natural-side positive" sign
+# convention for credit-natural account classes: liabilities (2xxx)
+# and revenue (4xxx). Activity to those accounts is presented with
+# CREDIT → positive, DEBIT → negative.
+#
+# The app's journal_lines use the standard debit-positive /
+# credit-negative convention. So `(debit_amount - credit_amount)`
+# applied to a 2xxx or 4xxx account produces the OPPOSITE sign from
+# what QBO prints.
+#
+# Verified against the live Bridlewood Feb 2026 GL:
+#   * 4010 Sales — Merchandise: GL period_activity = +144,314.71
+#     (revenue earned, a credit). App net would be -144,314.71.
+#   * 2500 Term Loan: GL period_activity = -5,109.66 (principal
+#     reduction, a debit). App net would be +5,109.66.
+#
+# To compare apples to apples we negate the app's net activity for
+# accounts whose code begins with any prefix in this set before
+# computing the variance.
+_FLIP_APP_SIGN_PREFIXES = ("2", "4")
+
 
 # ----------------------------------------------------------------------
 # Numeric / date helpers
@@ -584,7 +605,13 @@ def build_trial_balance_comparison(
         code = bal["account_code"]
         seen_codes.add(code)
         gl_period = _money(bal["period_activity"])
-        app_total = app_totals.get(code, Decimal("0.00"))
+        app_total_raw = app_totals.get(code, Decimal("0.00"))
+        # Normalize app sign to match QBO's natural-side-positive
+        # convention for credit-natural account classes (2xxx, 4xxx).
+        if code and code[:1] in _FLIP_APP_SIGN_PREFIXES:
+            app_total = -app_total_raw
+        else:
+            app_total = app_total_raw
         variance = gl_period - app_total
         denom = abs(gl_period) if gl_period != 0 else Decimal("0")
         variance_pct = (
@@ -634,9 +661,13 @@ def build_trial_balance_comparison(
         rows_written += 1
 
     # Catch app-side accounts that have activity but aren't in the GL.
-    for code, app_total in app_totals.items():
+    for code, app_total_raw in app_totals.items():
         if code in seen_codes:
             continue
+        if code and code[:1] in _FLIP_APP_SIGN_PREFIXES:
+            app_total = -app_total_raw
+        else:
+            app_total = app_total_raw
         variance = -app_total
         has_variance = abs(variance) > VARIANCE_TOLERANCE
         if has_variance:
