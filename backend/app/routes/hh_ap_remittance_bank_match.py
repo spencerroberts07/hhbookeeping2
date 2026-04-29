@@ -1,9 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..schemas import (
     HHAPRemittanceBankActionResponse,
     HHAPRemittanceBankAutoMatchRequest,
@@ -112,6 +113,7 @@ def hh_ap_remittance_bank_match_apply(
     request: HHAPRemittanceBankMatchRequest,
     remittance_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> HHAPRemittanceBankActionResponse:
     try:
         with db_session() as session:
@@ -141,6 +143,7 @@ def hh_ap_remittance_bank_match_release(
     remittance_id: str = Path(...),
     match_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> HHAPRemittanceBankActionResponse:
     try:
         with db_session() as session:
@@ -163,6 +166,7 @@ def hh_ap_remittance_bank_match_release(
 @router.post("/auto-match", response_model=HHAPRemittanceBankActionResponse)
 def hh_ap_remittance_bank_auto_match(
     request: HHAPRemittanceBankAutoMatchRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> HHAPRemittanceBankActionResponse:
     try:
         with db_session() as session:

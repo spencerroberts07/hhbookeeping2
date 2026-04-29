@@ -17,10 +17,11 @@ from datetime import date as DateType
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services_payroll import (
     approve_payroll_run,
     get_payroll_run,
@@ -72,7 +73,10 @@ class MarkClearedRequest(BaseModel):
 
 
 @router.post("/runs/upsert")
-def post_upsert(body: UpsertPayrollRunRequest) -> dict[str, Any]:
+def post_upsert(
+    body: UpsertPayrollRunRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
     try:
         with db_session() as session:
             return upsert_payroll_run(
@@ -138,6 +142,7 @@ def get_one_run(
 def post_submit(
     body: WorkflowRequest,
     payroll_reference: str = Path(...),
+    _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
@@ -156,6 +161,7 @@ def post_submit(
 def post_approve(
     body: WorkflowRequest,
     payroll_reference: str = Path(...),
+    _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
@@ -174,6 +180,7 @@ def post_approve(
 def post_mark_bank_cleared(
     body: MarkClearedRequest,
     payroll_reference: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
@@ -192,6 +199,7 @@ def post_mark_bank_cleared(
 def post_mark_remittance_cleared(
     body: MarkClearedRequest,
     payroll_reference: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:

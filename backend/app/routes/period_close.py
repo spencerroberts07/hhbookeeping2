@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services_period_close import (
     BlockingItemsError,
     PeriodLockedError,
@@ -63,7 +64,10 @@ def _blocking_to_http(exc: BlockingItemsError) -> HTTPException:
 
 
 @router.post("/submit")
-def post_submit(body: SubmitRequest) -> dict[str, Any]:
+def post_submit(
+    body: SubmitRequest,
+    _user: dict = Depends(require_role("approver")),
+) -> dict[str, Any]:
     try:
         with db_session() as session:
             return submit_period_for_close(
@@ -82,7 +86,10 @@ def post_submit(body: SubmitRequest) -> dict[str, Any]:
 
 
 @router.post("/approve")
-def post_approve(body: ApproveRequest) -> dict[str, Any]:
+def post_approve(
+    body: ApproveRequest,
+    _user: dict = Depends(require_role("approver")),
+) -> dict[str, Any]:
     try:
         with db_session() as session:
             return approve_period_close(
@@ -101,7 +108,10 @@ def post_approve(body: ApproveRequest) -> dict[str, Any]:
 
 
 @router.post("/reopen")
-def post_reopen(body: ReopenRequest) -> dict[str, Any]:
+def post_reopen(
+    body: ReopenRequest,
+    _user: dict = Depends(require_role("approver")),
+) -> dict[str, Any]:
     try:
         with db_session() as session:
             return reopen_period(

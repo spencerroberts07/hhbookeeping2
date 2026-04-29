@@ -1,10 +1,11 @@
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services import (
     get_bank_transaction_detail,
     list_bank_review_summary,
@@ -124,7 +125,11 @@ def get_bank_review_transaction_detail(transaction_id: str):
 
 
 @router.post("/transactions/{transaction_id}/set-review-status", response_model=BankTransactionDetailResponse)
-def set_review_status(transaction_id: str, payload: BankTransactionReviewStatusRequest):
+def set_review_status(
+    transaction_id: str,
+    payload: BankTransactionReviewStatusRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     try:
         with db_session() as session:
             result = set_bank_transaction_review_status(
@@ -140,7 +145,11 @@ def set_review_status(transaction_id: str, payload: BankTransactionReviewStatusR
 
 
 @router.post("/transactions/{transaction_id}/match", response_model=BankTransactionDetailResponse)
-def match_transaction(transaction_id: str, payload: BankTransactionMatchRequest):
+def match_transaction(
+    transaction_id: str,
+    payload: BankTransactionMatchRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     try:
         with db_session() as session:
             result = match_bank_transaction(
@@ -160,7 +169,11 @@ def match_transaction(transaction_id: str, payload: BankTransactionMatchRequest)
 
 
 @router.post("/transactions/{transaction_id}/unmatch", response_model=BankTransactionDetailResponse)
-def unmatch_transaction(transaction_id: str, payload: BankTransactionUnmatchRequest):
+def unmatch_transaction(
+    transaction_id: str,
+    payload: BankTransactionUnmatchRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     try:
         with db_session() as session:
             result = unmatch_bank_transaction(

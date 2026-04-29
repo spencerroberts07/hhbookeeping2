@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Any
 from collections import Counter
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services_period_close import (
     PeriodLockedError,
     is_date_in_locked_period,
@@ -2259,6 +2260,7 @@ async def hh_ap_upload_documents(
     document_type: str = Form(...),
     document_date: str | None = Form(default=None),
     files: list[UploadFile] = File(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ):
     with db_session() as session:
         entity = get_entity(session, entity_code)
@@ -2430,6 +2432,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
     entity_code: str = Form(...),
     document_date: str | None = Form(default=None),
     files: list[UploadFile] = File(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ):
     normalized_document_date = normalize_optional_date_input(document_date)
 
@@ -2770,7 +2773,10 @@ async def hh_ap_upload_and_parse_invoices_batch(
 
 
 @router.post("/invoices/upsert")
-def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
+def hh_ap_invoices_upsert(
+    payload: HHAPInvoiceUpsertRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     if not payload.invoices:
         raise HTTPException(status_code=400, detail="At least one invoice is required")
 
@@ -2932,7 +2938,10 @@ def hh_ap_invoices_upsert(payload: HHAPInvoiceUpsertRequest):
         }
 
 @router.post("/remittances/upsert")
-def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
+def hh_ap_remittances_upsert(
+    payload: HHAPRemittanceUpsertRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         remittance = None
@@ -3083,7 +3092,10 @@ def hh_ap_remittances_upsert(payload: HHAPRemittanceUpsertRequest):
 
 
 @router.post("/statements/upsert")
-def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
+def hh_ap_statements_upsert(
+    payload: HHAPStatementUpsertRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         statement = None
@@ -3238,7 +3250,10 @@ def hh_ap_statements_upsert(payload: HHAPStatementUpsertRequest):
         }
 
 @router.post("/statements/parse-document")
-def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
+def hh_ap_parse_statement_document(
+    payload: HHAPParseStatementDocumentRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
 
@@ -3416,7 +3431,10 @@ def hh_ap_parse_statement_document(payload: HHAPParseStatementDocumentRequest):
 
 
 @router.post("/invoices/parse-document")
-def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
+def hh_ap_parse_invoice_document(
+    payload: HHAPParseInvoiceDocumentRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         allowed_document_types = tuple(get_allowed_invoice_document_types())
@@ -3563,7 +3581,10 @@ def hh_ap_parse_invoice_document(payload: HHAPParseInvoiceDocumentRequest):
         }
 
 @router.post("/remittances/parse-document")
-def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest):
+def hh_ap_parse_remittance_document(
+    payload: HHAPParseRemittanceDocumentRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         allowed_document_types = (DOCUMENT_TYPE_HH_REMITTANCE, DOCUMENT_TYPE_HH_DOCUMENT)
@@ -3742,7 +3763,10 @@ def hh_ap_parse_remittance_document(payload: HHAPParseRemittanceDocumentRequest)
 
 
 @router.post("/match/run")
-def hh_ap_match_run(payload: HHAPMatchRunRequest):
+def hh_ap_match_run(
+    payload: HHAPMatchRunRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+):
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
 

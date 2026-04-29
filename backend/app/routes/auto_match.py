@@ -15,10 +15,11 @@ from datetime import date as DateType
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services_auto_match import (
     TRIGGER_MANUAL,
     get_auto_match_run_detail,
@@ -43,7 +44,10 @@ class RunRequest(BaseModel):
 
 
 @router.post("/run")
-def post_run(body: RunRequest) -> dict[str, Any]:
+def post_run(
+    body: RunRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
     try:
         with db_session() as session:
             return run_auto_match(

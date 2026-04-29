@@ -1,9 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..schemas import (
     CardSettlementActionResponse,
     CardSettlementBatchUpsertRequest,
@@ -85,6 +86,7 @@ def card_settlement_list(
 def card_settlement_upsert(
     request: CardSettlementBatchUpsertRequest,
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> CardSettlementActionResponse:
     try:
         with db_session() as session:
@@ -143,6 +145,7 @@ def card_settlement_set_status(
     request: CardSettlementStatusRequest,
     batch_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> CardSettlementActionResponse:
     try:
         with db_session() as session:
@@ -164,6 +167,7 @@ def card_settlement_match(
     request: CardSettlementMatchRequest,
     batch_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> CardSettlementActionResponse:
     try:
         with db_session() as session:
@@ -187,6 +191,7 @@ def card_settlement_unmatch(
     batch_id: str = Path(...),
     match_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> CardSettlementActionResponse:
     try:
         with db_session() as session:

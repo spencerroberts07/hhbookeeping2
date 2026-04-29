@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..services_bank_csv import (
     get_bank_csv_import_run_detail,
     list_bank_csv_import_runs,
@@ -71,6 +72,7 @@ async def bank_csv_preview(
     source_account_name: str | None = Form(default=None),
     column_map_json: str | None = Form(default=None),
     sample_limit: int = Form(default=20),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     """
     Parse the uploaded CSV and report what WOULD happen on import,
@@ -107,6 +109,7 @@ async def bank_csv_upload(
     source_account_name: str | None = Form(default=None),
     column_map_json: str | None = Form(default=None),
     note: str | None = Form(default=None),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     """
     Import the uploaded CSV into bank_transactions.

@@ -1,9 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from ..db import db_session
+from ..services_auth import require_role
 from ..schemas import (
     DirectVendorAPActionResponse,
     DirectVendorAPDetailResponse,
@@ -93,6 +94,7 @@ def direct_vendor_ap_list(
 def direct_vendor_ap_upsert(
     request: DirectVendorAPInvoiceUpsertRequest,
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> DirectVendorAPActionResponse:
     try:
         with db_session() as session:
@@ -151,6 +153,7 @@ def direct_vendor_ap_set_status(
     request: DirectVendorAPInvoiceStatusRequest,
     invoice_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> DirectVendorAPActionResponse:
     try:
         with db_session() as session:
@@ -172,6 +175,7 @@ def direct_vendor_ap_match(
     request: DirectVendorAPInvoiceMatchRequest,
     invoice_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> DirectVendorAPActionResponse:
     try:
         with db_session() as session:
@@ -195,6 +199,7 @@ def direct_vendor_ap_unmatch(
     invoice_id: str = Path(...),
     match_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> DirectVendorAPActionResponse:
     try:
         with db_session() as session:
