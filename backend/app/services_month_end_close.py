@@ -903,6 +903,38 @@ def _section_payroll(
 
 
 # ----------------------------------------------------------------------
+# Section: POS month-end reports (pos_financial / inventory_value / aged_ar)
+# ----------------------------------------------------------------------
+
+
+def _section_pos_reports(
+    session,
+    entity_id: UUID,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Wraps services_pos_import.section_pos_reports() into the standard
+    section shape. Imported lazily so environments without 014 applied
+    don't fail at import time.
+    """
+    if not _has_table(session, "pos_import_runs"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "pos_import_runs table not present",
+        }
+    from .services_pos_import import section_pos_reports  # noqa: WPS433
+
+    return section_pos_reports(
+        session,
+        entity_id=entity_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
+# ----------------------------------------------------------------------
 # Roll-up
 # ----------------------------------------------------------------------
 
@@ -1037,6 +1069,9 @@ def get_month_end_close_status(
         ),
         "payroll": _section_payroll(
             session, entity_code, period_start, period_end_date
+        ),
+        "pos_reports": _section_pos_reports(
+            session, entity["id"], period_start, period_end_date
         ),
     }
 

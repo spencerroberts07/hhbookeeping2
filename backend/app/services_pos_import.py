@@ -1,0 +1,2099 @@
+"""
+Inventory adjustment + month-end POS import — service layer.
+
+Parses the four month-end reports the store POS exports as fixed-width
+text and persists them to the tables created in
+sql/014_inventory_month_end.sql.
+
+Reports:
+    inventory_adjustment   store_use, donation, etc. — line-level
+    pos_financial          payment-type / sales / COGS / HST totals
+    inventory_value        snapshot of stocked inventory cost & retail
+    aged_ar                house-account aging buckets
+
+Public surface (used by routes/pos_import.py):
+    Parsers (pure functions, no DB):
+        parse_inventory_adjustment_report(text) -> dict
+        parse_pos_financial_report(text)        -> dict
+        parse_inventory_value_report(text)      -> dict
+        parse_aged_ar_report(text)              -> dict
+
+    Importers (parse + persist):
+        import_inventory_adjustment(...)
+        import_pos_financial(...)
+        import_inventory_value(...)
+        import_aged_ar(...)
+
+    Journal builders (run after import):
+        build_store_use_journal(...)
+        build_donation_journal(...)
+
+    Read helpers:
+        list_pos_import_runs(...)
+        get_pos_import_run_detail(...)
+        get_latest_inventory_value_snapshot(...)
+        get_latest_aged_ar_snapshot(...)
+        get_latest_pos_financial_snapshot(...)
+
+Chart-of-accounts mapping (Bridlewood — see
+seeds/Bridlewood_posting_rules_seed.json rule ME-19):
+    1120  Inventory
+    6510  Store Use Supplies expense
+    6695  Charitable Donations expense
+
+The journal builders accept override account codes so other entities
+can use the same module with their own COA.
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import text
+
+from .services import (
+    _has_table,
+    _parse_uuid,
+    get_entity_by_code,
+    get_or_create_accounting_period,
+)
+
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+REPORT_TYPE_INVENTORY_ADJUSTMENT = "inventory_adjustment"
+REPORT_TYPE_POS_FINANCIAL = "pos_financial"
+REPORT_TYPE_INVENTORY_VALUE = "inventory_value"
+REPORT_TYPE_AGED_AR = "aged_ar"
+
+# Adjustment-reason codes the store uses in the inventory adjustment report
+# header. Matched case-insensitively, normalized to uppercase tokens.
+ADJ_REASON_SUPPLIES = "SUPPLIES"
+ADJ_REASON_STORE_USE = "STORE_USE"
+ADJ_REASON_DONATION = "DONATION"
+ADJ_REASON_OTHER = "OTHER"
+
+# Bridlewood default chart-of-accounts mapping for the journal builders.
+DEFAULT_INVENTORY_ACCOUNT_CODE = "1120"
+DEFAULT_STORE_USE_EXPENSE_ACCOUNT_CODE = "6510"
+DEFAULT_DONATION_EXPENSE_ACCOUNT_CODE = "6695"
+
+# journal_batches.source_module + batch_label conventions
+SOURCE_MODULE_POS_IMPORT = "pos_import"
+BATCH_LABEL_STORE_USE = "store_use_inventory_reclass"
+BATCH_LABEL_DONATION = "donation_inventory_reclass"
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def _money(value: Any) -> Decimal:
+    """Best-effort -> Decimal('0.00') for None/blank, else 2-dp Decimal."""
+    if value is None or value == "":
+        return Decimal("0.00")
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0.00")
+
+
+def _money4(value: Any) -> Decimal:
+    """4-dp Decimal — used for per-line adjustment_cost and quantities."""
+    if value is None or value == "":
+        return Decimal("0.0000")
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.0001"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0.0000")
+
+
+def _parse_signed_money_token(token: str) -> Decimal:
+    """
+    Parse a money token that may use trailing-minus convention
+    (e.g. '289.19-') as well as leading-minus and parentheses.
+    Returns Decimal('0') for unparseable input.
+    """
+    if token is None:
+        return Decimal("0")
+    t = str(token).strip().replace(",", "").replace("$", "")
+    if not t:
+        return Decimal("0")
+    negative = False
+    if t.endswith("-"):
+        negative = True
+        t = t[:-1].strip()
+    elif t.startswith("(") and t.endswith(")"):
+        negative = True
+        t = t[1:-1].strip()
+    elif t.startswith("-"):
+        negative = True
+        t = t[1:].strip()
+    try:
+        value = Decimal(t)
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+    return -value if negative else value
+
+
+def _parse_yy_mm_dd(token: str) -> date | None:
+    """Accept YY/MM/DD, YYYY/MM/DD, YYYY-MM-DD, MM/DD/YY, MM/DD/YYYY."""
+    if not token:
+        return None
+    s = str(token).strip()
+    if not s:
+        return None
+    fmts = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%y/%m/%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_reason_token(raw: str) -> str:
+    """SUPPLIES / STORE USE / Store-Use -> STORE_USE; etc."""
+    s = (raw or "").strip().upper()
+    s = re.sub(r"[^A-Z0-9]+", "_", s).strip("_")
+    if not s:
+        return ADJ_REASON_OTHER
+    if "DONAT" in s:
+        return ADJ_REASON_DONATION
+    if "STORE" in s and "USE" in s:
+        return ADJ_REASON_STORE_USE
+    if "SUPPL" in s:
+        return ADJ_REASON_SUPPLIES
+    return s
+
+
+def _coalesce_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_lines(file_text: str) -> list[str]:
+    """Normalize line endings and return the raw lines (preserve spacing)."""
+    return file_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+# --------------------------------------------------------------------------
+# Parser — Inventory Adjustment Report
+# --------------------------------------------------------------------------
+
+
+# Field column positions (0-based, [start, end)) per the user's spec:
+#     SKU(7) Description(36) Date(8) Quantity(10) QtyAfter(10)
+#     AdjustmentCost(15) ReasonDesc(30) EmpID(8)
+# We allow some slack: each field is whitespace-trimmed after slicing,
+# and a fallback whitespace-split parser kicks in if the row is shorter
+# than expected.
+_INV_ADJ_SLICES = [
+    ("sku_number", 0, 7),
+    ("description", 7, 43),
+    ("date_adjusted", 43, 51),
+    ("quantity_adjusted", 51, 61),
+    ("quantity_after", 61, 71),
+    ("adjustment_cost", 71, 86),
+    ("reason_description", 86, 116),
+    ("employee_id", 116, 124),
+]
+
+_RE_TOTAL_FOR_REPORT = re.compile(
+    r"^\s*Total\s+For\s+Report\s*[:.]?\s*([\-\(\)\$0-9,\.]+\-?)",
+    re.IGNORECASE,
+)
+_RE_ADJ_REASON_HEADER = re.compile(
+    r"Adjustment\s+Reason\s*[:.]?\s*(.+)$", re.IGNORECASE
+)
+_RE_FROM_DATE = re.compile(r"From\s+Date\s*[:.]?\s*([0-9/\-]+)", re.IGNORECASE)
+_RE_TO_DATE = re.compile(r"To\s+Date\s*[:.]?\s*([0-9/\-]+)", re.IGNORECASE)
+_RE_STORE_LABEL = re.compile(r"Store\s*[:.]?\s*([^\s].*?)\s*$", re.IGNORECASE)
+# A data line must start with a 5-7 digit SKU (Prism SKUs are commonly
+# 6-7 digits). MFG-number continuation lines are indented and contain
+# only the MFG token, no date/quantity columns.
+_RE_DATA_ROW_START = re.compile(r"^\s*(\d{4,8})\s")
+_RE_MFG_LINE = re.compile(
+    r"^\s*(?:MFG\s*[#:]?\s*)?([A-Za-z0-9\-./]+)\s*$"
+)
+
+
+def parse_inventory_adjustment_report(file_text: str) -> dict[str, Any]:
+    """
+    Parse a fixed-width Inventory Adjustment Report.
+
+    Returns:
+        {
+            "store_label": str | None,
+            "adjustment_reason": str        # normalized: SUPPLIES/STORE_USE/DONATION/OTHER
+            "adjustment_reason_raw": str,
+            "period_start": date | None,
+            "period_end": date | None,
+            "total_for_report": Decimal,
+            "lines": [
+                {
+                    "sku_number": str,
+                    "description": str,
+                    "mfg_number": str | None,
+                    "date_adjusted": date | None,
+                    "quantity_adjusted": Decimal,
+                    "quantity_after": Decimal,
+                    "adjustment_cost": Decimal,
+                    "reason_description": str | None,
+                    "employee_id": str | None,
+                },
+                ...
+            ],
+            "employee_summary": [{"employee_id": str, "total_cost": Decimal}, ...],
+            "warnings": [str, ...],
+        }
+    """
+    raw_lines = _split_lines(file_text or "")
+
+    store_label: str | None = None
+    adjustment_reason_raw: str | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+    total_for_report = Decimal("0.00")
+    lines: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    # First pass: header fields anywhere in first ~30 lines.
+    for raw in raw_lines[:60]:
+        if adjustment_reason_raw is None:
+            m = _RE_ADJ_REASON_HEADER.search(raw)
+            if m:
+                adjustment_reason_raw = m.group(1).strip()
+        if period_start is None:
+            m = _RE_FROM_DATE.search(raw)
+            if m:
+                period_start = _parse_yy_mm_dd(m.group(1))
+        if period_end is None:
+            m = _RE_TO_DATE.search(raw)
+            if m:
+                period_end = _parse_yy_mm_dd(m.group(1))
+        if store_label is None:
+            stripped = raw.strip()
+            if stripped.lower().startswith("store"):
+                m = _RE_STORE_LABEL.search(stripped)
+                if m and not _RE_ADJ_REASON_HEADER.search(stripped):
+                    store_label = m.group(1).strip() or None
+
+    # Second pass: data rows + total line. We track the "current" line so a
+    # following indented MFG line can attach to the most recent data row.
+    current: dict[str, Any] | None = None
+    in_employee_summary = False
+    employee_summary: list[dict[str, Any]] = []
+
+    for raw in raw_lines:
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+
+        # Total for report
+        m_tot = _RE_TOTAL_FOR_REPORT.search(line)
+        if m_tot:
+            total_for_report = _parse_signed_money_token(m_tot.group(1))
+            in_employee_summary = True
+            current = None
+            continue
+
+        # Employee summary table comes after the totals line. We don't need
+        # rich parsing — capture (employee_id, total_cost) pairs.
+        if in_employee_summary:
+            tokens = line.split()
+            # Expect "<EMP_ID> .... <amount>"
+            if len(tokens) >= 2:
+                amount = _parse_signed_money_token(tokens[-1])
+                if amount != Decimal("0"):
+                    emp_id = tokens[0]
+                    if not emp_id.isdigit() and len(emp_id) > 32:
+                        # not a sane row
+                        continue
+                    employee_summary.append(
+                        {"employee_id": emp_id, "total_cost": amount}
+                    )
+            continue
+
+        # Looks like a data row?
+        if _RE_DATA_ROW_START.match(line):
+            row: dict[str, Any] = {}
+            for field, start, end in _INV_ADJ_SLICES:
+                row[field] = line[start:end].strip() if len(line) >= start else ""
+
+            sku = row["sku_number"]
+            if not sku:
+                continue
+
+            row_data: dict[str, Any] = {
+                "sku_number": sku,
+                "description": row["description"] or None,
+                "mfg_number": None,
+                "date_adjusted": _parse_yy_mm_dd(row["date_adjusted"]),
+                "quantity_adjusted": _money4(
+                    row["quantity_adjusted"].replace(",", "")
+                ),
+                "quantity_after": _money4(row["quantity_after"].replace(",", "")),
+                "adjustment_cost": _parse_signed_money_token(row["adjustment_cost"]),
+                "reason_description": row["reason_description"] or None,
+                "employee_id": row["employee_id"] or None,
+            }
+
+            # If the row is short and the slices yielded almost nothing,
+            # fall back to whitespace-split parsing.
+            if (
+                row_data["adjustment_cost"] == Decimal("0")
+                and row_data["date_adjusted"] is None
+            ):
+                tokens = line.split()
+                if len(tokens) >= 5:
+                    fallback_sku = tokens[0]
+                    # heuristic: last token = employee_id, second last = reason desc?
+                    # last numeric-ish from end = adjustment_cost
+                    cost_token = None
+                    cost_idx = None
+                    for i in range(len(tokens) - 1, 0, -1):
+                        guess = _parse_signed_money_token(tokens[i])
+                        if guess != Decimal("0") or re.match(
+                            r"^[\-\(\)\$0-9,\.]+$", tokens[i]
+                        ):
+                            cost_token = tokens[i]
+                            cost_idx = i
+                            break
+                    if cost_token is not None and cost_idx is not None:
+                        row_data["sku_number"] = fallback_sku
+                        row_data["adjustment_cost"] = _parse_signed_money_token(
+                            cost_token
+                        )
+                        # description = tokens between sku and a date-looking token
+                        date_token_idx = None
+                        for i in range(1, cost_idx):
+                            if _parse_yy_mm_dd(tokens[i]) is not None:
+                                date_token_idx = i
+                                break
+                        if date_token_idx is not None:
+                            row_data["date_adjusted"] = _parse_yy_mm_dd(
+                                tokens[date_token_idx]
+                            )
+                            row_data["description"] = " ".join(
+                                tokens[1:date_token_idx]
+                            ) or None
+                        else:
+                            row_data["description"] = " ".join(
+                                tokens[1:cost_idx]
+                            ) or None
+
+            current = row_data
+            lines.append(row_data)
+            continue
+
+        # MFG continuation row (indented, no leading SKU digits)
+        if current is not None and not _RE_DATA_ROW_START.match(line):
+            mfg_match = _RE_MFG_LINE.match(line)
+            if mfg_match:
+                token = mfg_match.group(1)
+                if token and not token.lower().startswith(("date", "from", "to", "page")):
+                    current["mfg_number"] = token
+                    continue
+
+    if adjustment_reason_raw is None:
+        warnings.append("Adjustment Reason header not found")
+    if not lines:
+        warnings.append("No inventory adjustment data rows parsed")
+
+    return {
+        "store_label": store_label,
+        "adjustment_reason": _normalize_reason_token(adjustment_reason_raw or ""),
+        "adjustment_reason_raw": adjustment_reason_raw,
+        "period_start": period_start,
+        "period_end": period_end,
+        "total_for_report": total_for_report,
+        "lines": lines,
+        "employee_summary": employee_summary,
+        "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# Parser — POS Financial History Report
+# --------------------------------------------------------------------------
+
+
+# Each tender / sales / COGS / tax line in the POS Financial Report is:
+#     <left-justified label>   <debit>   <credit>   <count>
+# We normalize the label by lower-casing and stripping non-letters
+# to match against canonical keys.
+_POS_FINANCIAL_LABEL_MAP: dict[str, str] = {
+    # Tender (debit-side)
+    "cash": "cash_amount",
+    "cheque": "cheque_amount",
+    "check": "cheque_amount",
+    "visanet": "visa_net",
+    "mastercardnet": "mastercard_net",
+    "debitcardsnet": "debit_net",
+    "debitnet": "debit_net",
+    "americanexpressnet": "amex_net",
+    "amexnet": "amex_net",
+    "ecommercenet": "ecommerce_net",
+    "giftcardsnet": "gift_card_net",
+    "giftcardnet": "gift_card_net",
+    # Sales / COGS / tax (credit-side)
+    "merchandisesalesother": "merchandise_sales",
+    "merchandisesalesha": "non_merchandise_sales",
+    "merchandisesales": "merchandise_sales",
+    "nonmerchandisesales": "non_merchandise_sales",
+    "costofgoodssold": "cogs_merchandise",
+    "costofgoodssoldnonmerchandise": "cogs_non_merchandise",
+    "hst": "hst_collected",
+    "hst5": "hst_5pct",
+    "hst5pct": "hst_5pct",
+}
+
+# Period range from the report header
+_RE_POS_PERIOD = re.compile(
+    r"(?:From|Date\s*Range)\s*[:.]?\s*"
+    r"([0-9/\-]+)\s*(?:to|through|-|–|—)\s*([0-9/\-]+)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_pos_label(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (raw or "").lower())
+
+
+def parse_pos_financial_report(file_text: str) -> dict[str, Any]:
+    """
+    Parse the POS Financial History Report.
+
+    Strategy:
+        - Walk the lines top to bottom.
+        - Lines that have a label on the left and 2-3 right-aligned
+          numeric columns are treated as data.
+        - Map the label (after normalization) to a canonical field via
+          _POS_FINANCIAL_LABEL_MAP. Unmapped labels go into other_tender_json.
+        - Track the running debit / credit totals so we can flag is_balanced.
+        - Detect period_start / period_end from a "From: X to Y" header.
+
+    Returns:
+        {
+            "period_start": date | None,
+            "period_end": date | None,
+            "fields": dict[str, Decimal],          # canonical -> amount
+            "house_account_debit": Decimal,
+            "house_account_credit": Decimal,
+            "other_tender": dict[str, Decimal],    # raw_label -> debit-credit
+            "total_debit_side": Decimal,
+            "total_credit_side": Decimal,
+            "is_balanced": bool,
+            "warnings": list[str],
+            "raw_rows": list[dict],
+        }
+    """
+    raw_lines = _split_lines(file_text or "")
+
+    period_start: date | None = None
+    period_end: date | None = None
+    fields: dict[str, Decimal] = {}
+    other_tender: dict[str, Decimal] = {}
+    house_account_debit = Decimal("0.00")
+    house_account_credit = Decimal("0.00")
+    total_debit_side = Decimal("0.00")
+    total_credit_side = Decimal("0.00")
+    raw_rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    # Header period
+    for raw in raw_lines[:50]:
+        m = _RE_POS_PERIOD.search(raw)
+        if m:
+            period_start = _parse_yy_mm_dd(m.group(1))
+            period_end = _parse_yy_mm_dd(m.group(2))
+            if period_start or period_end:
+                break
+
+    # Money token regex — fixed-width money: optional $, digits/commas, dot,
+    # cents, optional trailing minus or parentheses.
+    money_token_re = re.compile(
+        r"\(?-?\$?-?[\d,]*\.\d{2}\-?\)?"
+    )
+
+    for raw in raw_lines:
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        # Skip obvious header/footer noise
+        lower = line.lower()
+        if any(
+            tag in lower
+            for tag in (
+                "page ",
+                "report id",
+                "store ",
+                "from date",
+                "to date",
+            )
+        ):
+            continue
+        # Find numeric tokens
+        tokens = money_token_re.findall(line)
+        if not tokens:
+            continue
+        # Label is everything to the left of the first numeric token.
+        first_token = tokens[0]
+        first_idx = line.find(first_token)
+        if first_idx <= 0:
+            continue
+        label_raw = line[:first_idx].strip()
+        if not label_raw:
+            continue
+        # Drop anything that's clearly not a tender/sales label
+        norm_label = _normalize_pos_label(label_raw)
+        if not norm_label:
+            continue
+
+        # Numeric columns: <debit> <credit> <count?> — sometimes only one
+        # of (debit, credit) is non-zero. Normalize zero/blank to 0.
+        nums = [_parse_signed_money_token(t) for t in tokens]
+        # The "count" column (if present) is integer-like and not money.
+        # Heuristic: drop trailing tokens that have no decimal.
+        debit_amount = nums[0] if len(nums) >= 1 else Decimal("0")
+        credit_amount = nums[1] if len(nums) >= 2 else Decimal("0")
+
+        raw_rows.append(
+            {
+                "label": label_raw,
+                "label_normalized": norm_label,
+                "debit": str(debit_amount),
+                "credit": str(credit_amount),
+            }
+        )
+
+        # House Account is special: debit (charges) + credit (payments) live
+        # on the same row but go to different DB columns.
+        if "houseaccount" in norm_label:
+            house_account_debit += debit_amount
+            house_account_credit += credit_amount
+            total_debit_side += debit_amount
+            total_credit_side += credit_amount
+            continue
+
+        canonical = _POS_FINANCIAL_LABEL_MAP.get(norm_label)
+        if canonical:
+            net = debit_amount - credit_amount
+            # For credit-side rows (sales, COGS, HST), the magnitude is
+            # the credit amount. For debit-side (tender), the magnitude
+            # is the debit amount. We store the absolute net under the
+            # canonical name; sign convention: positive = the natural
+            # direction for that column.
+            if canonical in {
+                "merchandise_sales",
+                "non_merchandise_sales",
+                "cogs_merchandise",
+                "cogs_non_merchandise",
+                "hst_collected",
+                "hst_5pct",
+            }:
+                fields[canonical] = (
+                    fields.get(canonical, Decimal("0.00")) + credit_amount
+                )
+            else:
+                fields[canonical] = (
+                    fields.get(canonical, Decimal("0.00")) + debit_amount
+                )
+        else:
+            net = debit_amount - credit_amount
+            other_tender[label_raw] = (
+                other_tender.get(label_raw, Decimal("0.00")) + net
+            )
+
+        total_debit_side += debit_amount
+        total_credit_side += credit_amount
+
+    is_balanced = (
+        total_debit_side != Decimal("0")
+        and abs(total_debit_side - total_credit_side) < Decimal("0.05")
+    )
+    if not is_balanced:
+        warnings.append(
+            "POS Financial debit total does not equal credit total: "
+            f"debit={total_debit_side} credit={total_credit_side}"
+        )
+
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "fields": fields,
+        "house_account_debit": house_account_debit,
+        "house_account_credit": house_account_credit,
+        "other_tender": other_tender,
+        "total_debit_side": total_debit_side,
+        "total_credit_side": total_credit_side,
+        "is_balanced": is_balanced,
+        "warnings": warnings,
+        "raw_rows": raw_rows,
+    }
+
+
+# --------------------------------------------------------------------------
+# Parser — Inventory Value Report
+# --------------------------------------------------------------------------
+
+
+_RE_INV_VALUE_TOTAL = re.compile(
+    r"^\s*Total\s+For\s+Report\s*[:.]?\s*(.+)$", re.IGNORECASE
+)
+_RE_INV_VALUE_AS_OF = re.compile(
+    r"(?:As\s+of|Snapshot\s+Date|Report\s+Date)\s*[:.]?\s*([0-9/\-]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_inventory_value_report(file_text: str) -> dict[str, Any]:
+    """
+    Parse the Current Stocked Inventory Value Report.
+
+    The body is a per-department summary with columns:
+        Dept Description Qty Cost Retail GM$ GM%
+
+    We split on whitespace from the right (GM%, GM$, Retail, Cost, Qty)
+    so a multi-word department description is preserved on the left.
+    """
+    raw_lines = _split_lines(file_text or "")
+
+    snapshot_date: date | None = None
+    departments: list[dict[str, Any]] = []
+    total_sku_count: int | None = None
+    total_cost_value = Decimal("0.00")
+    total_retail_value = Decimal("0.00")
+    total_gm_dollars = Decimal("0.00")
+    total_gm_pct: Decimal | None = None
+    warnings: list[str] = []
+
+    for raw in raw_lines[:60]:
+        m = _RE_INV_VALUE_AS_OF.search(raw)
+        if m:
+            snapshot_date = _parse_yy_mm_dd(m.group(1))
+            if snapshot_date:
+                break
+
+    money_token_re = re.compile(r"-?\$?-?[\d,]*\.\d{1,4}\-?")
+    pct_token_re = re.compile(r"-?\d{1,3}\.\d{1,2}\s*%?")
+
+    for raw in raw_lines:
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+
+        m_total = _RE_INV_VALUE_TOTAL.search(line)
+        if m_total:
+            tail = m_total.group(1)
+            tokens = tail.split()
+            # Walk from the right: GM% (often "%" suffix), GM$, Retail, Cost, Qty
+            try:
+                if tokens:
+                    last = tokens[-1].rstrip("%")
+                    total_gm_pct = _money4(last) if "." in last else None
+                if len(tokens) >= 2:
+                    total_gm_dollars = _parse_signed_money_token(tokens[-2])
+                if len(tokens) >= 3:
+                    total_retail_value = _parse_signed_money_token(tokens[-3])
+                if len(tokens) >= 4:
+                    total_cost_value = _parse_signed_money_token(tokens[-4])
+                if len(tokens) >= 5:
+                    total_sku_count = _coalesce_int(tokens[-5])
+            except Exception as exc:
+                warnings.append(f"Failed to parse Total For Report tail: {exc}")
+            continue
+
+        # Department row: starts with a 1-4 digit dept code
+        m_dept = re.match(r"^\s*(\d{1,4})\s+(.+)$", line)
+        if not m_dept:
+            continue
+        dept_code = m_dept.group(1)
+        rest = m_dept.group(2)
+
+        nums = money_token_re.findall(rest)
+        pct_match = pct_token_re.search(rest)
+        if len(nums) < 2:
+            # Probably a header row, skip
+            continue
+        gm_pct = None
+        if pct_match:
+            try:
+                gm_pct = Decimal(pct_match.group(0).rstrip("%").strip())
+            except (InvalidOperation, ValueError):
+                gm_pct = None
+
+        # Right-most numbers are: ... Cost Retail GM$ (and GM% via pct_match)
+        right_nums = [_parse_signed_money_token(t) for t in nums[-4:]]
+        # Pad to 4 from the left
+        while len(right_nums) < 4:
+            right_nums.insert(0, Decimal("0"))
+        qty, cost, retail, gm_dollars = right_nums
+
+        # Description is whatever's left after stripping the trailing numerics
+        # and the (optional) percent token.
+        desc = rest
+        for t in nums[-4:]:
+            desc = desc.rsplit(t, 1)[0]
+        if pct_match:
+            desc = desc.replace(pct_match.group(0), "")
+        desc = desc.strip()
+
+        departments.append(
+            {
+                "dept_code": dept_code,
+                "description": desc or None,
+                "qty": qty,
+                "cost": cost,
+                "retail": retail,
+                "gm_dollars": gm_dollars,
+                "gm_pct": gm_pct,
+            }
+        )
+
+    if not departments:
+        warnings.append("No department rows parsed in Inventory Value Report")
+
+    return {
+        "snapshot_date": snapshot_date,
+        "departments": departments,
+        "total_sku_count": total_sku_count,
+        "total_cost_value": total_cost_value,
+        "total_retail_value": total_retail_value,
+        "total_gm_dollars": total_gm_dollars,
+        "total_gm_pct": total_gm_pct,
+        "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# Parser — Aged AR Report
+# --------------------------------------------------------------------------
+
+
+_RE_AGED_TOTALS = re.compile(r"^\s*Totals?\s*[:.]?\s*(.*)$", re.IGNORECASE)
+_RE_AGED_AS_OF = re.compile(
+    r"(?:As\s+of|Aging\s+Date|Report\s+Date|Snapshot\s+Date)\s*[:.]?\s*([0-9/\-]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_aged_ar_report(file_text: str) -> dict[str, Any]:
+    """
+    Parse the Aged AR Report.
+
+    Customer rows look like:
+        <CustNum> <Name>          <Total> <Current> <30+> <60+> <90+> <120+> <CrLim>
+
+    Credit balances may be shown with a trailing minus ("289.19-").
+    """
+    raw_lines = _split_lines(file_text or "")
+
+    snapshot_date: date | None = None
+    customers: list[dict[str, Any]] = []
+    total_ar = Decimal("0.00")
+    current_amount = Decimal("0.00")
+    over_30 = Decimal("0.00")
+    over_60 = Decimal("0.00")
+    over_90 = Decimal("0.00")
+    over_120 = Decimal("0.00")
+    warnings: list[str] = []
+
+    for raw in raw_lines[:50]:
+        m = _RE_AGED_AS_OF.search(raw)
+        if m:
+            snapshot_date = _parse_yy_mm_dd(m.group(1))
+            if snapshot_date:
+                break
+
+    money_token_re = re.compile(r"-?[\d,]*\.\d{2}\-?")
+
+    for raw in raw_lines:
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+
+        # Totals row
+        m_tot = _RE_AGED_TOTALS.match(line)
+        if m_tot:
+            tail = m_tot.group(1)
+            tokens = money_token_re.findall(tail)
+            # Expect [total, current, 30, 60, 90, 120, (cr_lim?)]
+            parsed = [_parse_signed_money_token(t) for t in tokens]
+            if len(parsed) >= 6:
+                total_ar, current_amount, over_30, over_60, over_90, over_120 = parsed[:6]
+            elif len(parsed) >= 1:
+                total_ar = parsed[0]
+                if len(parsed) >= 2:
+                    current_amount = parsed[1]
+            continue
+
+        # Customer row: starts with cust num (digits or alphanumeric)
+        m_row = re.match(r"^\s*([A-Za-z0-9\-]{1,12})\s+(.+)$", line)
+        if not m_row:
+            continue
+        cust_num = m_row.group(1)
+        rest = m_row.group(2)
+
+        # Skip header-ish rows that don't contain money tokens
+        nums = money_token_re.findall(rest)
+        if len(nums) < 2:
+            continue
+
+        parsed_nums = [_parse_signed_money_token(t) for t in nums]
+        # Customer rows have 6 aging columns (Total, Current, 30+, 60+,
+        # 90+, 120+) optionally followed by a 7th "credit limit" column.
+        # Drop the trailing credit-limit if present so we always read the
+        # 6 aging columns from the LEFT side of the numeric run.
+        if len(parsed_nums) >= 7:
+            right = parsed_nums[:6]
+        else:
+            right = parsed_nums[-6:]
+        while len(right) < 6:
+            right.insert(0, Decimal("0"))
+        c_total, c_current, c_30, c_60, c_90, c_120 = right
+
+        # Customer name = rest with the trailing numeric/cr_lim tokens
+        # stripped from the right.
+        name = rest
+        for t in nums:
+            name = name.rsplit(t, 1)[0]
+        name = name.strip()
+
+        customers.append(
+            {
+                "customer_number": cust_num,
+                "customer_name": name or None,
+                "total": c_total,
+                "current": c_current,
+                "over_30": c_30,
+                "over_60": c_60,
+                "over_90": c_90,
+                "over_120": c_120,
+            }
+        )
+
+    if not customers:
+        warnings.append("No customer rows parsed in Aged AR Report")
+
+    return {
+        "snapshot_date": snapshot_date,
+        "customers": customers,
+        "total_ar": total_ar,
+        "current_amount": current_amount,
+        "over_30": over_30,
+        "over_60": over_60,
+        "over_90": over_90,
+        "over_120": over_120,
+        "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# Persistence helpers
+# --------------------------------------------------------------------------
+
+
+def _resolve_entity_or_raise(session, entity_code: str) -> dict[str, Any]:
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+    return dict(entity)
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    return _money(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """Decimals -> str, dates -> ISO. Used before json.dumps()."""
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _insert_pos_import_run(
+    session,
+    *,
+    entity_id: UUID,
+    accounting_period_id: UUID | None,
+    report_type: str,
+    period_start: date | None,
+    period_end: date | None,
+    file_name: str,
+    adjustment_reason: str | None,
+    total_amount: Decimal | None,
+    row_count: int,
+    parsed_data: dict[str, Any],
+    raw_text: str,
+    actor_email: str,
+) -> UUID:
+    row = session.execute(
+        text(
+            """
+            INSERT INTO pos_import_runs (
+                entity_id, accounting_period_id, report_type,
+                period_start, period_end, file_name,
+                adjustment_reason, total_amount, row_count,
+                parsed_data_json, raw_text, actor_email
+            ) VALUES (
+                :entity_id, :accounting_period_id, :report_type,
+                :period_start, :period_end, :file_name,
+                :adjustment_reason, :total_amount, :row_count,
+                CAST(:parsed_data_json AS jsonb), :raw_text, :actor_email
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "accounting_period_id": accounting_period_id,
+            "report_type": report_type,
+            "period_start": period_start,
+            "period_end": period_end,
+            "file_name": file_name,
+            "adjustment_reason": adjustment_reason,
+            "total_amount": total_amount,
+            "row_count": row_count,
+            "parsed_data_json": json.dumps(_json_safe(parsed_data)),
+            "raw_text": raw_text,
+            "actor_email": actor_email,
+        },
+    ).mappings().first()
+    return row["id"]
+
+
+# --------------------------------------------------------------------------
+# Importer — Inventory Adjustment
+# --------------------------------------------------------------------------
+
+
+def import_inventory_adjustment(
+    session,
+    *,
+    entity_code: str,
+    file_text: str,
+    file_name: str,
+    actor_email: str,
+) -> dict[str, Any]:
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = _resolve_entity_or_raise(session, entity_code)
+    parsed = parse_inventory_adjustment_report(file_text)
+
+    period_end = parsed["period_end"] or parsed["period_start"]
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], period_end
+    )
+
+    run_id = _insert_pos_import_run(
+        session,
+        entity_id=entity["id"],
+        accounting_period_id=accounting_period_id,
+        report_type=REPORT_TYPE_INVENTORY_ADJUSTMENT,
+        period_start=parsed["period_start"],
+        period_end=parsed["period_end"],
+        file_name=file_name,
+        adjustment_reason=parsed["adjustment_reason"],
+        total_amount=_money(parsed["total_for_report"]),
+        row_count=len(parsed["lines"]),
+        parsed_data={
+            "store_label": parsed["store_label"],
+            "adjustment_reason_raw": parsed["adjustment_reason_raw"],
+            "employee_summary": parsed["employee_summary"],
+            "warnings": parsed["warnings"],
+        },
+        raw_text=file_text,
+        actor_email=actor_email,
+    )
+
+    for ln in parsed["lines"]:
+        session.execute(
+            text(
+                """
+                INSERT INTO inventory_adjustment_lines (
+                    entity_id, import_run_id, accounting_period_id,
+                    sku_number, description, mfg_number,
+                    date_adjusted, quantity_adjusted, quantity_after,
+                    adjustment_cost, adjustment_reason,
+                    reason_description, employee_id
+                ) VALUES (
+                    :entity_id, :import_run_id, :accounting_period_id,
+                    :sku_number, :description, :mfg_number,
+                    :date_adjusted, :quantity_adjusted, :quantity_after,
+                    :adjustment_cost, :adjustment_reason,
+                    :reason_description, :employee_id
+                )
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "import_run_id": run_id,
+                "accounting_period_id": accounting_period_id,
+                "sku_number": ln["sku_number"],
+                "description": ln["description"],
+                "mfg_number": ln["mfg_number"],
+                "date_adjusted": ln["date_adjusted"],
+                "quantity_adjusted": ln["quantity_adjusted"],
+                "quantity_after": ln["quantity_after"],
+                "adjustment_cost": ln["adjustment_cost"],
+                "adjustment_reason": parsed["adjustment_reason"],
+                "reason_description": ln["reason_description"],
+                "employee_id": ln["employee_id"],
+            },
+        )
+
+    return {
+        "run_id": str(run_id),
+        "entity_code": entity_code,
+        "report_type": REPORT_TYPE_INVENTORY_ADJUSTMENT,
+        "adjustment_reason": parsed["adjustment_reason"],
+        "adjustment_reason_raw": parsed["adjustment_reason_raw"],
+        "period_start": parsed["period_start"].isoformat() if parsed["period_start"] else None,
+        "period_end": parsed["period_end"].isoformat() if parsed["period_end"] else None,
+        "line_count": len(parsed["lines"]),
+        "total_for_report": str(parsed["total_for_report"]),
+        "warnings": parsed["warnings"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Importer — POS Financial
+# --------------------------------------------------------------------------
+
+
+def import_pos_financial(
+    session,
+    *,
+    entity_code: str,
+    file_text: str,
+    file_name: str,
+    actor_email: str,
+) -> dict[str, Any]:
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = _resolve_entity_or_raise(session, entity_code)
+    parsed = parse_pos_financial_report(file_text)
+
+    if not parsed["period_start"] or not parsed["period_end"]:
+        raise ValueError(
+            "POS Financial Report did not contain a parseable period range. "
+            "Expected a 'From: <date> to <date>' header."
+        )
+
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], parsed["period_end"]
+    )
+
+    fields = parsed["fields"]
+    run_id = _insert_pos_import_run(
+        session,
+        entity_id=entity["id"],
+        accounting_period_id=accounting_period_id,
+        report_type=REPORT_TYPE_POS_FINANCIAL,
+        period_start=parsed["period_start"],
+        period_end=parsed["period_end"],
+        file_name=file_name,
+        adjustment_reason=None,
+        total_amount=_money(parsed["total_credit_side"]),
+        row_count=len(parsed["raw_rows"]),
+        parsed_data={
+            "raw_rows": parsed["raw_rows"],
+            "warnings": parsed["warnings"],
+        },
+        raw_text=file_text,
+        actor_email=actor_email,
+    )
+
+    snap = session.execute(
+        text(
+            """
+            INSERT INTO pos_financial_snapshots (
+                entity_id, import_run_id, accounting_period_id,
+                period_start, period_end,
+                cash_amount, cheque_amount, visa_net, mastercard_net,
+                debit_net, amex_net,
+                house_account_debit, house_account_credit,
+                gift_card_net, ecommerce_net, other_tender_json,
+                merchandise_sales, non_merchandise_sales,
+                cogs_merchandise, cogs_non_merchandise,
+                hst_collected, hst_5pct,
+                total_debit_side, total_credit_side, is_balanced,
+                raw_parsed_json
+            ) VALUES (
+                :entity_id, :import_run_id, :accounting_period_id,
+                :period_start, :period_end,
+                :cash_amount, :cheque_amount, :visa_net, :mastercard_net,
+                :debit_net, :amex_net,
+                :house_account_debit, :house_account_credit,
+                :gift_card_net, :ecommerce_net, CAST(:other_tender_json AS jsonb),
+                :merchandise_sales, :non_merchandise_sales,
+                :cogs_merchandise, :cogs_non_merchandise,
+                :hst_collected, :hst_5pct,
+                :total_debit_side, :total_credit_side, :is_balanced,
+                CAST(:raw_parsed_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, period_start, period_end)
+            DO UPDATE SET
+                import_run_id        = EXCLUDED.import_run_id,
+                accounting_period_id = EXCLUDED.accounting_period_id,
+                cash_amount          = EXCLUDED.cash_amount,
+                cheque_amount        = EXCLUDED.cheque_amount,
+                visa_net             = EXCLUDED.visa_net,
+                mastercard_net       = EXCLUDED.mastercard_net,
+                debit_net            = EXCLUDED.debit_net,
+                amex_net             = EXCLUDED.amex_net,
+                house_account_debit  = EXCLUDED.house_account_debit,
+                house_account_credit = EXCLUDED.house_account_credit,
+                gift_card_net        = EXCLUDED.gift_card_net,
+                ecommerce_net        = EXCLUDED.ecommerce_net,
+                other_tender_json    = EXCLUDED.other_tender_json,
+                merchandise_sales    = EXCLUDED.merchandise_sales,
+                non_merchandise_sales= EXCLUDED.non_merchandise_sales,
+                cogs_merchandise     = EXCLUDED.cogs_merchandise,
+                cogs_non_merchandise = EXCLUDED.cogs_non_merchandise,
+                hst_collected        = EXCLUDED.hst_collected,
+                hst_5pct             = EXCLUDED.hst_5pct,
+                total_debit_side     = EXCLUDED.total_debit_side,
+                total_credit_side    = EXCLUDED.total_credit_side,
+                is_balanced          = EXCLUDED.is_balanced,
+                raw_parsed_json      = EXCLUDED.raw_parsed_json
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "import_run_id": run_id,
+            "accounting_period_id": accounting_period_id,
+            "period_start": parsed["period_start"],
+            "period_end": parsed["period_end"],
+            "cash_amount": _money(fields.get("cash_amount", 0)),
+            "cheque_amount": _money(fields.get("cheque_amount", 0)),
+            "visa_net": _money(fields.get("visa_net", 0)),
+            "mastercard_net": _money(fields.get("mastercard_net", 0)),
+            "debit_net": _money(fields.get("debit_net", 0)),
+            "amex_net": _money(fields.get("amex_net", 0)),
+            "house_account_debit": _money(parsed["house_account_debit"]),
+            "house_account_credit": _money(parsed["house_account_credit"]),
+            "gift_card_net": _money(fields.get("gift_card_net", 0)),
+            "ecommerce_net": _money(fields.get("ecommerce_net", 0)),
+            "other_tender_json": json.dumps(_json_safe(parsed["other_tender"])),
+            "merchandise_sales": _money(fields.get("merchandise_sales", 0)),
+            "non_merchandise_sales": _money(fields.get("non_merchandise_sales", 0)),
+            "cogs_merchandise": _money(fields.get("cogs_merchandise", 0)),
+            "cogs_non_merchandise": _money(fields.get("cogs_non_merchandise", 0)),
+            "hst_collected": _money(fields.get("hst_collected", 0)),
+            "hst_5pct": _money(fields.get("hst_5pct", 0)),
+            "total_debit_side": _money(parsed["total_debit_side"]),
+            "total_credit_side": _money(parsed["total_credit_side"]),
+            "is_balanced": parsed["is_balanced"],
+            "raw_parsed_json": json.dumps(_json_safe(parsed["raw_rows"])),
+        },
+    ).mappings().first()
+
+    return {
+        "run_id": str(run_id),
+        "snapshot_id": str(snap["id"]) if snap else None,
+        "entity_code": entity_code,
+        "report_type": REPORT_TYPE_POS_FINANCIAL,
+        "period_start": parsed["period_start"].isoformat(),
+        "period_end": parsed["period_end"].isoformat(),
+        "is_balanced": parsed["is_balanced"],
+        "total_debit_side": str(parsed["total_debit_side"]),
+        "total_credit_side": str(parsed["total_credit_side"]),
+        "warnings": parsed["warnings"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Importer — Inventory Value
+# --------------------------------------------------------------------------
+
+
+def import_inventory_value(
+    session,
+    *,
+    entity_code: str,
+    file_text: str,
+    file_name: str,
+    actor_email: str,
+    snapshot_date_override: date | None = None,
+) -> dict[str, Any]:
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = _resolve_entity_or_raise(session, entity_code)
+    parsed = parse_inventory_value_report(file_text)
+
+    snapshot_date = snapshot_date_override or parsed["snapshot_date"]
+    if not snapshot_date:
+        raise ValueError(
+            "Inventory Value Report did not contain a parseable snapshot "
+            "date. Pass snapshot_date_override or fix the report header."
+        )
+
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], snapshot_date
+    )
+
+    run_id = _insert_pos_import_run(
+        session,
+        entity_id=entity["id"],
+        accounting_period_id=accounting_period_id,
+        report_type=REPORT_TYPE_INVENTORY_VALUE,
+        period_start=snapshot_date,
+        period_end=snapshot_date,
+        file_name=file_name,
+        adjustment_reason=None,
+        total_amount=_money(parsed["total_cost_value"]),
+        row_count=len(parsed["departments"]),
+        parsed_data={
+            "departments": parsed["departments"],
+            "warnings": parsed["warnings"],
+        },
+        raw_text=file_text,
+        actor_email=actor_email,
+    )
+
+    snap = session.execute(
+        text(
+            """
+            INSERT INTO inventory_value_snapshots (
+                entity_id, import_run_id, accounting_period_id,
+                snapshot_date,
+                total_sku_count, total_cost_value, total_retail_value,
+                total_gm_dollars, total_gm_pct,
+                department_breakdown_json
+            ) VALUES (
+                :entity_id, :import_run_id, :accounting_period_id,
+                :snapshot_date,
+                :total_sku_count, :total_cost_value, :total_retail_value,
+                :total_gm_dollars, :total_gm_pct,
+                CAST(:department_breakdown_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, snapshot_date) DO UPDATE SET
+                import_run_id              = EXCLUDED.import_run_id,
+                accounting_period_id       = EXCLUDED.accounting_period_id,
+                total_sku_count            = EXCLUDED.total_sku_count,
+                total_cost_value           = EXCLUDED.total_cost_value,
+                total_retail_value         = EXCLUDED.total_retail_value,
+                total_gm_dollars           = EXCLUDED.total_gm_dollars,
+                total_gm_pct               = EXCLUDED.total_gm_pct,
+                department_breakdown_json  = EXCLUDED.department_breakdown_json
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "import_run_id": run_id,
+            "accounting_period_id": accounting_period_id,
+            "snapshot_date": snapshot_date,
+            "total_sku_count": parsed["total_sku_count"],
+            "total_cost_value": _money(parsed["total_cost_value"]),
+            "total_retail_value": _money(parsed["total_retail_value"]),
+            "total_gm_dollars": _money(parsed["total_gm_dollars"]),
+            "total_gm_pct": parsed["total_gm_pct"],
+            "department_breakdown_json": json.dumps(
+                _json_safe(parsed["departments"])
+            ),
+        },
+    ).mappings().first()
+
+    return {
+        "run_id": str(run_id),
+        "snapshot_id": str(snap["id"]) if snap else None,
+        "entity_code": entity_code,
+        "report_type": REPORT_TYPE_INVENTORY_VALUE,
+        "snapshot_date": snapshot_date.isoformat(),
+        "total_sku_count": parsed["total_sku_count"],
+        "total_cost_value": str(parsed["total_cost_value"]),
+        "total_retail_value": str(parsed["total_retail_value"]),
+        "warnings": parsed["warnings"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Importer — Aged AR
+# --------------------------------------------------------------------------
+
+
+def import_aged_ar(
+    session,
+    *,
+    entity_code: str,
+    file_text: str,
+    file_name: str,
+    actor_email: str,
+    snapshot_date_override: date | None = None,
+) -> dict[str, Any]:
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = _resolve_entity_or_raise(session, entity_code)
+    parsed = parse_aged_ar_report(file_text)
+
+    snapshot_date = snapshot_date_override or parsed["snapshot_date"]
+    if not snapshot_date:
+        raise ValueError(
+            "Aged AR Report did not contain a parseable snapshot date. "
+            "Pass snapshot_date_override or fix the report header."
+        )
+
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], snapshot_date
+    )
+
+    run_id = _insert_pos_import_run(
+        session,
+        entity_id=entity["id"],
+        accounting_period_id=accounting_period_id,
+        report_type=REPORT_TYPE_AGED_AR,
+        period_start=snapshot_date,
+        period_end=snapshot_date,
+        file_name=file_name,
+        adjustment_reason=None,
+        total_amount=_money(parsed["total_ar"]),
+        row_count=len(parsed["customers"]),
+        parsed_data={
+            "warnings": parsed["warnings"],
+        },
+        raw_text=file_text,
+        actor_email=actor_email,
+    )
+
+    snap = session.execute(
+        text(
+            """
+            INSERT INTO aged_ar_snapshots (
+                entity_id, import_run_id, accounting_period_id,
+                snapshot_date,
+                total_ar, current_amount,
+                over_30, over_60, over_90, over_120,
+                customer_detail_json
+            ) VALUES (
+                :entity_id, :import_run_id, :accounting_period_id,
+                :snapshot_date,
+                :total_ar, :current_amount,
+                :over_30, :over_60, :over_90, :over_120,
+                CAST(:customer_detail_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, snapshot_date) DO UPDATE SET
+                import_run_id        = EXCLUDED.import_run_id,
+                accounting_period_id = EXCLUDED.accounting_period_id,
+                total_ar             = EXCLUDED.total_ar,
+                current_amount       = EXCLUDED.current_amount,
+                over_30              = EXCLUDED.over_30,
+                over_60              = EXCLUDED.over_60,
+                over_90              = EXCLUDED.over_90,
+                over_120             = EXCLUDED.over_120,
+                customer_detail_json = EXCLUDED.customer_detail_json
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "import_run_id": run_id,
+            "accounting_period_id": accounting_period_id,
+            "snapshot_date": snapshot_date,
+            "total_ar": _money(parsed["total_ar"]),
+            "current_amount": _money(parsed["current_amount"]),
+            "over_30": _money(parsed["over_30"]),
+            "over_60": _money(parsed["over_60"]),
+            "over_90": _money(parsed["over_90"]),
+            "over_120": _money(parsed["over_120"]),
+            "customer_detail_json": json.dumps(_json_safe(parsed["customers"])),
+        },
+    ).mappings().first()
+
+    return {
+        "run_id": str(run_id),
+        "snapshot_id": str(snap["id"]) if snap else None,
+        "entity_code": entity_code,
+        "report_type": REPORT_TYPE_AGED_AR,
+        "snapshot_date": snapshot_date.isoformat(),
+        "total_ar": str(parsed["total_ar"]),
+        "buckets": {
+            "current": str(parsed["current_amount"]),
+            "over_30": str(parsed["over_30"]),
+            "over_60": str(parsed["over_60"]),
+            "over_90": str(parsed["over_90"]),
+            "over_120": str(parsed["over_120"]),
+        },
+        "warnings": parsed["warnings"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Journal builders
+# --------------------------------------------------------------------------
+
+
+def _resolve_import_run_for_journal(
+    session, entity_id: UUID, run_id_str: str
+) -> dict[str, Any]:
+    run_uuid = _parse_uuid(run_id_str, "import_run_id")
+    row = session.execute(
+        text(
+            """
+            SELECT id, entity_id, accounting_period_id, report_type,
+                   period_start, period_end, adjustment_reason
+            FROM pos_import_runs
+            WHERE id = :id AND entity_id = :entity_id
+            """
+        ),
+        {"id": run_uuid, "entity_id": entity_id},
+    ).mappings().first()
+    if not row:
+        raise ValueError(f"pos_import_run not found: {run_id_str}")
+    if row["report_type"] != REPORT_TYPE_INVENTORY_ADJUSTMENT:
+        raise ValueError(
+            "Journal builders only run on inventory_adjustment imports; "
+            f"this run is report_type={row['report_type']}"
+        )
+    if row["accounting_period_id"] is None:
+        raise ValueError(
+            "Cannot build journal: pos_import_run has no accounting_period_id "
+            "(no accounting_periods row covers the report's period_end)."
+        )
+    return dict(row)
+
+
+def _build_inventory_reclass_journal(
+    session,
+    *,
+    entity_code: str,
+    import_run_id: str,
+    actor_email: str,
+    expected_reason: str,
+    expense_account_code: str,
+    inventory_account_code: str,
+    batch_label: str,
+    journal_memo: str,
+) -> dict[str, Any]:
+    if not actor_email:
+        raise ValueError("actor_email is required")
+
+    entity = _resolve_entity_or_raise(session, entity_code)
+    run = _resolve_import_run_for_journal(session, entity["id"], import_run_id)
+
+    if run["adjustment_reason"] != expected_reason:
+        raise ValueError(
+            f"Run adjustment_reason={run['adjustment_reason']!r} does not "
+            f"match builder reason={expected_reason!r}"
+        )
+
+    # Sum the lines for this run (filter on reason for safety).
+    line_rows = session.execute(
+        text(
+            """
+            SELECT id, sku_number, description, adjustment_cost
+            FROM inventory_adjustment_lines
+            WHERE entity_id = :entity_id
+              AND import_run_id = :import_run_id
+              AND adjustment_reason = :adjustment_reason
+            ORDER BY date_adjusted, sku_number
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "import_run_id": _parse_uuid(import_run_id, "import_run_id"),
+            "adjustment_reason": expected_reason,
+        },
+    ).mappings().all()
+
+    if not line_rows:
+        raise ValueError(
+            "No inventory_adjustment_lines for this import run + reason; "
+            "nothing to post."
+        )
+
+    # The store reports adjustment_cost as a negative number when
+    # inventory is leaving (decrease). The journal magnitude is abs().
+    raw_total = sum((Decimal(str(r["adjustment_cost"] or 0)) for r in line_rows), Decimal("0"))
+    total = abs(_money(raw_total))
+    if total == Decimal("0.00"):
+        raise ValueError("Total adjustment cost is 0.00; nothing to post.")
+
+    summary = {
+        "source_run_id": import_run_id,
+        "entity_code": entity_code,
+        "adjustment_reason": expected_reason,
+        "line_count": len(line_rows),
+        "raw_total": str(raw_total),
+        "posted_total": str(total),
+        "is_balanced": True,
+    }
+
+    # Upsert the journal_batches row using the same convention as the
+    # other modules (entity_id, accounting_period_id, source_module,
+    # batch_label) is unique.
+    batch = session.execute(
+        text(
+            """
+            INSERT INTO journal_batches (
+                entity_id, accounting_period_id, source_module, batch_label,
+                status, workflow_status,
+                total_debits, total_credits, summary_json
+            ) VALUES (
+                :entity_id, :accounting_period_id, :source_module, :batch_label,
+                'draft', 'draft_ready',
+                :total_debits, :total_credits, CAST(:summary_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
+            DO UPDATE SET
+                status = 'draft',
+                workflow_status = 'draft_ready',
+                total_debits = EXCLUDED.total_debits,
+                total_credits = EXCLUDED.total_credits,
+                summary_json = EXCLUDED.summary_json,
+                submitted_by = NULL, submitted_at = NULL,
+                reviewed_by = NULL, reviewed_at = NULL,
+                approved_by = NULL, approved_at = NULL,
+                approval_note = NULL, rejection_note = NULL,
+                locked_by = NULL, locked_at = NULL,
+                updated_at = NOW()
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "accounting_period_id": run["accounting_period_id"],
+            "source_module": SOURCE_MODULE_POS_IMPORT,
+            "batch_label": batch_label,
+            "total_debits": total,
+            "total_credits": total,
+            "summary_json": json.dumps(summary),
+        },
+    ).mappings().first()
+    journal_batch_id = batch["id"]
+
+    # Wipe + rewrite the lines so re-running the builder is idempotent.
+    session.execute(
+        text("DELETE FROM journal_lines WHERE journal_batch_id = :id"),
+        {"id": journal_batch_id},
+    )
+    session.execute(
+        text(
+            """
+            INSERT INTO journal_lines (
+                journal_batch_id, line_number, account_code,
+                debit_amount, credit_amount, memo, source_json
+            ) VALUES
+                (:id, 1, :dr_account, :total, 0,        :memo, CAST(:src AS jsonb)),
+                (:id, 2, :cr_account, 0,        :total, :memo, CAST(:src AS jsonb))
+            """
+        ),
+        {
+            "id": journal_batch_id,
+            "dr_account": expense_account_code,
+            "cr_account": inventory_account_code,
+            "total": total,
+            "memo": journal_memo,
+            "src": json.dumps(
+                {
+                    "source_module": SOURCE_MODULE_POS_IMPORT,
+                    "import_run_id": import_run_id,
+                    "adjustment_reason": expected_reason,
+                    "line_count": len(line_rows),
+                }
+            ),
+        },
+    )
+
+    # Backfill journal_batch_id on the lines so we know which batch
+    # claimed them.
+    session.execute(
+        text(
+            """
+            UPDATE inventory_adjustment_lines
+               SET journal_batch_id = :journal_batch_id
+             WHERE entity_id = :entity_id
+               AND import_run_id = :import_run_id
+               AND adjustment_reason = :adjustment_reason
+            """
+        ),
+        {
+            "journal_batch_id": journal_batch_id,
+            "entity_id": entity["id"],
+            "import_run_id": _parse_uuid(import_run_id, "import_run_id"),
+            "adjustment_reason": expected_reason,
+        },
+    )
+
+    return {
+        "journal_batch_id": str(journal_batch_id),
+        "entity_code": entity_code,
+        "import_run_id": import_run_id,
+        "adjustment_reason": expected_reason,
+        "expense_account_code": expense_account_code,
+        "inventory_account_code": inventory_account_code,
+        "total_debits": str(total),
+        "total_credits": str(total),
+        "line_count": len(line_rows),
+    }
+
+
+def build_store_use_journal(
+    session,
+    *,
+    entity_code: str,
+    import_run_id: str,
+    actor_email: str,
+    expense_account_code: str = DEFAULT_STORE_USE_EXPENSE_ACCOUNT_CODE,
+    inventory_account_code: str = DEFAULT_INVENTORY_ACCOUNT_CODE,
+) -> dict[str, Any]:
+    """
+    Reads inventory_adjustment_lines for `import_run_id` whose
+    adjustment_reason is SUPPLIES (store use) and writes a balanced
+    journal_batch:
+
+        Dr  Store Supplies Expense  [total]
+        Cr  Inventory               [total]
+    """
+    return _build_inventory_reclass_journal(
+        session,
+        entity_code=entity_code,
+        import_run_id=import_run_id,
+        actor_email=actor_email,
+        expected_reason=ADJ_REASON_SUPPLIES,
+        expense_account_code=expense_account_code,
+        inventory_account_code=inventory_account_code,
+        batch_label=BATCH_LABEL_STORE_USE,
+        journal_memo="Store use / supplies — inventory reclass",
+    )
+
+
+def build_donation_journal(
+    session,
+    *,
+    entity_code: str,
+    import_run_id: str,
+    actor_email: str,
+    expense_account_code: str = DEFAULT_DONATION_EXPENSE_ACCOUNT_CODE,
+    inventory_account_code: str = DEFAULT_INVENTORY_ACCOUNT_CODE,
+) -> dict[str, Any]:
+    """
+    Reads inventory_adjustment_lines for `import_run_id` whose
+    adjustment_reason is DONATION and writes a balanced journal_batch:
+
+        Dr  Charitable Donations    [total]
+        Cr  Inventory               [total]
+    """
+    return _build_inventory_reclass_journal(
+        session,
+        entity_code=entity_code,
+        import_run_id=import_run_id,
+        actor_email=actor_email,
+        expected_reason=ADJ_REASON_DONATION,
+        expense_account_code=expense_account_code,
+        inventory_account_code=inventory_account_code,
+        batch_label=BATCH_LABEL_DONATION,
+        journal_memo="Charitable donations — inventory reclass",
+    )
+
+
+# --------------------------------------------------------------------------
+# Read helpers
+# --------------------------------------------------------------------------
+
+
+def list_pos_import_runs(
+    session,
+    *,
+    entity_code: str,
+    period_start: date | None = None,
+    period_end: date | None = None,
+    report_type: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    entity = _resolve_entity_or_raise(session, entity_code)
+    rows = session.execute(
+        text(
+            """
+            SELECT id, report_type, period_start, period_end,
+                   file_name, adjustment_reason, total_amount,
+                   row_count, status, actor_email, created_at
+            FROM pos_import_runs
+            WHERE entity_id = :entity_id
+              AND (:period_start IS NULL OR period_end >= :period_start)
+              AND (:period_end   IS NULL OR period_start <= :period_end)
+              AND (:report_type IS NULL OR report_type = :report_type)
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "period_start": period_start,
+            "period_end": period_end,
+            "report_type": report_type,
+            "limit": int(limit),
+        },
+    ).mappings().all()
+
+    runs = []
+    for r in rows:
+        runs.append(
+            {
+                "id": str(r["id"]),
+                "report_type": r["report_type"],
+                "period_start": r["period_start"].isoformat() if r["period_start"] else None,
+                "period_end": r["period_end"].isoformat() if r["period_end"] else None,
+                "file_name": r["file_name"],
+                "adjustment_reason": r["adjustment_reason"],
+                "total_amount": str(r["total_amount"]) if r["total_amount"] is not None else None,
+                "row_count": r["row_count"],
+                "status": r["status"],
+                "actor_email": r["actor_email"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+        )
+    return {"entity_code": entity_code, "count": len(runs), "runs": runs}
+
+
+def get_pos_import_run_detail(
+    session, *, entity_code: str, run_id: str
+) -> dict[str, Any]:
+    entity = _resolve_entity_or_raise(session, entity_code)
+    run_uuid = _parse_uuid(run_id, "run_id")
+    row = session.execute(
+        text(
+            """
+            SELECT id, report_type, period_start, period_end,
+                   file_name, adjustment_reason, total_amount,
+                   row_count, status, actor_email, created_at,
+                   parsed_data_json
+            FROM pos_import_runs
+            WHERE id = :id AND entity_id = :entity_id
+            """
+        ),
+        {"id": run_uuid, "entity_id": entity["id"]},
+    ).mappings().first()
+    if not row:
+        raise ValueError(f"pos_import_run not found: {run_id}")
+
+    detail: dict[str, Any] = {
+        "id": str(row["id"]),
+        "entity_code": entity_code,
+        "report_type": row["report_type"],
+        "period_start": row["period_start"].isoformat() if row["period_start"] else None,
+        "period_end": row["period_end"].isoformat() if row["period_end"] else None,
+        "file_name": row["file_name"],
+        "adjustment_reason": row["adjustment_reason"],
+        "total_amount": str(row["total_amount"]) if row["total_amount"] is not None else None,
+        "row_count": row["row_count"],
+        "status": row["status"],
+        "actor_email": row["actor_email"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "parsed_data": row["parsed_data_json"],
+    }
+
+    if row["report_type"] == REPORT_TYPE_INVENTORY_ADJUSTMENT:
+        line_rows = session.execute(
+            text(
+                """
+                SELECT sku_number, description, mfg_number,
+                       date_adjusted, quantity_adjusted, quantity_after,
+                       adjustment_cost, reason_description, employee_id,
+                       journal_batch_id
+                FROM inventory_adjustment_lines
+                WHERE import_run_id = :id
+                ORDER BY date_adjusted, sku_number
+                """
+            ),
+            {"id": run_uuid},
+        ).mappings().all()
+        detail["lines"] = [
+            {
+                **dict(line),
+                "date_adjusted": line["date_adjusted"].isoformat() if line["date_adjusted"] else None,
+                "quantity_adjusted": str(line["quantity_adjusted"]) if line["quantity_adjusted"] is not None else None,
+                "quantity_after": str(line["quantity_after"]) if line["quantity_after"] is not None else None,
+                "adjustment_cost": str(line["adjustment_cost"]) if line["adjustment_cost"] is not None else None,
+                "journal_batch_id": str(line["journal_batch_id"]) if line["journal_batch_id"] else None,
+            }
+            for line in line_rows
+        ]
+    return detail
+
+
+def _row_to_inventory_value_snapshot(row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "snapshot_date": row["snapshot_date"].isoformat() if row["snapshot_date"] else None,
+        "total_sku_count": row["total_sku_count"],
+        "total_cost_value": str(row["total_cost_value"]) if row["total_cost_value"] is not None else None,
+        "total_retail_value": str(row["total_retail_value"]) if row["total_retail_value"] is not None else None,
+        "total_gm_dollars": str(row["total_gm_dollars"]) if row["total_gm_dollars"] is not None else None,
+        "total_gm_pct": str(row["total_gm_pct"]) if row["total_gm_pct"] is not None else None,
+        "department_breakdown": row["department_breakdown_json"],
+        "import_run_id": str(row["import_run_id"]) if row["import_run_id"] else None,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+def get_latest_inventory_value_snapshot(
+    session, *, entity_code: str
+) -> dict[str, Any] | None:
+    entity = _resolve_entity_or_raise(session, entity_code)
+    row = session.execute(
+        text(
+            """
+            SELECT id, snapshot_date, total_sku_count, total_cost_value,
+                   total_retail_value, total_gm_dollars, total_gm_pct,
+                   department_breakdown_json, import_run_id, created_at
+            FROM inventory_value_snapshots
+            WHERE entity_id = :entity_id
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity["id"]},
+    ).mappings().first()
+    return _row_to_inventory_value_snapshot(row) if row else None
+
+
+def _row_to_aged_ar_snapshot(row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "snapshot_date": row["snapshot_date"].isoformat() if row["snapshot_date"] else None,
+        "total_ar": str(row["total_ar"]) if row["total_ar"] is not None else None,
+        "current_amount": str(row["current_amount"]) if row["current_amount"] is not None else None,
+        "over_30": str(row["over_30"]) if row["over_30"] is not None else None,
+        "over_60": str(row["over_60"]) if row["over_60"] is not None else None,
+        "over_90": str(row["over_90"]) if row["over_90"] is not None else None,
+        "over_120": str(row["over_120"]) if row["over_120"] is not None else None,
+        "customer_detail": row["customer_detail_json"],
+        "import_run_id": str(row["import_run_id"]) if row["import_run_id"] else None,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+def get_latest_aged_ar_snapshot(
+    session, *, entity_code: str
+) -> dict[str, Any] | None:
+    entity = _resolve_entity_or_raise(session, entity_code)
+    row = session.execute(
+        text(
+            """
+            SELECT id, snapshot_date, total_ar, current_amount,
+                   over_30, over_60, over_90, over_120,
+                   customer_detail_json, import_run_id, created_at
+            FROM aged_ar_snapshots
+            WHERE entity_id = :entity_id
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity["id"]},
+    ).mappings().first()
+    return _row_to_aged_ar_snapshot(row) if row else None
+
+
+def _row_to_pos_financial_snapshot(row) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": str(row["id"]),
+        "period_start": row["period_start"].isoformat() if row["period_start"] else None,
+        "period_end": row["period_end"].isoformat() if row["period_end"] else None,
+        "is_balanced": row["is_balanced"],
+        "total_debit_side": str(row["total_debit_side"]) if row["total_debit_side"] is not None else None,
+        "total_credit_side": str(row["total_credit_side"]) if row["total_credit_side"] is not None else None,
+        "import_run_id": str(row["import_run_id"]) if row["import_run_id"] else None,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "other_tender": row["other_tender_json"],
+    }
+    for key in (
+        "cash_amount", "cheque_amount", "visa_net", "mastercard_net",
+        "debit_net", "amex_net",
+        "house_account_debit", "house_account_credit",
+        "gift_card_net", "ecommerce_net",
+        "merchandise_sales", "non_merchandise_sales",
+        "cogs_merchandise", "cogs_non_merchandise",
+        "hst_collected", "hst_5pct",
+    ):
+        out[key] = str(row[key]) if row[key] is not None else None
+    return out
+
+
+def get_latest_pos_financial_snapshot(
+    session, *, entity_code: str
+) -> dict[str, Any] | None:
+    entity = _resolve_entity_or_raise(session, entity_code)
+    row = session.execute(
+        text(
+            """
+            SELECT id, period_start, period_end,
+                   cash_amount, cheque_amount, visa_net, mastercard_net,
+                   debit_net, amex_net,
+                   house_account_debit, house_account_credit,
+                   gift_card_net, ecommerce_net, other_tender_json,
+                   merchandise_sales, non_merchandise_sales,
+                   cogs_merchandise, cogs_non_merchandise,
+                   hst_collected, hst_5pct,
+                   total_debit_side, total_credit_side, is_balanced,
+                   import_run_id, created_at
+            FROM pos_financial_snapshots
+            WHERE entity_id = :entity_id
+            ORDER BY period_end DESC, created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity["id"]},
+    ).mappings().first()
+    return _row_to_pos_financial_snapshot(row) if row else None
+
+
+# --------------------------------------------------------------------------
+# Close control center: section helper
+# --------------------------------------------------------------------------
+
+
+def section_pos_reports(
+    session,
+    *,
+    entity_id: UUID,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Reports whether the three month-end POS snapshots have been imported
+    for the period. Returns the standard section shape used by
+    services_month_end_close.
+
+    Status:
+        no_data       — pos_import_runs table missing entirely
+        blocked       — at least one of pos_financial / inventory_value /
+                        aged_ar is missing for the period
+        ready         — all three present
+    """
+    if not _has_table(session, "pos_import_runs"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "pos_import_runs table not present",
+        }
+
+    pos_financial = session.execute(
+        text(
+            """
+            SELECT id, period_start, period_end, is_balanced
+            FROM pos_financial_snapshots
+            WHERE entity_id = :entity_id
+              AND period_end = :period_end
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity_id, "period_end": period_end},
+    ).mappings().first()
+
+    inventory_value = session.execute(
+        text(
+            """
+            SELECT id, snapshot_date, total_cost_value
+            FROM inventory_value_snapshots
+            WHERE entity_id = :entity_id
+              AND snapshot_date BETWEEN :period_start AND :period_end
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+
+    aged_ar = session.execute(
+        text(
+            """
+            SELECT id, snapshot_date, total_ar
+            FROM aged_ar_snapshots
+            WHERE entity_id = :entity_id
+              AND snapshot_date BETWEEN :period_start AND :period_end
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+
+    missing: list[str] = []
+    if not pos_financial:
+        missing.append("pos_financial")
+    if not inventory_value:
+        missing.append("inventory_value")
+    if not aged_ar:
+        missing.append("aged_ar")
+
+    warnings: list[str] = []
+    if pos_financial and not pos_financial["is_balanced"]:
+        warnings.append("pos_financial snapshot is not balanced")
+
+    if missing:
+        status = "blocked"
+        summary = (
+            "Missing month-end POS snapshot(s): " + ", ".join(missing)
+        )
+    elif warnings:
+        status = "needs_review"
+        summary = "; ".join(warnings)
+    else:
+        status = "ready"
+        summary = (
+            "POS financial, inventory value, and aged AR snapshots all "
+            "present for the period"
+        )
+
+    return {
+        "status": status,
+        "module_present": True,
+        "summary": summary,
+        "pos_financial": {
+            "present": pos_financial is not None,
+            "is_balanced": bool(pos_financial["is_balanced"]) if pos_financial else None,
+            "period_start": pos_financial["period_start"].isoformat() if pos_financial and pos_financial["period_start"] else None,
+            "period_end": pos_financial["period_end"].isoformat() if pos_financial and pos_financial["period_end"] else None,
+        },
+        "inventory_value": {
+            "present": inventory_value is not None,
+            "snapshot_date": inventory_value["snapshot_date"].isoformat() if inventory_value and inventory_value["snapshot_date"] else None,
+            "total_cost_value": str(inventory_value["total_cost_value"]) if inventory_value and inventory_value["total_cost_value"] is not None else None,
+        },
+        "aged_ar": {
+            "present": aged_ar is not None,
+            "snapshot_date": aged_ar["snapshot_date"].isoformat() if aged_ar and aged_ar["snapshot_date"] else None,
+            "total_ar": str(aged_ar["total_ar"]) if aged_ar and aged_ar["total_ar"] is not None else None,
+        },
+    }
