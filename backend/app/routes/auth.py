@@ -24,6 +24,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel, EmailStr, Field
 
+import jwt as _jwt
+
+from ..config import settings
 from ..db import db_session
 from ..services_auth import (
     EVENT_FAILED_LOGIN,
@@ -386,6 +389,75 @@ def revoke_role(
             detail={"entity_code": entity_row["entity_code"]},
         )
         return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# DEBUG endpoint — REMOVE after JWT_SECRET mismatch is resolved.
+# Exposes the first 8 chars of the loaded JWT_SECRET so we can confirm at a
+# glance whether the token-issuing instance and the token-verifying instance
+# share the same key. Returns whatever payload it can decode (signed or not)
+# plus the verification outcome.
+# --------------------------------------------------------------------------
+
+
+@router.get("/debug-token")
+def debug_token(request: Request):
+    secret_prefix = settings.jwt_secret[:8]
+    secret_length = len(settings.jwt_secret)
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return {
+            "DEBUG": "REMOVE THIS ENDPOINT AFTER USE",
+            "received_authorization_header": bool(auth_header),
+            "jwt_secret_prefix": secret_prefix,
+            "jwt_secret_length": secret_length,
+            "jwt_algorithm": settings.jwt_algorithm,
+            "verification_succeeded": False,
+            "error": "No Bearer token in Authorization header",
+        }
+
+    token = auth_header.split(" ", 1)[1].strip()
+
+    unverified_payload: Any = None
+    unverified_header: Any = None
+    decode_unverified_error: str | None = None
+    try:
+        unverified_payload = _jwt.decode(token, options={"verify_signature": False})
+    except Exception as exc:
+        decode_unverified_error = repr(exc)
+    try:
+        unverified_header = _jwt.get_unverified_header(token)
+    except Exception as exc:
+        if decode_unverified_error is None:
+            decode_unverified_error = repr(exc)
+
+    verified_payload: Any = None
+    verification_error: str | None = None
+    verification_succeeded = False
+    try:
+        verified_payload = _jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[settings.jwt_algorithm],
+        )
+        verification_succeeded = True
+    except Exception as exc:
+        verification_error = repr(exc)
+
+    return {
+        "DEBUG": "REMOVE THIS ENDPOINT AFTER USE",
+        "jwt_secret_prefix": secret_prefix,
+        "jwt_secret_length": secret_length,
+        "jwt_algorithm": settings.jwt_algorithm,
+        "token_length": len(token),
+        "unverified_header": unverified_header,
+        "unverified_payload": unverified_payload,
+        "decode_unverified_error": decode_unverified_error,
+        "verification_succeeded": verification_succeeded,
+        "verified_payload": verified_payload,
+        "verification_error": verification_error,
+    }
 
 
 @router.get("/users")

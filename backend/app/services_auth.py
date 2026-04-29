@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
@@ -66,6 +68,8 @@ from sqlalchemy import text
 from .config import settings
 from .db import db_session
 from .services import _parse_uuid, get_entity_by_code
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +173,8 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
     try:
         return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
     except jwt.ExpiredSignatureError as exc:
+        print(f"JWT verification failed: {exc!r}", file=sys.stderr, flush=True)
+        logger.warning("JWT verification failed: %r", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",
@@ -177,11 +183,24 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
         # Distinguished from generic InvalidTokenError so a JWT_SECRET
         # rotation/mismatch is identifiable from the response, not just a
         # blanket "Invalid token".
+        print(
+            f"JWT verification failed: {exc!r} "
+            f"(signing-key prefix loaded: {settings.jwt_secret[:8]!r})",
+            file=sys.stderr,
+            flush=True,
+        )
+        logger.warning(
+            "JWT verification failed: %r (signing-key prefix loaded: %r)",
+            exc,
+            settings.jwt_secret[:8],
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token signature invalid (signing key mismatch — please log in again)",
         ) from exc
     except jwt.InvalidTokenError as exc:
+        print(f"JWT verification failed: {exc!r}", file=sys.stderr, flush=True)
+        logger.warning("JWT verification failed: %r", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
