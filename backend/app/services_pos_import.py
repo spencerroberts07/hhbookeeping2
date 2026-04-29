@@ -166,18 +166,60 @@ def _parse_yy_mm_dd(token: str) -> date | None:
 
 
 def _normalize_reason_token(raw: str) -> str:
-    """SUPPLIES / STORE USE / Store-Use -> STORE_USE; etc."""
+    """
+    'SUPPLIES' / 'Store Use' / 'Store use - Coffee bar' all collapse to
+    SUPPLIES. 'DONATION' / 'Donation - Food bank' collapse to DONATION.
+    Everything else is uppercased and underscored verbatim — generic
+    headers like 'ALL' or 'MISC' are preserved so the builder can tell
+    a specific run from a combined-report run.
+    """
     s = (raw or "").strip().upper()
     s = re.sub(r"[^A-Z0-9]+", "_", s).strip("_")
     if not s:
         return ADJ_REASON_OTHER
     if "DONAT" in s:
         return ADJ_REASON_DONATION
-    if "STORE" in s and "USE" in s:
-        return ADJ_REASON_STORE_USE
-    if "SUPPL" in s:
+    # The store uses several phrasings for store-use of inventory. The
+    # one Bridlewood actually emits in their report is "For Store Non
+    # Inventory"; older docs / other stores may say "Store Use" or
+    # "Supplies". Consolidate them all into SUPPLIES so the builder
+    # filter doesn't have to know all spellings.
+    if (
+        "STORE_NON_INVENTORY" in s
+        or "STORE_USE" in s
+        or ("STORE" in s and "USE" in s)
+        or "SUPPL" in s
+    ):
         return ADJ_REASON_SUPPLIES
     return s
+
+
+# Specific reasons the journal builders care about. If a run's header
+# adjustment_reason is one of these, the builder REQUIRES it match. If
+# the header is anything else (ALL / OTHER / MISC / blank), the builder
+# trusts the per-line adjustment_reason instead.
+_SPECIFIC_RUN_REASONS = frozenset(
+    {ADJ_REASON_SUPPLIES, ADJ_REASON_DONATION, ADJ_REASON_STORE_USE}
+)
+
+
+def _classify_line_reason(
+    line_reason_description: str | None,
+    header_reason: str | None,
+) -> str:
+    """
+    Pick the per-line reason: line-level reason_description first, then
+    fall back to the header reason. Used so a 'combined' report (header
+    Adjustment Reason: ALL) can still produce store_use and donation
+    journals from the line-level reason text.
+    """
+    if line_reason_description:
+        token = _normalize_reason_token(line_reason_description)
+        if token and token != ADJ_REASON_OTHER:
+            return token
+    if header_reason:
+        return _normalize_reason_token(header_reason)
+    return ADJ_REASON_OTHER
 
 
 def _coalesce_int(value: Any) -> int | None:
@@ -1036,6 +1078,9 @@ def import_inventory_adjustment(
     )
 
     for ln in parsed["lines"]:
+        line_reason = _classify_line_reason(
+            ln["reason_description"], parsed["adjustment_reason"]
+        )
         session.execute(
             text(
                 """
@@ -1065,7 +1110,7 @@ def import_inventory_adjustment(
                 "quantity_adjusted": ln["quantity_adjusted"],
                 "quantity_after": ln["quantity_after"],
                 "adjustment_cost": ln["adjustment_cost"],
-                "adjustment_reason": parsed["adjustment_reason"],
+                "adjustment_reason": line_reason,
                 "reason_description": ln["reason_description"],
                 "employee_id": ln["employee_id"],
             },
@@ -1502,10 +1547,14 @@ def _build_inventory_reclass_journal(
     entity = _resolve_entity_or_raise(session, entity_code)
     run = _resolve_import_run_for_journal(session, entity["id"], import_run_id)
 
-    if run["adjustment_reason"] != expected_reason:
+    # Only reject when the run's header pinned a different specific reason.
+    # Combined-report headers like 'ALL' pass through; the per-line
+    # adjustment_reason filter below picks just the matching lines.
+    run_reason = run["adjustment_reason"]
+    if run_reason in _SPECIFIC_RUN_REASONS and run_reason != expected_reason:
         raise ValueError(
-            f"Run adjustment_reason={run['adjustment_reason']!r} does not "
-            f"match builder reason={expected_reason!r}"
+            f"Run adjustment_reason={run_reason!r} does not match "
+            f"builder reason={expected_reason!r}"
         )
 
     # Sum the lines for this run (filter on reason for safety).
