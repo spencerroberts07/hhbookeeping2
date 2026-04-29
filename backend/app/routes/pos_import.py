@@ -29,6 +29,7 @@ from ..services_auth import require_role
 from ..services_pos_import import (
     build_donation_journal,
     build_store_use_journal,
+    extract_text_from_upload,
     get_latest_aged_ar_snapshot,
     get_latest_inventory_value_snapshot,
     get_latest_pos_financial_snapshot,
@@ -49,19 +50,18 @@ router = APIRouter(prefix="/api/pos-import", tags=["pos-import"])
 # --------------------------------------------------------------------------
 
 
-async def _read_file_text(file: UploadFile) -> str:
+async def _read_file_text(file: UploadFile) -> tuple[str, str]:
+    """
+    Returns (text, source) where source is 'text' / 'pdf_text' / 'pdf_ocr'.
+    PDFs go through pypdf first; if the extraction looks corrupted (a
+    non-standard font breaks glyph mappings), OCR fallback runs via
+    pytesseract — provided Tesseract is installed on the host.
+    """
     raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    # POS reports are usually plain ASCII / latin-1 fixed-width text.
-    # Try utf-8 first, fall back to latin-1, and finally decode with
-    # replacement so weird control bytes don't take the request down.
-    for enc in ("utf-8", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    try:
+        return extract_text_from_upload(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _parse_optional_date(name: str, value: str | None) -> DateType | None:
@@ -112,16 +112,18 @@ async def post_import_inventory_adjustment(
     file: UploadFile = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
-    file_text = await _read_file_text(file)
+    file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
-            return import_inventory_adjustment(
+            result = import_inventory_adjustment(
                 session,
                 entity_code=entity_code,
                 file_text=file_text,
                 file_name=file.filename or "inventory_adjustment.txt",
                 actor_email=actor_email,
             )
+            result["extraction_source"] = source
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -133,16 +135,18 @@ async def post_import_pos_financial(
     file: UploadFile = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
-    file_text = await _read_file_text(file)
+    file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
-            return import_pos_financial(
+            result = import_pos_financial(
                 session,
                 entity_code=entity_code,
                 file_text=file_text,
                 file_name=file.filename or "pos_financial.txt",
                 actor_email=actor_email,
             )
+            result["extraction_source"] = source
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -155,11 +159,11 @@ async def post_import_inventory_value(
     snapshot_date: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
-    file_text = await _read_file_text(file)
+    file_text, source = await _read_file_text(file)
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
         with db_session() as session:
-            return import_inventory_value(
+            result = import_inventory_value(
                 session,
                 entity_code=entity_code,
                 file_text=file_text,
@@ -167,6 +171,8 @@ async def post_import_inventory_value(
                 actor_email=actor_email,
                 snapshot_date_override=snap_override,
             )
+            result["extraction_source"] = source
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -179,11 +185,11 @@ async def post_import_aged_ar(
     snapshot_date: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
-    file_text = await _read_file_text(file)
+    file_text, source = await _read_file_text(file)
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
         with db_session() as session:
-            return import_aged_ar(
+            result = import_aged_ar(
                 session,
                 entity_code=entity_code,
                 file_text=file_text,
@@ -191,6 +197,8 @@ async def post_import_aged_ar(
                 actor_email=actor_email,
                 snapshot_date_override=snap_override,
             )
+            result["extraction_source"] = source
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

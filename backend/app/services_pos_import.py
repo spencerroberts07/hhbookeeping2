@@ -89,6 +89,131 @@ SOURCE_MODULE_POS_IMPORT = "pos_import"
 BATCH_LABEL_STORE_USE = "store_use_inventory_reclass"
 BATCH_LABEL_DONATION = "donation_inventory_reclass"
 
+# PDF magic-byte prefix — used to detect a binary PDF upload so we can
+# extract text via pypdf / OCR before handing it to a parser.
+_PDF_MAGIC = b"%PDF"
+
+# Pypdf occasionally returns a "decoded" stream that looks like text but
+# actually has bad font glyph mappings (e.g. '1' rendered as 'l',
+# '147.50' as '147.5A'). When the count of valid money tokens in the
+# text is well below what the report should contain, we fall back to
+# OCR. 5 is a conservative floor — even small reports have more than
+# that.
+_TEXT_QUALITY_MONEY_TOKEN_FLOOR = 5
+_RE_MONEY_TOKEN = re.compile(r"\d+\.\d{2}")
+
+
+def looks_like_pdf(file_bytes: bytes) -> bool:
+    return bool(file_bytes) and file_bytes.lstrip().startswith(_PDF_MAGIC)
+
+
+def _pypdf_extract_text(file_bytes: bytes) -> str:
+    """Best-effort plain-text extraction via pypdf. Returns '' on failure."""
+    try:
+        from pypdf import PdfReader
+        from io import BytesIO
+    except Exception:
+        return ""
+    try:
+        reader = PdfReader(BytesIO(file_bytes))
+    except Exception:
+        return ""
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return "\n".join(pages)
+
+
+def _ocr_pdf_text(file_bytes: bytes) -> str:
+    """
+    Rasterize the PDF with PyMuPDF and OCR each page with pytesseract.
+    Returns '' if either dependency is unavailable or the install lacks
+    a Tesseract binary on PATH.
+    """
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return ""
+    try:
+        from PIL import Image
+    except Exception:
+        return ""
+    try:
+        import pytesseract  # type: ignore
+    except Exception:
+        return ""
+
+    pages: list[str] = []
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        for page in doc:
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                img = Image.frombytes(
+                    "RGB", [pix.width, pix.height], pix.samples
+                )
+                pages.append(pytesseract.image_to_string(img) or "")
+            except Exception:
+                pages.append("")
+    finally:
+        doc.close()
+    return "\n".join(pages)
+
+
+def extract_text_from_upload(file_bytes: bytes) -> tuple[str, str]:
+    """
+    Read the upload bytes and return (text, source) where `source` is one
+    of 'text', 'pdf_text', 'pdf_ocr'. PDFs go through pypdf first; if
+    that returns suspiciously few money tokens we fall back to OCR.
+
+    Raises ValueError when nothing produces usable text, with a
+    diagnostic that distinguishes "PDF unparseable, no OCR available"
+    from "file is empty".
+    """
+    if not file_bytes:
+        raise ValueError("Uploaded file is empty")
+
+    if not looks_like_pdf(file_bytes):
+        # Plain text — try utf-8, fall back to latin-1 (POS reports).
+        for enc in ("utf-8", "latin-1"):
+            try:
+                return file_bytes.decode(enc), "text"
+            except UnicodeDecodeError:
+                continue
+        return file_bytes.decode("utf-8", errors="replace"), "text"
+
+    pypdf_text = _pypdf_extract_text(file_bytes)
+    money_tokens = len(_RE_MONEY_TOKEN.findall(pypdf_text))
+    if pypdf_text and money_tokens >= _TEXT_QUALITY_MONEY_TOKEN_FLOOR:
+        # Heuristic check: glyph-substituted PDFs sometimes still emit
+        # SOME good money tokens (e.g. 25,551.01) while corrupting
+        # others. Accept if we have at least the floor; the parsers
+        # tolerate garbage rows.
+        return pypdf_text, "pdf_text"
+
+    ocr_text = _ocr_pdf_text(file_bytes)
+    if ocr_text and len(_RE_MONEY_TOKEN.findall(ocr_text)) >= _TEXT_QUALITY_MONEY_TOKEN_FLOOR:
+        return ocr_text, "pdf_ocr"
+
+    if pypdf_text:
+        # Last-resort: hand back the corrupted text so the parser can
+        # produce a partial answer / clear warning rather than 500.
+        return pypdf_text, "pdf_text"
+
+    raise ValueError(
+        "Could not extract usable text from the PDF. The PDF appears to "
+        "use a non-standard font that breaks pypdf, and OCR is not "
+        "available (Tesseract is not installed or not on PATH). "
+        "Install Tesseract from https://github.com/UB-Mannheim/tesseract/wiki "
+        "and re-upload, or export the report as plain text from the POS."
+    )
+
 
 # --------------------------------------------------------------------------
 # Helpers
