@@ -303,23 +303,6 @@ def learn_from_gl_history(
 
     notes = f"Seeded from gl_import_run {gl_import_run_id} by {actor_email}"
 
-    # Render's Postgres free tier kills the connection after a small
-    # number of rapid INSERTs from the same session. Workaround: commit
-    # + close the outer session, then run the bulk upsert against a
-    # brand-new engine using NullPool so each chunk genuinely gets a
-    # fresh connection.
-    session.commit()
-    session.close()
-
-    from sqlalchemy import create_engine  # noqa: WPS433
-    from sqlalchemy.pool import NullPool  # noqa: WPS433
-
-    from .config import settings  # noqa: WPS433
-
-    bulk_engine = create_engine(
-        settings.database_url, poolclass=NullPool
-    )
-
     # Simple UPSERT — user_confirmed rows are already filtered out
     # Python-side, and the pre-aggregated occurrences_count already
     # includes the prior count, so a plain SET overwrites correctly.
@@ -344,8 +327,12 @@ def learn_from_gl_history(
             last_seen_at = NOW()
         """
     )
-    CHUNK = 10  # Render's free-tier Postgres aborts the connection on
-                # larger batched executemany calls; 10 is safe.
+    # Bulk upsert against the outer session. Free-tier Render Postgres
+    # used to abort the connection on bulk writes — that's why earlier
+    # versions of this code spun up a NullPool engine per chunk. The
+    # paid Basic tier handles plain executemany via the existing
+    # session cleanly, so we use it directly.
+    CHUNK = 100
     upserted = 0
     for start in range(0, len(rows_to_upsert), CHUNK):
         chunk = rows_to_upsert[start : start + CHUNK]
@@ -363,10 +350,8 @@ def learn_from_gl_history(
             }
             for r in chunk
         ]
-        with bulk_engine.begin() as conn:
-            conn.execute(upsert_sql, params)
+        session.execute(upsert_sql, params)
         upserted += len(chunk)
-    bulk_engine.dispose()
 
     return {
         "entity_code": entity_code,
