@@ -2045,6 +2045,252 @@ def auto_match_hh_ap_remittances_to_bank(
     }
 
 
+REMITTANCE_CLEARING_SOURCE_MODULE = "hh_ap_remittance_clearing"
+REMITTANCE_CLEARING_BATCH_LABEL = "hh_ap_remittance_clearing"
+REMITTANCE_CLEARING_DEBIT_ACCOUNT = "2030"
+REMITTANCE_CLEARING_CREDIT_ACCOUNT = "1020"
+
+
+def build_remittance_clearing_journal(
+    session,
+    *,
+    entity_code: str,
+    period_start: date,
+    period_end: date,
+    actor_email: str,
+) -> dict[str, Any]:
+    """
+    Build a Dr 2030 / Cr 1020 journal_batch for every active HH AP
+    remittance whose matched bank transaction falls in [period_start,
+    period_end]. One pair of journal lines per matched remittance.
+
+    Idempotent: re-running for the same period overwrites the batch
+    via the (entity_id, accounting_period_id, source_module, batch_label)
+    unique constraint.
+    """
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    if period_end < period_start:
+        raise ValueError("period_end must be >= period_start")
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], period_end
+    )
+    if accounting_period_id is None:
+        raise ValueError(
+            f"No accounting_period covers {period_end.isoformat()} for {entity_code}"
+        )
+
+    matches = session.execute(
+        text(
+            """
+            SELECT m.id AS match_id,
+                   m.bank_transaction_id,
+                   m.target_record_id::uuid AS remittance_id,
+                   m.matched_amount,
+                   r.remittance_reference,
+                   r.remittance_date,
+                   r.withdrawal_date,
+                   r.total_amount,
+                   bt.transaction_date AS bank_transaction_date,
+                   bt.amount AS bank_amount,
+                   bt.description AS bank_description
+            FROM bank_transaction_matches m
+            JOIN hh_ap_remittances r ON r.id::text = m.target_record_id
+            JOIN bank_transactions bt ON bt.id = m.bank_transaction_id
+            WHERE m.entity_id = :entity_id
+              AND m.target_table_name = :target_table
+              AND m.active = TRUE
+              AND bt.transaction_date >= :period_start
+              AND bt.transaction_date <= :period_end
+            ORDER BY bt.transaction_date, m.created_at
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "target_table": REMITTANCE_BANK_TARGET_TABLE,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().all()
+
+    lines: list[dict[str, Any]] = []
+    total = Decimal("0.00")
+    for r in matches:
+        amt = Decimal(str(r["matched_amount"] or 0)).quantize(Decimal("0.01"))
+        if amt == 0:
+            continue
+        memo = (
+            f"HH remittance {r['remittance_reference'] or str(r['remittance_id'])[:8]}"
+            f" — bank {r['bank_transaction_date']}"
+        )
+        lines.append(
+            {
+                "amount": amt,
+                "memo": memo,
+                "remittance_id": str(r["remittance_id"]),
+                "match_id": str(r["match_id"]),
+                "bank_transaction_id": str(r["bank_transaction_id"]),
+                "bank_transaction_date": (
+                    r["bank_transaction_date"].isoformat() if r["bank_transaction_date"] else None
+                ),
+            }
+        )
+        total += amt
+
+    summary = {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "matched_remittance_count": len(lines),
+        "total_amount": str(total),
+        "debit_account": REMITTANCE_CLEARING_DEBIT_ACCOUNT,
+        "credit_account": REMITTANCE_CLEARING_CREDIT_ACCOUNT,
+        "remittances": [
+            {
+                "remittance_id": l["remittance_id"],
+                "match_id": l["match_id"],
+                "bank_transaction_id": l["bank_transaction_id"],
+                "bank_transaction_date": l["bank_transaction_date"],
+                "amount": str(l["amount"]),
+            }
+            for l in lines
+        ],
+    }
+
+    if not lines:
+        return {
+            "entity_code": entity_code,
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "journal_batch_id": None,
+            "matched_remittance_count": 0,
+            "total_debits": "0.00",
+            "total_credits": "0.00",
+            "message": "No active remittance bank matches in this period; no journal built.",
+        }
+
+    batch = session.execute(
+        text(
+            """
+            INSERT INTO journal_batches (
+                entity_id, accounting_period_id, source_module, batch_label,
+                status, workflow_status,
+                total_debits, total_credits, summary_json
+            ) VALUES (
+                :entity_id, :accounting_period_id, :source_module, :batch_label,
+                'draft', 'draft_ready',
+                :total_debits, :total_credits, CAST(:summary_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
+            DO UPDATE SET
+                status = 'draft',
+                workflow_status = 'draft_ready',
+                total_debits = EXCLUDED.total_debits,
+                total_credits = EXCLUDED.total_credits,
+                summary_json = EXCLUDED.summary_json,
+                submitted_by = NULL, submitted_at = NULL,
+                reviewed_by = NULL, reviewed_at = NULL,
+                approved_by = NULL, approved_at = NULL,
+                approval_note = NULL, rejection_note = NULL,
+                locked_by = NULL, locked_at = NULL,
+                updated_at = NOW()
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "accounting_period_id": accounting_period_id,
+            "source_module": REMITTANCE_CLEARING_SOURCE_MODULE,
+            "batch_label": REMITTANCE_CLEARING_BATCH_LABEL,
+            "total_debits": total,
+            "total_credits": total,
+            "summary_json": json.dumps(summary),
+        },
+    ).mappings().first()
+    journal_batch_id = batch["id"]
+
+    session.execute(
+        text("DELETE FROM journal_lines WHERE journal_batch_id = :id"),
+        {"id": journal_batch_id},
+    )
+
+    line_number = 0
+    for l in lines:
+        line_number += 1
+        session.execute(
+            text(
+                """
+                INSERT INTO journal_lines (
+                    journal_batch_id, line_number, account_code,
+                    debit_amount, credit_amount, memo, source_json
+                ) VALUES (
+                    :id, :line_number, :account_code,
+                    :debit_amount, 0, :memo, CAST(:src AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": journal_batch_id,
+                "line_number": line_number,
+                "account_code": REMITTANCE_CLEARING_DEBIT_ACCOUNT,
+                "debit_amount": l["amount"],
+                "memo": l["memo"],
+                "src": json.dumps(
+                    {
+                        "source_module": REMITTANCE_CLEARING_SOURCE_MODULE,
+                        "remittance_id": l["remittance_id"],
+                        "match_id": l["match_id"],
+                        "bank_transaction_id": l["bank_transaction_id"],
+                        "side": "debit",
+                    }
+                ),
+            },
+        )
+        line_number += 1
+        session.execute(
+            text(
+                """
+                INSERT INTO journal_lines (
+                    journal_batch_id, line_number, account_code,
+                    debit_amount, credit_amount, memo, source_json
+                ) VALUES (
+                    :id, :line_number, :account_code,
+                    0, :credit_amount, :memo, CAST(:src AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": journal_batch_id,
+                "line_number": line_number,
+                "account_code": REMITTANCE_CLEARING_CREDIT_ACCOUNT,
+                "credit_amount": l["amount"],
+                "memo": l["memo"],
+                "src": json.dumps(
+                    {
+                        "source_module": REMITTANCE_CLEARING_SOURCE_MODULE,
+                        "remittance_id": l["remittance_id"],
+                        "match_id": l["match_id"],
+                        "bank_transaction_id": l["bank_transaction_id"],
+                        "side": "credit",
+                    }
+                ),
+            },
+        )
+
+    return {
+        "entity_code": entity_code,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "journal_batch_id": str(journal_batch_id),
+        "matched_remittance_count": len(lines),
+        "total_debits": str(total),
+        "total_credits": str(total),
+    }
+
+
 DIRECT_VENDOR_INVOICE_STATUSES = {"open", "needs_review", "approved", "scheduled", "paid", "void"}
 DIRECT_VENDOR_PAYMENT_STATUSES = {"unpaid", "partially_paid", "paid"}
 DIRECT_VENDOR_PRIORITIES = {"low", "normal", "high", "urgent"}

@@ -16,7 +16,10 @@ from .routes.direct_vendor_ap import router as direct_vendor_ap_router
 from .routes.gl_import import router as gl_import_router
 from .routes.hh_ap import router as hh_ap_router
 from .routes import hh_ap_overrides
-from .routes.hh_ap_remittance_bank_match import router as hh_ap_remittance_bank_match_router
+from .routes.hh_ap_remittance_bank_match import (
+    clearing_router as hh_ap_remittance_clearing_router,
+    router as hh_ap_remittance_bank_match_router,
+)
 from .routes.month_end import router as month_end_router
 from .routes.month_end_close import router as month_end_close_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
@@ -47,6 +50,7 @@ app.include_router(month_end_hh_ap_router)
 app.include_router(month_end_workflow_router)
 app.include_router(month_end_close_router)
 app.include_router(hh_ap_remittance_bank_match_router)
+app.include_router(hh_ap_remittance_clearing_router)
 app.include_router(direct_vendor_ap_router)
 app.include_router(card_settlement_router)
 app.include_router(hh_ap_overrides.router)

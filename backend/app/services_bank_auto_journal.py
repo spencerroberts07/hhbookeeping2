@@ -61,6 +61,9 @@ MATCH_STATUS_MATCHED = "matched"
 MATCH_STATUS_UNMATCHED = "unmatched"
 MATCH_STATUS_SKIPPED = "skipped"
 MATCH_STATUS_SPLIT_REQUIRED = "split_required"
+MATCH_STATUS_AUTO_DRAFT_PAYROLL = "auto_draft_payroll"
+
+TRANSACTION_TYPE_AUTO_DRAFT_PAYROLL = "auto_draft_payroll"
 
 # Description prefixes / fragments that should always be skipped
 # because another module handles them.
@@ -264,9 +267,9 @@ _BRIDLEWOOD_SEED: list[dict[str, Any]] = [
         "match_type": "contains",
         "debit_account": "6120",
         "credit_account": DEFAULT_BANK_ACCOUNT_CODE,
-        "transaction_type": "payroll",
+        "transaction_type": TRANSACTION_TYPE_AUTO_DRAFT_PAYROLL,
         "priority": 15,
-        "notes": "Posts to 6120 Wages & Benefits — split into sub-accounts using payroll register",
+        "notes": "Auto-drafts a payroll_run from the bank net-pay debit. The bookkeeper splits gross/CPP/EI/tax/fees in the payroll module before approving.",
     },
     # ---------- Utilities ----------
     {
@@ -664,6 +667,7 @@ def run_auto_journal(
     unmatched_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
     split_required_rows: list[dict[str, Any]] = []
+    auto_draft_payroll_rows: list[dict[str, Any]] = []
 
     # Per-layer counters so the run summary can show the human where
     # each match came from (rule vs memory vs LLM).
@@ -919,6 +923,122 @@ def run_auto_journal(
             )
             continue
 
+        if rule.get("transaction_type") == TRANSACTION_TYPE_AUTO_DRAFT_PAYROLL:
+            # ENetEmployer (or any payroll-processor) bank withdrawal:
+            # create a payroll_run draft seeded with net_pay = abs(amount)
+            # and let the bookkeeper fill in gross / CPP / EI / fees
+            # before approving. We do NOT post a journal entry here —
+            # the eventual journal comes out of the payroll module.
+            net_pay = abs(_money(txn["amount"]))
+            txn_date = txn["transaction_date"]
+            payroll_reference = f"ENET-{txn_date.isoformat()}"
+            session.execute(
+                text(
+                    """
+                    INSERT INTO payroll_runs (
+                        entity_id, accounting_period_id, payroll_reference,
+                        pay_period_start, pay_period_end, pay_date,
+                        processor, net_pay, status, workflow_status,
+                        bank_transaction_id, notes, actor_email,
+                        raw_import_json
+                    ) VALUES (
+                        :entity_id, :accounting_period_id, :payroll_reference,
+                        :pay_period_start, :pay_period_end, :pay_date,
+                        'ENetEmployer', :net_pay, 'draft', 'draft',
+                        :bank_transaction_id, :notes, :actor_email,
+                        CAST(:raw AS jsonb)
+                    )
+                    ON CONFLICT (entity_id, payroll_reference)
+                    DO UPDATE SET
+                        net_pay = EXCLUDED.net_pay,
+                        bank_transaction_id = EXCLUDED.bank_transaction_id,
+                        notes = COALESCE(payroll_runs.notes, EXCLUDED.notes),
+                        raw_import_json = EXCLUDED.raw_import_json,
+                        updated_at = NOW()
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "accounting_period_id": accounting_period_id,
+                    "payroll_reference": payroll_reference,
+                    "pay_period_start": txn_date,
+                    "pay_period_end": txn_date,
+                    "pay_date": txn_date,
+                    "net_pay": net_pay,
+                    "bank_transaction_id": txn["id"],
+                    "notes": (
+                        "Auto-drafted from bank transaction - "
+                        "complete gross/deductions before approving"
+                    ),
+                    "actor_email": actor_email,
+                    "raw": json.dumps(
+                        {
+                            "auto_drafted_from_bank": True,
+                            "bank_description": desc,
+                            "bank_amount": str(txn["amount"]),
+                            "bank_transaction_id": str(txn["id"]),
+                            "rule_code": rule["rule_code"],
+                        }
+                    ),
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO bank_auto_journal_lines (
+                        entity_id, auto_journal_run_id, bank_transaction_id,
+                        rule_id, matched_status, amount, notes
+                    ) VALUES (
+                        :entity_id, :run_id, :bt_id,
+                        :rule_id, :status, :amount,
+                        'Auto-drafted payroll_run; awaiting gross/deductions split'
+                    )
+                    ON CONFLICT (entity_id, bank_transaction_id)
+                    DO UPDATE SET
+                        auto_journal_run_id = EXCLUDED.auto_journal_run_id,
+                        rule_id = EXCLUDED.rule_id,
+                        matched_status = EXCLUDED.matched_status,
+                        amount = EXCLUDED.amount,
+                        notes = EXCLUDED.notes,
+                        debit_account = NULL,
+                        credit_account = NULL,
+                        journal_batch_id = NULL
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "run_id": run_id,
+                    "bt_id": txn["id"],
+                    "rule_id": rule["id"],
+                    "status": MATCH_STATUS_AUTO_DRAFT_PAYROLL,
+                    "amount": txn["amount"],
+                },
+            )
+            # Keep the bank transaction in needs_review so the bookkeeper
+            # sees it until they approve the payroll run.
+            session.execute(
+                text(
+                    """
+                    UPDATE bank_transactions
+                       SET review_status = 'needs_review'
+                     WHERE id = :id
+                       AND review_status NOT IN ('matched','ignored')
+                    """
+                ),
+                {"id": txn["id"]},
+            )
+            auto_draft_payroll_rows.append(
+                {
+                    "bank_transaction_id": str(txn["id"]),
+                    "transaction_date": txn_date.isoformat(),
+                    "description": desc,
+                    "amount": str(txn["amount"]),
+                    "rule_code": rule["rule_code"],
+                    "payroll_reference": payroll_reference,
+                }
+            )
+            continue
+
         # If rule['id'] is a real UUID, this came from Layer 1 (the
         # bank_transaction_rules table). We don't record a
         # bank_classification_suggestions row for Layer 1 — that table
@@ -1170,7 +1290,10 @@ def run_auto_journal(
                     AS total_skipped,
                 COUNT(*) FILTER (
                     WHERE ajl.matched_status = 'split_required'
-                ) AS total_split_required
+                ) AS total_split_required,
+                COUNT(*) FILTER (
+                    WHERE ajl.matched_status = 'auto_draft_payroll'
+                ) AS total_auto_draft_payroll
             FROM bank_auto_journal_lines ajl
             JOIN bank_transactions bt ON bt.id = ajl.bank_transaction_id
             LEFT JOIN bank_classification_suggestions bcs
@@ -1195,6 +1318,7 @@ def run_auto_journal(
         "unmatched": int(period_totals["total_unmatched"] or 0),
         "skipped": int(period_totals["total_skipped"] or 0),
         "split_required": int(period_totals["total_split_required"] or 0),
+        "auto_draft_payroll": int(period_totals["total_auto_draft_payroll"] or 0),
     }
 
     # Finalize the run row.
@@ -1204,6 +1328,7 @@ def run_auto_journal(
             "unmatched_count": len(unmatched_rows),
             "skipped_count": len(skipped_rows),
             "split_required_count": len(split_required_rows),
+            "auto_draft_payroll_count": len(auto_draft_payroll_rows),
             "matched_by_layer": layer_counts,
         },
         "period_totals": period_summary,
@@ -1211,6 +1336,7 @@ def run_auto_journal(
         "total_credits": str(total_credits),
         "unmatched_sample": unmatched_rows[:50],
         "split_required_sample": split_required_rows[:50],
+        "auto_draft_payroll_sample": auto_draft_payroll_rows[:50],
     }
     session.execute(
         text(
@@ -1248,6 +1374,7 @@ def run_auto_journal(
         "transactions_unmatched": len(unmatched_rows),
         "transactions_skipped": len(skipped_rows),
         "transactions_split_required": len(split_required_rows),
+        "transactions_auto_draft_payroll": len(auto_draft_payroll_rows),
         "matched_by_layer": layer_counts,
         # ---- period_totals: cumulative state for the period ----
         # These reflect the bank_auto_journal_lines table after this
@@ -1260,6 +1387,7 @@ def run_auto_journal(
         "total_credits": str(total_credits),
         "unmatched_sample": unmatched_rows[:25],
         "split_required_sample": split_required_rows[:25],
+        "auto_draft_payroll_sample": auto_draft_payroll_rows[:25],
     }
 
 

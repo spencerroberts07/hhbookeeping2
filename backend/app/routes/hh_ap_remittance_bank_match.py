@@ -1,7 +1,9 @@
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from pydantic import BaseModel
 
 from ..db import db_session
 from ..services_auth import require_role
@@ -16,6 +18,7 @@ from ..schemas import (
 )
 from ..services import (
     auto_match_hh_ap_remittances_to_bank,
+    build_remittance_clearing_journal,
     create_hh_ap_remittance_bank_match,
     get_hh_ap_remittance_bank_match_detail,
     list_hh_ap_remittances_for_bank_matching,
@@ -25,6 +28,11 @@ from ..services import (
 router = APIRouter(
     prefix="/api/hh-ap/remittance-bank-match",
     tags=["hh-ap-remittance-bank-match"],
+)
+
+clearing_router = APIRouter(
+    prefix="/api/hh-ap-remittance",
+    tags=["hh-ap-remittance-clearing"],
 )
 
 
@@ -160,6 +168,36 @@ def hh_ap_remittance_bank_match_release(
                 summary=result,
             )
     except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class BuildClearingJournalRequest(BaseModel):
+    entity_code: str
+    period_start: str
+    period_end: str
+    actor_email: str
+
+
+@clearing_router.post("/build-clearing-journal")
+def hh_ap_remittance_build_clearing_journal(
+    request: BuildClearingJournalRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    try:
+        period_start = date.fromisoformat(request.period_start)
+        period_end = date.fromisoformat(request.period_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {exc}") from exc
+    try:
+        with db_session() as session:
+            return build_remittance_clearing_journal(
+                session=session,
+                entity_code=request.entity_code,
+                period_start=period_start,
+                period_end=period_end,
+                actor_email=request.actor_email,
+            )
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

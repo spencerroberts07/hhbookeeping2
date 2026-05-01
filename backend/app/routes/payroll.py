@@ -20,7 +20,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
+from sqlalchemy import text
+
 from ..db import db_session
+from ..services import get_entity_by_code
 from ..services_auth import require_role
 from ..services_payroll import (
     approve_payroll_run,
@@ -210,6 +213,99 @@ def post_mark_remittance_cleared(
                 bank_transaction_id=body.bank_transaction_id,
                 actor_email=body.actor_email,
             )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/draft-from-bank")
+def get_draft_from_bank(
+    entity_code: str = Query(...),
+) -> dict[str, Any]:
+    """
+    List payroll_runs that are still in 'draft' workflow_status AND
+    have a bank_transaction_id wired up — i.e. drafts created by the
+    bank auto-journal's auto_draft_payroll handler that the bookkeeper
+    hasn't completed yet.
+    """
+    try:
+        with db_session() as session:
+            entity = get_entity_by_code(session, entity_code)
+            if not entity:
+                raise ValueError(f"Unknown entity code: {entity_code}")
+            rows = session.execute(
+                text(
+                    """
+                    SELECT pr.id, pr.payroll_reference, pr.pay_period_start,
+                           pr.pay_period_end, pr.pay_date, pr.processor,
+                           pr.gross_wages, pr.net_pay, pr.status,
+                           pr.workflow_status, pr.notes,
+                           pr.bank_transaction_id, pr.created_at,
+                           bt.transaction_date AS bank_transaction_date,
+                           bt.amount AS bank_amount,
+                           bt.description AS bank_description,
+                           bt.review_status AS bank_review_status
+                    FROM payroll_runs pr
+                    LEFT JOIN bank_transactions bt ON bt.id = pr.bank_transaction_id
+                    WHERE pr.entity_id = :entity_id
+                      AND pr.workflow_status = 'draft'
+                      AND pr.bank_transaction_id IS NOT NULL
+                    ORDER BY pr.pay_date DESC, pr.created_at DESC
+                    """
+                ),
+                {"entity_id": entity["id"]},
+            ).mappings().all()
+            return {
+                "entity_code": entity_code,
+                "count": len(rows),
+                "drafts": [
+                    {
+                        "id": str(r["id"]),
+                        "payroll_reference": r["payroll_reference"],
+                        "pay_period_start": (
+                            r["pay_period_start"].isoformat()
+                            if r["pay_period_start"]
+                            else None
+                        ),
+                        "pay_period_end": (
+                            r["pay_period_end"].isoformat()
+                            if r["pay_period_end"]
+                            else None
+                        ),
+                        "pay_date": (
+                            r["pay_date"].isoformat() if r["pay_date"] else None
+                        ),
+                        "processor": r["processor"],
+                        "gross_wages": (
+                            str(r["gross_wages"]) if r["gross_wages"] is not None else None
+                        ),
+                        "net_pay": (
+                            str(r["net_pay"]) if r["net_pay"] is not None else None
+                        ),
+                        "status": r["status"],
+                        "workflow_status": r["workflow_status"],
+                        "notes": r["notes"],
+                        "bank_transaction_id": (
+                            str(r["bank_transaction_id"])
+                            if r["bank_transaction_id"]
+                            else None
+                        ),
+                        "bank_transaction_date": (
+                            r["bank_transaction_date"].isoformat()
+                            if r["bank_transaction_date"]
+                            else None
+                        ),
+                        "bank_amount": (
+                            str(r["bank_amount"]) if r["bank_amount"] is not None else None
+                        ),
+                        "bank_description": r["bank_description"],
+                        "bank_review_status": r["bank_review_status"],
+                        "created_at": (
+                            r["created_at"].isoformat() if r["created_at"] else None
+                        ),
+                    }
+                    for r in rows
+                ],
+            }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

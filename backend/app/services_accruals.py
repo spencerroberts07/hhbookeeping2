@@ -40,7 +40,7 @@ _BRIDLEWOOD_SEED = [
         "description": "Accrued Rent",
         "debit_account": "6010",
         "credit_account": "2201",
-        "default_amount": Decimal("4980.34"),
+        "default_amount": Decimal("6471.66"),
         "frequency": "monthly",
         "notes": "Rent expense account = 6010 (Occupancy Costs parent 6000)",
     },
