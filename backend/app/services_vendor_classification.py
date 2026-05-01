@@ -749,7 +749,7 @@ def list_pending_suggestions(
             FROM bank_classification_suggestions bcs
             JOIN bank_transactions bt ON bt.id = bcs.bank_transaction_id
             WHERE bcs.entity_id = :entity_id
-              AND (:status IS NULL OR bcs.status = :status)
+              AND (CAST(:status AS text) IS NULL OR bcs.status = :status)
             ORDER BY bcs.created_at DESC
             LIMIT :limit
             """
@@ -814,7 +814,7 @@ def list_vendor_memory(
                    first_seen_at, last_seen_at, notes
             FROM vendor_classification_memory
             WHERE entity_id = :entity_id
-              AND (:source IS NULL OR source = :source)
+              AND (CAST(:source AS text) IS NULL OR source = :source)
             ORDER BY confidence_score DESC, occurrences_count DESC,
                      normalized_vendor_key
             LIMIT :limit
