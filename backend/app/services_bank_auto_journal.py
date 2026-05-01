@@ -371,6 +371,34 @@ _BRIDLEWOOD_SEED: list[dict[str, Any]] = [
         "priority": 15,
         "notes": "Intuit billing routed through merchant fee bucket; user can recategorize",
     },
+    # ---------- Inflow / deposit rules (debit = bank, credit = clearing) ----------
+    {
+        "rule_code": "EFT_BATCH_DEPOSIT",
+        "description_pattern": "EF0",
+        "match_type": "starts_with",
+        # Inflow-style: bank receives the money (Dr 1020), Ecommerce
+        # clearing settles down (Cr 1095). Pattern matches Moneris EFT
+        # batches like "EF0130 14350 MSP", "EF0202 14350 MSP", etc.
+        "debit_account": DEFAULT_BANK_ACCOUNT_CODE,
+        "credit_account": "1095",
+        "transaction_type": "card_settlement_deposit",
+        "priority": 8,
+        "notes": "Moneris EFT batch settlements (debit-card / e-commerce). Clears 1095.",
+    },
+    {
+        "rule_code": "TD_EXPRESS_DEPOSIT",
+        "description_pattern": "TD EXPRESS DEPOSIT",
+        "match_type": "starts_with",
+        # Inflow-style: physical cash + cheques deposited via TD's
+        # express deposit slot at the branch. Dr 1020 / Cr 1010 moves
+        # till cash (already booked to 1010 via the daily POS journal)
+        # into the chequing account.
+        "debit_account": DEFAULT_BANK_ACCOUNT_CODE,
+        "credit_account": "1010",
+        "transaction_type": "cash_deposit",
+        "priority": 8,
+        "notes": "Daily till deposit. Clears 1010 Cash Float into 1020.",
+    },
 ]
 
 
@@ -926,14 +954,26 @@ def run_auto_journal(
             if magnitude == Decimal("0.00"):
                 continue
             direction = txn["direction"]
-            if direction == "inflow":
-                dr = rule["credit_account"]   # bank goes up
-                cr = rule["debit_account"]    # the rule's "debit" side
-                                              # is the GL we'd normally
-                                              # debit; flip on inflow
+            # Direction-aware account resolution. Rules are stored with
+            # the bank account (1020) on either side:
+            #   outflow-style: debit_account=expense, credit_account=1020
+            #   inflow-style:  debit_account=1020, credit_account=other
+            # If the txn direction matches the rule's natural direction,
+            # use the accounts as-stored. If it doesn't, flip (e.g. a
+            # refund on a normally-outflow vendor → inflow txn → flip).
+            rule_is_outflow_style = (
+                rule["credit_account"] == DEFAULT_BANK_ACCOUNT_CODE
+            )
+            rule_is_inflow_style = (
+                rule["debit_account"] == DEFAULT_BANK_ACCOUNT_CODE
+            )
+            if direction == "outflow" and rule_is_outflow_style:
+                dr, cr = rule["debit_account"], rule["credit_account"]
+            elif direction == "inflow" and rule_is_inflow_style:
+                dr, cr = rule["debit_account"], rule["credit_account"]
             else:
-                dr = rule["debit_account"]
-                cr = rule["credit_account"]
+                # Direction mismatches the rule's natural side — flip.
+                dr, cr = rule["credit_account"], rule["debit_account"]
             prepared_lines.append(
                 {
                     "txn_id": txn["id"],
@@ -1099,13 +1139,74 @@ def run_auto_journal(
                     },
                 )
 
+    # Compute the CUMULATIVE period totals — what the bank_auto_journal
+    # state looks like across all runs in this period combined. This
+    # answers "where does the period stand?" rather than "what did this
+    # one run change?". Necessary because the run loop only processes
+    # transactions not already matched (the WHERE NOT EXISTS filter at
+    # the top), so per-run counts go to 0 once everything is matched
+    # but the journal_batch still holds the matched lines.
+    period_totals = session.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE ajl.matched_status = 'matched')
+                    AS total_matched,
+                COUNT(*) FILTER (
+                    WHERE ajl.matched_status = 'matched'
+                      AND ajl.rule_id IS NOT NULL
+                ) AS by_rules,
+                COUNT(*) FILTER (
+                    WHERE ajl.matched_status = 'matched'
+                      AND bcs.layer = 'vendor_memory'
+                ) AS by_vendor_memory,
+                COUNT(*) FILTER (
+                    WHERE ajl.matched_status = 'matched'
+                      AND bcs.layer = 'claude'
+                ) AS by_claude,
+                COUNT(*) FILTER (WHERE ajl.matched_status = 'unmatched')
+                    AS total_unmatched,
+                COUNT(*) FILTER (WHERE ajl.matched_status = 'skipped')
+                    AS total_skipped,
+                COUNT(*) FILTER (
+                    WHERE ajl.matched_status = 'split_required'
+                ) AS total_split_required
+            FROM bank_auto_journal_lines ajl
+            JOIN bank_transactions bt ON bt.id = ajl.bank_transaction_id
+            LEFT JOIN bank_classification_suggestions bcs
+                ON bcs.bank_transaction_id = ajl.bank_transaction_id
+            WHERE ajl.entity_id = :entity_id
+              AND bt.transaction_date BETWEEN :period_start AND :period_end
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+    period_summary = {
+        "matched": int(period_totals["total_matched"] or 0),
+        "by_layer": {
+            LAYER_RULES: int(period_totals["by_rules"] or 0),
+            LAYER_VENDOR_MEMORY: int(period_totals["by_vendor_memory"] or 0),
+            LAYER_CLAUDE: int(period_totals["by_claude"] or 0),
+        },
+        "unmatched": int(period_totals["total_unmatched"] or 0),
+        "skipped": int(period_totals["total_skipped"] or 0),
+        "split_required": int(period_totals["total_split_required"] or 0),
+    }
+
     # Finalize the run row.
     summary_json = {
-        "matched_count": len(matched_rows),
-        "unmatched_count": len(unmatched_rows),
-        "skipped_count": len(skipped_rows),
-        "split_required_count": len(split_required_rows),
-        "matched_by_layer": layer_counts,
+        "this_run": {
+            "matched_count": len(matched_rows),
+            "unmatched_count": len(unmatched_rows),
+            "skipped_count": len(skipped_rows),
+            "split_required_count": len(split_required_rows),
+            "matched_by_layer": layer_counts,
+        },
+        "period_totals": period_summary,
         "total_debits": str(total_debits),
         "total_credits": str(total_credits),
         "unmatched_sample": unmatched_rows[:50],
@@ -1141,12 +1242,18 @@ def run_auto_journal(
         "entity_code": entity_code,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
+        # ---- this_run: what THIS execution processed ----
         "transactions_reviewed": len(txns),
         "transactions_matched": len(matched_rows),
         "transactions_unmatched": len(unmatched_rows),
         "transactions_skipped": len(skipped_rows),
         "transactions_split_required": len(split_required_rows),
         "matched_by_layer": layer_counts,
+        # ---- period_totals: cumulative state for the period ----
+        # These reflect the bank_auto_journal_lines table after this
+        # run completes, including transactions matched in earlier
+        # runs. Use these to answer "where does the period stand?".
+        "period_totals": period_summary,
         "claude_available": is_claude_available(),
         "journal_batch_id": str(journal_batch_id) if journal_batch_id else None,
         "total_debits": str(total_debits),
