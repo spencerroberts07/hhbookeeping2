@@ -2742,8 +2742,29 @@ def build_ar_adjustment_journal(
 
 
 # --------------------------------------------------------------------------
-# POS Financial daily summary journal
+# POS Financial validation (NOT a journal source)
 # --------------------------------------------------------------------------
+#
+# Architecture rule (corrected 2026-04-30):
+#
+#     The DAILY SOURCE OF TRUTH for sales / tender / HST / COGS GL
+#     postings is the cash_balancing module. Each business_date in
+#     cash_balancing_days produces a journal_batch (entries 1848,
+#     1854, 1855, ... in QBO). Those daily entries ARE the GL.
+#
+#     The MONTHLY POS Financial report is a CHECK on those daily
+#     entries — never a posting source. A prior version of this
+#     module had a `build_pos_financial_journal` that double-posted
+#     daily totals; that batch was voided and the function deleted
+#     in commit 2dfe252's successor.
+#
+# `validate_pos_financial` aggregates the cash_balancing_lines for the
+# same period as the imported pos_financial_snapshots row and reports
+# per-GL-account variances. No writes; pure read.
+# --------------------------------------------------------------------------
+
+
+VALIDATION_TOLERANCE = Decimal("0.05")  # within 5 cents = no variance
 
 
 def _other_tender(snap_other: Any, label: str) -> Decimal:
@@ -2762,40 +2783,77 @@ def _other_tender(snap_other: Any, label: str) -> Decimal:
         return Decimal("0.00")
 
 
-def build_pos_financial_journal(
+def _pos_snapshot_per_gl_account(snap: dict[str, Any]) -> dict[str, Decimal]:
+    """
+    Group POS Financial snapshot fields by the GL account that the
+    cash_balancing module maps the equivalent daily line to.
+
+    Mapping mirrors account_mapping_rules where source_type =
+    'cash_balancing_line_label':
+
+        4010 = "Item Sales"           -> merchandise_sales + non_merchandise_sales
+        2300 = "Tax - HST"            -> hst_collected + hst_5pct
+        1020 = "Visa" + "Mastercard"  -> visa_net + mastercard_net
+               + "Debit Card" + "Amex"   + debit_net + amex_net
+               + "Bank Deposit/EFT"      + cash_amount + cheque_amount + EFT (other)
+               + "Wireless Pin Pad"      + Wireless Pin Pad (other)
+        1095 = "ECOM"                 -> ecommerce_net
+        5020 = gift card lines        -> gift_card_net
+        1085 = "House Acct Charge"    -> house_account_debit + house_account_credit
+               + "House Acct Payment"   (gross sum, since CB rolls both directions
+                                        into 1085)
+        1096 = "Loyalty Redemption"   -> Loyalty Redemption (other)
+        5010 = (no CB equivalent)     -> cogs_merchandise + cogs_non_merchandise
+                                        (POS-only — flagged as "POS-only" in the
+                                        variance report rather than a variance)
+    """
+    other = snap["other_tender_json"]
+    wireless_pin_pad = _other_tender(other, "Wireless Pin Pad (net)")
+    eft_net = _other_tender(other, "E.F.T. (net)")
+    loyalty = _other_tender(other, "Loyalty Redemption")
+
+    return {
+        "4010": _money(snap["merchandise_sales"]) + _money(snap["non_merchandise_sales"]),
+        "2300": _money(snap["hst_collected"]) + _money(snap["hst_5pct"]),
+        "1020": (
+            _money(snap["visa_net"])
+            + _money(snap["mastercard_net"])
+            + _money(snap["debit_net"])
+            + _money(snap["amex_net"])
+            + _money(snap["cash_amount"])
+            + _money(snap["cheque_amount"])
+            + wireless_pin_pad
+            + eft_net
+        ),
+        "1095": _money(snap["ecommerce_net"]),
+        "5020": _money(snap["gift_card_net"]),
+        "1085": _money(snap["house_account_debit"]) + _money(snap["house_account_credit"]),
+        "1096": loyalty,
+        "5010": _money(snap["cogs_merchandise"]) + _money(snap["cogs_non_merchandise"]),
+    }
+
+
+# Accounts where the POS report is the ONLY source — no cash-balancing
+# equivalent — so a non-zero CB total is unexpected, but a non-zero
+# POS total is just informational, not a variance.
+_POS_ONLY_ACCOUNTS = frozenset({"5010"})
+
+
+def validate_pos_financial(
     session,
     *,
     entity_code: str,
     import_run_id: str,
-    actor_email: str,
 ) -> dict[str, Any]:
     """
-    Build the daily-summary journal from a pos_financial_snapshots row.
+    Compare a pos_financial_snapshots row (monthly totals) against the
+    SUM of cash_balancing_lines for the same period, grouped by GL
+    account_code. Returns a per-account variance report. No writes.
 
-    Tender side (Dr — assets received):
-        Dr 1010  Cash Float          cash_amount + cheque_amount
-        Dr 1020  TD Canada Trust     visa + mc + debit + amex + gift +
-                                     ecommerce + wireless_pin_pad + eft
-        Dr 1085  House Accounts      house_account_debit (charges → AR up)
-        Dr 1096  Loyalty Redemption  loyalty (liability paid down)
-        Dr 5010  COGS                cogs_merchandise + cogs_non_merchandise
-
-    Revenue / liability / clearing side (Cr):
-        Cr 4010  Sales               merchandise_sales + non_merch
-                                     + credit_notes_net (sales contra)
-        Cr 2300  HST Payable         hst_collected + hst_5pct
-        Cr 1085  House Accounts      house_account_credit (payments → AR down)
-        Cr 1120  Inventory           cogs_merchandise + cogs_non_merchandise
-
-    Plus a 6699 Cash Over/Short balancing line for any residual rounding,
-    paid-out/in, and other small tender items.
-
-    The journal is balanced exactly to total_debit_side from the snapshot
-    by adjusting 6699 if needed.
+    The result feeds the close control center as a 'pos_financial_validation'
+    section that flags whether monthly POS totals reconcile to what the
+    daily cash-balancing journals already posted.
     """
-    if not actor_email:
-        raise ValueError("actor_email is required")
-
     entity = _resolve_entity_or_raise(session, entity_code)
     run = _resolve_import_run_for_journal(
         session,
@@ -2807,7 +2865,8 @@ def build_pos_financial_journal(
     snap = session.execute(
         text(
             """
-            SELECT cash_amount, cheque_amount,
+            SELECT period_start, period_end,
+                   cash_amount, cheque_amount,
                    visa_net, mastercard_net, debit_net, amex_net,
                    gift_card_net, ecommerce_net,
                    house_account_debit, house_account_credit,
@@ -2831,224 +2890,115 @@ def build_pos_financial_journal(
             "import the POS.txt first."
         )
 
-    other = snap["other_tender_json"]
-    wireless_pin_pad = _other_tender(other, "Wireless Pin Pad (net)")
-    eft_net = _other_tender(other, "E.F.T. (net)")
-    loyalty = _other_tender(other, "Loyalty Redemption")
-    paid_out_in = _other_tender(other, "Paid Out/In")  # net signed; positive = paid out
-    rounding = _other_tender(other, "Rounding to 5 cents")
-    credit_notes_net = _other_tender(other, "Credit Notes")  # net Cr if positive
-
-    # ----- Build raw account amounts (before balancing) -----
-    cash = _money(snap["cash_amount"]) + _money(snap["cheque_amount"])
-    bank = (
-        _money(snap["visa_net"])
-        + _money(snap["mastercard_net"])
-        + _money(snap["debit_net"])
-        + _money(snap["amex_net"])
-        + _money(snap["gift_card_net"])
-        + _money(snap["ecommerce_net"])
-        + wireless_pin_pad
-        + eft_net
-    )
-    ar_charges = _money(snap["house_account_debit"])
-    ar_payments = _money(snap["house_account_credit"])
-    sales = _money(snap["merchandise_sales"]) + _money(snap["non_merchandise_sales"])
-    hst = _money(snap["hst_collected"]) + _money(snap["hst_5pct"])
-    cogs = _money(snap["cogs_merchandise"]) + _money(snap["cogs_non_merchandise"])
-
-    # ----- Compose the line list -----
-    # Each entry: (account_code, debit_amount, credit_amount, memo)
-    lines: list[tuple[str, Decimal, Decimal, str]] = []
-
-    if cash > 0:
-        lines.append(
-            (DEFAULT_CASH_FLOAT_ACCOUNT_CODE, cash, Decimal("0.00"),
-             "Cash + cheque tender")
-        )
-    if bank > 0:
-        lines.append(
-            (DEFAULT_BANK_ACCOUNT_CODE, bank, Decimal("0.00"),
-             "Card / EFT / e-commerce tender")
-        )
-    if ar_charges > 0:
-        lines.append(
-            (DEFAULT_AR_ACCOUNT_CODE, ar_charges, Decimal("0.00"),
-             "House-account charges (AR up)")
-        )
-    if ar_payments > 0:
-        lines.append(
-            (DEFAULT_AR_ACCOUNT_CODE, Decimal("0.00"), ar_payments,
-             "House-account payments (AR down)")
-        )
-    if loyalty > 0:
-        lines.append(
-            (DEFAULT_LOYALTY_ACCOUNT_CODE, loyalty, Decimal("0.00"),
-             "Loyalty redemption")
-        )
-    if cogs > 0:
-        lines.append(
-            (DEFAULT_COGS_ACCOUNT_CODE, cogs, Decimal("0.00"),
-             "Cost of sales")
-        )
-        lines.append(
-            (DEFAULT_INVENTORY_ACCOUNT_CODE, Decimal("0.00"), cogs,
-             "Inventory reduction (sold)")
-        )
-    # Sales = base sales plus net credit-notes (refunds typically net Cr).
-    sales_net = sales + credit_notes_net
-    if sales_net > 0:
-        lines.append(
-            (DEFAULT_SALES_ACCOUNT_CODE, Decimal("0.00"), sales_net,
-             "Merchandise + non-merch sales (incl. credit-notes net)")
-        )
-    if hst > 0:
-        lines.append(
-            (DEFAULT_HST_PAYABLE_ACCOUNT_CODE, Decimal("0.00"), hst,
-             "HST collected")
-        )
-
-    # ----- Balance with 6699 Cash Over/Short -----
-    total_dr = sum((ln[1] for ln in lines), Decimal("0.00"))
-    total_cr = sum((ln[2] for ln in lines), Decimal("0.00"))
-    diff = total_dr - total_cr
-    # paid-out/in + rounding contribute to Dr/Cr; we collapse them with
-    # the balancing residual into a single 6699 line.
-    if diff > 0:
-        # Need a credit to balance (Dr is higher).
-        lines.append(
-            (DEFAULT_CASH_OVER_SHORT_ACCOUNT_CODE, Decimal("0.00"),
-             abs(diff),
-             "Cash over/short + paid-out + rounding (balancing)")
-        )
-    elif diff < 0:
-        lines.append(
-            (DEFAULT_CASH_OVER_SHORT_ACCOUNT_CODE, abs(diff),
-             Decimal("0.00"),
-             "Cash over/short + paid-out + rounding (balancing)")
-        )
-
-    final_dr = sum((ln[1] for ln in lines), Decimal("0.00"))
-    final_cr = sum((ln[2] for ln in lines), Decimal("0.00"))
-    if final_dr != final_cr:
+    period_start = snap["period_start"] or run["period_start"]
+    period_end = snap["period_end"] or run["period_end"]
+    if not period_start or not period_end:
         raise ValueError(
-            f"POS financial journal failed to balance: "
-            f"Dr={final_dr} Cr={final_cr} diff={final_dr - final_cr}"
-        )
-    if final_dr == Decimal("0.00"):
-        raise ValueError(
-            "POS financial snapshot has no activity; nothing to post."
+            "POS financial snapshot is missing period_start / period_end; "
+            "cannot pick the cash-balancing date range."
         )
 
-    summary = {
-        "source_run_id": import_run_id,
-        "entity_code": entity_code,
-        "snapshot": {
-            "cash": str(cash),
-            "bank": str(bank),
-            "ar_charges": str(ar_charges),
-            "ar_payments": str(ar_payments),
-            "loyalty": str(loyalty),
-            "sales_net": str(sales_net),
-            "hst": str(hst),
-            "cogs": str(cogs),
-            "credit_notes_net": str(credit_notes_net),
-            "paid_out_in": str(paid_out_in),
-            "rounding": str(rounding),
-            "snapshot_total": str(_money(snap["total_debit_side"])),
-            "is_balanced_at_source": bool(snap["is_balanced"]),
-        },
-        "line_count": len(lines),
-        "total_debits": str(final_dr),
-        "total_credits": str(final_cr),
-    }
+    pos_per_account = _pos_snapshot_per_gl_account(dict(snap))
 
-    batch = session.execute(
+    cb_rows = session.execute(
         text(
             """
-            INSERT INTO journal_batches (
-                entity_id, accounting_period_id, source_module, batch_label,
-                status, workflow_status,
-                total_debits, total_credits, summary_json
-            ) VALUES (
-                :entity_id, :accounting_period_id, :source_module, :batch_label,
-                'draft', 'draft_ready',
-                :total_debits, :total_credits, CAST(:summary_json AS jsonb)
-            )
-            ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
-            DO UPDATE SET
-                status = 'draft',
-                workflow_status = 'draft_ready',
-                total_debits = EXCLUDED.total_debits,
-                total_credits = EXCLUDED.total_credits,
-                summary_json = EXCLUDED.summary_json,
-                submitted_by = NULL, submitted_at = NULL,
-                reviewed_by = NULL, reviewed_at = NULL,
-                approved_by = NULL, approved_at = NULL,
-                approval_note = NULL, rejection_note = NULL,
-                locked_by = NULL, locked_at = NULL,
-                updated_at = NOW()
-            RETURNING id
+            SELECT l.mapped_account_code AS acct,
+                   COUNT(*) AS line_count,
+                   COALESCE(SUM(l.amount), 0) AS total
+            FROM cash_balancing_lines l
+            JOIN cash_balancing_days d ON d.id = l.cash_balancing_day_id
+            WHERE d.entity_id = :entity_id
+              AND d.business_date BETWEEN :ps AND :pe
+              AND l.translation_status = 'mapped'
+              AND l.mapped_account_code IS NOT NULL
+            GROUP BY l.mapped_account_code
             """
         ),
-        {
-            "entity_id": entity["id"],
-            "accounting_period_id": run["accounting_period_id"],
-            "source_module": SOURCE_MODULE_POS_IMPORT,
-            "batch_label": BATCH_LABEL_POS_FINANCIAL,
-            "total_debits": final_dr,
-            "total_credits": final_cr,
-            "summary_json": json.dumps(summary),
-        },
-    ).mappings().first()
-    journal_batch_id = batch["id"]
+        {"entity_id": entity["id"], "ps": period_start, "pe": period_end},
+    ).mappings().all()
+    cb_per_account: dict[str, Decimal] = {
+        r["acct"]: _money(r["total"]) for r in cb_rows
+    }
+    cb_line_count_per_account: dict[str, int] = {
+        r["acct"]: int(r["line_count"]) for r in cb_rows
+    }
 
-    session.execute(
-        text("DELETE FROM journal_lines WHERE journal_batch_id = :id"),
-        {"id": journal_batch_id},
-    )
-    line_number = 0
-    for acct, dr, cr, memo in lines:
-        line_number += 1
-        session.execute(
-            text(
-                """
-                INSERT INTO journal_lines (
-                    journal_batch_id, line_number, account_code,
-                    debit_amount, credit_amount, memo, source_json
-                ) VALUES (
-                    :id, :ln, :acct, :dr, :cr, :memo, CAST(:src AS jsonb)
-                )
-                """
-            ),
+    cb_day_count = session.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM cash_balancing_days
+            WHERE entity_id = :entity_id
+              AND business_date BETWEEN :ps AND :pe
+            """
+        ),
+        {"entity_id": entity["id"], "ps": period_start, "pe": period_end},
+    ).scalar() or 0
+
+    all_accounts = sorted(set(pos_per_account.keys()) | set(cb_per_account.keys()))
+
+    variance_items: list[dict[str, Any]] = []
+    total_abs_variance = Decimal("0.00")
+    accounts_with_variance = 0
+
+    for acct in all_accounts:
+        pos_amt = pos_per_account.get(acct, Decimal("0.00"))
+        cb_amt = cb_per_account.get(acct, Decimal("0.00"))
+        variance = pos_amt - cb_amt
+        is_pos_only = acct in _POS_ONLY_ACCOUNTS
+        # POS-only accounts (e.g. COGS) are not variances if CB has 0;
+        # they're reported as informational ("posted by another module").
+        if is_pos_only and cb_amt == Decimal("0.00"):
+            has_variance = False
+            note = "POS-only line (cash balancing does not post this account)"
+        else:
+            has_variance = abs(variance) > VALIDATION_TOLERANCE
+            note = None
+        if has_variance:
+            accounts_with_variance += 1
+            total_abs_variance += abs(variance)
+        variance_items.append(
             {
-                "id": journal_batch_id,
-                "ln": line_number,
-                "acct": acct,
-                "dr": dr,
-                "cr": cr,
-                "memo": memo,
-                "src": json.dumps(
-                    {
-                        "source_module": SOURCE_MODULE_POS_IMPORT,
-                        "import_run_id": import_run_id,
-                        "report_type": REPORT_TYPE_POS_FINANCIAL,
-                    }
-                ),
-            },
+                "account_code": acct,
+                "pos_monthly_total": str(pos_amt),
+                "cash_balancing_daily_sum": str(cb_amt),
+                "variance": str(variance.quantize(Decimal("0.01"))),
+                "has_variance": has_variance,
+                "is_pos_only": is_pos_only,
+                "cb_line_count": cb_line_count_per_account.get(acct, 0),
+                "note": note,
+            }
         )
 
+    is_balanced = accounts_with_variance == 0
+
     return {
-        "journal_batch_id": str(journal_batch_id),
         "entity_code": entity_code,
         "import_run_id": import_run_id,
-        "line_count": len(lines),
-        "total_debits": str(final_dr),
-        "total_credits": str(final_cr),
-        "is_balanced": final_dr == final_cr,
-        "snapshot_total": str(_money(snap["total_debit_side"])),
-        "summary": summary["snapshot"],
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "snapshot_total_debit_side": str(_money(snap["total_debit_side"])),
+        "snapshot_total_credit_side": str(_money(snap["total_credit_side"])),
+        "snapshot_is_balanced_at_source": bool(snap["is_balanced"]),
+        "cash_balancing_day_count": int(cb_day_count),
+        "tolerance": str(VALIDATION_TOLERANCE),
+        "is_balanced": is_balanced,
+        "accounts_with_variance": accounts_with_variance,
+        "total_absolute_variance": str(total_abs_variance.quantize(Decimal("0.01"))),
+        "variance_items": variance_items,
+        "close_ready": is_balanced,
     }
+
+
+# --------------------------------------------------------------------------
+# (formerly: build_pos_financial_journal — REMOVED 2026-04-30)
+# --------------------------------------------------------------------------
+# This function previously synthesized a journal_batch from a
+# pos_financial_snapshots row. It was incorrect by design — the daily
+# cash_balancing module already posts the same GL accounts each
+# business_date, so the monthly journal double-counted. The bad batch
+# (id 0dee9d89-4a7a-4398-8686-44f98c5f768f) was voided and the
+# function removed. Use validate_pos_financial above for monthly checks.
 
 
 # --------------------------------------------------------------------------
@@ -3518,4 +3468,113 @@ def section_pos_reports(
             "row_count": ar_adjustment["row_count"] if ar_adjustment else None,
             "total_amount": str(ar_adjustment["total_amount"]) if ar_adjustment and ar_adjustment["total_amount"] is not None else None,
         },
+    }
+
+
+def section_pos_financial_validation(
+    session,
+    *,
+    entity_id: UUID,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Close-control-center section that runs validate_pos_financial for the
+    period's most recent pos_financial import and surfaces the variance
+    summary.
+
+    Status:
+        no_data       — no pos_financial run for the period
+        needs_review  — 1+ accounts with variance above tolerance
+        ready         — all account totals match within tolerance
+    """
+    if not _has_table(session, "pos_financial_snapshots"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "pos_financial_snapshots table not present",
+        }
+
+    run = session.execute(
+        text(
+            """
+            SELECT pir.id, pir.period_start, pir.period_end
+            FROM pos_import_runs pir
+            JOIN pos_financial_snapshots pfs
+              ON pfs.import_run_id = pir.id
+            WHERE pir.entity_id = :entity_id
+              AND pir.report_type = :report_type
+              AND COALESCE(pir.period_end, pir.period_start)
+                  BETWEEN :period_start AND :period_end
+            ORDER BY pir.created_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "report_type": REPORT_TYPE_POS_FINANCIAL,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+    if not run:
+        return {
+            "status": "no_data",
+            "module_present": True,
+            "summary": (
+                f"No pos_financial import for {period_start.isoformat()} – "
+                f"{period_end.isoformat()}; cannot run validation."
+            ),
+        }
+
+    # Look up entity_code to call the validate fn (it takes entity_code).
+    entity_row = session.execute(
+        text("SELECT entity_code FROM entities WHERE id = :id"),
+        {"id": entity_id},
+    ).mappings().first()
+    if not entity_row:
+        return {
+            "status": "no_data",
+            "module_present": True,
+            "summary": "entities row missing for the given entity_id",
+        }
+
+    try:
+        result = validate_pos_financial(
+            session,
+            entity_code=entity_row["entity_code"],
+            import_run_id=str(run["id"]),
+        )
+    except ValueError as exc:
+        return {
+            "status": "needs_review",
+            "module_present": True,
+            "summary": f"Validation failed: {exc}",
+        }
+
+    if result["is_balanced"]:
+        status = "ready"
+        summary = (
+            f"POS monthly totals reconcile to cash-balancing daily sum "
+            f"for all accounts (within ${result['tolerance']} tolerance)."
+        )
+    else:
+        status = "needs_review"
+        summary = (
+            f"{result['accounts_with_variance']} account(s) have variance "
+            f"between POS monthly report and cash-balancing daily sum "
+            f"(total ${result['total_absolute_variance']})."
+        )
+
+    return {
+        "status": status,
+        "module_present": True,
+        "summary": summary,
+        "import_run_id": str(run["id"]),
+        "is_balanced": result["is_balanced"],
+        "accounts_with_variance": result["accounts_with_variance"],
+        "total_absolute_variance": result["total_absolute_variance"],
+        "variance_items": result["variance_items"],
+        "tolerance": result["tolerance"],
+        "cash_balancing_day_count": result["cash_balancing_day_count"],
     }

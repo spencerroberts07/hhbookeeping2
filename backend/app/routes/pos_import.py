@@ -31,7 +31,6 @@ from ..services_auth import require_role
 from ..services_pos_import import (
     build_ar_adjustment_journal,
     build_donation_journal,
-    build_pos_financial_journal,
     build_store_use_journal,
     extract_text_from_upload,
     get_latest_aged_ar_snapshot,
@@ -44,6 +43,7 @@ from ..services_pos_import import (
     import_inventory_value,
     import_pos_financial,
     list_pos_import_runs,
+    validate_pos_financial,
 )
 
 
@@ -330,26 +330,33 @@ def post_build_ar_adjustment_journal(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-class BuildPosFinancialJournalRequest(BaseModel):
+class ValidatePosFinancialRequest(BaseModel):
     entity_code: str = Field(..., examples=["1877-8"])
     import_run_id: str = Field(
         ..., examples=["9ba44c24-40c5-4e6d-acf2-005351ff97f3"]
     )
-    actor_email: str = Field(..., examples=["controller@bridlewood.ca"])
 
 
-@router.post("/build-pos-financial-journal")
-def post_build_pos_financial_journal(
-    body: BuildPosFinancialJournalRequest,
+@router.post("/validate-pos-financial")
+def post_validate_pos_financial(
+    body: ValidatePosFinancialRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    """
+    Compare a monthly POS Financial snapshot against the SUM of daily
+    cash_balancing journals for the same period. Returns a per-GL-account
+    variance report. **No journal entries are written** — this endpoint
+    is read-only.
+
+    Replaces the deprecated POST /api/pos-import/build-pos-financial-journal,
+    which double-counted daily entries.
+    """
     try:
         with db_session() as session:
-            return build_pos_financial_journal(
+            return validate_pos_financial(
                 session,
                 entity_code=body.entity_code,
                 import_run_id=body.import_run_id,
-                actor_email=body.actor_email,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

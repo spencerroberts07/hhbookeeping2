@@ -799,6 +799,7 @@ def _section_journal_batches(
     pending_count = 0
     unbalanced_count = 0
     approved_count = 0
+    voided_count = 0
 
     for row in rows:
         total_debits = Decimal(str(row["total_debits"] or 0))
@@ -806,12 +807,18 @@ def _section_journal_batches(
         balance_diff = total_debits - total_credits
         is_balanced = balance_diff == 0
         wf = row["workflow_status"]
+        st = row["status"]
 
-        if wf in {"approved_to_post", "posted"}:
+        is_voided = (wf == "voided") or (st == "voided")
+        if is_voided:
+            voided_count += 1
+        elif wf in {"approved_to_post", "posted"}:
             approved_count += 1
         else:
             pending_count += 1
-        if not is_balanced:
+        # Voided batches are out-of-band; their balance state doesn't
+        # block close (they have no journal_lines anyway).
+        if not is_balanced and not is_voided:
             unbalanced_count += 1
 
         batches.append(
@@ -842,6 +849,7 @@ def _section_journal_batches(
             "pending_count": 0,
             "unbalanced_count": 0,
             "approved_count": 0,
+            "voided_count": 0,
         }
 
     if unbalanced_count > 0:
@@ -853,6 +861,8 @@ def _section_journal_batches(
     else:
         status = "ready"
         summary = f"All {approved_count} journal batch(es) approved"
+    if voided_count > 0:
+        summary = f"{summary} ({voided_count} voided ignored)"
 
     return {
         "status": status,
@@ -862,6 +872,7 @@ def _section_journal_batches(
         "pending_count": pending_count,
         "unbalanced_count": unbalanced_count,
         "approved_count": approved_count,
+        "voided_count": voided_count,
     }
 
 
@@ -927,6 +938,41 @@ def _section_pos_reports(
     from .services_pos_import import section_pos_reports  # noqa: WPS433
 
     return section_pos_reports(
+        session,
+        entity_id=entity_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
+def _section_pos_financial_validation(
+    session,
+    entity_id: UUID,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Wraps services_pos_import.section_pos_financial_validation() — runs
+    the monthly-POS vs daily-cash-balancing variance check. Pure read.
+    """
+    if not _has_table(session, "pos_financial_snapshots"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "pos_financial_snapshots table not present",
+        }
+    if not _has_table(session, "cash_balancing_lines"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": (
+                "cash_balancing_lines table not present; cannot validate "
+                "POS monthly against daily cash balancing."
+            ),
+        }
+    from .services_pos_import import section_pos_financial_validation  # noqa: WPS433
+
+    return section_pos_financial_validation(
         session,
         entity_id=entity_id,
         period_start=period_start,
@@ -1143,6 +1189,9 @@ def get_month_end_close_status(
             session, entity_code, period_start, period_end_date
         ),
         "pos_reports": _section_pos_reports(
+            session, entity["id"], period_start, period_end_date
+        ),
+        "pos_financial_validation": _section_pos_financial_validation(
             session, entity["id"], period_start, period_end_date
         ),
         "gl_import": _section_gl_import_wrapper(
