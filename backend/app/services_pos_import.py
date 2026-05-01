@@ -92,11 +92,21 @@ DEFAULT_DONATION_EXPENSE_ACCOUNT_CODE = "6695"
 DEFAULT_AR_ACCOUNT_CODE = "1085"
 DEFAULT_BAD_DEBT_EXPENSE_ACCOUNT_CODE = "6550"
 
+# POS-financial journal account defaults
+DEFAULT_CASH_FLOAT_ACCOUNT_CODE = "1010"
+DEFAULT_BANK_ACCOUNT_CODE = "1020"
+DEFAULT_LOYALTY_ACCOUNT_CODE = "1096"
+DEFAULT_SALES_ACCOUNT_CODE = "4010"
+DEFAULT_HST_PAYABLE_ACCOUNT_CODE = "2300"
+DEFAULT_COGS_ACCOUNT_CODE = "5010"
+DEFAULT_CASH_OVER_SHORT_ACCOUNT_CODE = "6699"
+
 # journal_batches.source_module + batch_label conventions
 SOURCE_MODULE_POS_IMPORT = "pos_import"
 BATCH_LABEL_STORE_USE = "store_use_inventory_reclass"
 BATCH_LABEL_DONATION = "donation_inventory_reclass"
 BATCH_LABEL_AR_ADJUSTMENT = "ar_adjustment_writeoff"
+BATCH_LABEL_POS_FINANCIAL = "pos_financial_daily_summary"
 
 # PDF magic-byte prefix — used to detect a binary PDF upload so we can
 # extract text via pypdf / OCR before handing it to a parser.
@@ -2279,6 +2289,7 @@ def _build_inventory_reclass_journal(
     inventory_account_code: str,
     batch_label: str,
     journal_memo: str,
+    override_total: Decimal | None = None,
 ) -> dict[str, Any]:
     if not actor_email:
         raise ValueError("actor_email is required")
@@ -2296,7 +2307,8 @@ def _build_inventory_reclass_journal(
             f"builder reason={expected_reason!r}"
         )
 
-    # Sum the lines for this run (filter on reason for safety).
+    # Sum the lines for this run. Use ILIKE so reason variants like
+    # 'SUPPLIES - Coffee bar' or 'STORE_USE_SUPPLIES' all match.
     line_rows = session.execute(
         text(
             """
@@ -2304,21 +2316,21 @@ def _build_inventory_reclass_journal(
             FROM inventory_adjustment_lines
             WHERE entity_id = :entity_id
               AND import_run_id = :import_run_id
-              AND adjustment_reason = :adjustment_reason
+              AND adjustment_reason ILIKE :reason_like
             ORDER BY date_adjusted, sku_number
             """
         ),
         {
             "entity_id": entity["id"],
             "import_run_id": _parse_uuid(import_run_id, "import_run_id"),
-            "adjustment_reason": expected_reason,
+            "reason_like": f"%{expected_reason}%",
         },
     ).mappings().all()
 
     if not line_rows:
         raise ValueError(
-            "No inventory_adjustment_lines for this import run + reason; "
-            "nothing to post."
+            f"No inventory_adjustment_lines matching reason ~ "
+            f"{expected_reason!r} for this import run; nothing to post."
         )
 
     # The store reports adjustment_cost as a negative number when
@@ -2329,15 +2341,21 @@ def _build_inventory_reclass_journal(
     # When the imported run was a single-reason report (e.g. a SUPPLIES-only
     # or DONATION-only export), the run's total_amount carries the parsed
     # report-header total. Prefer that over the line-sum because the report
-    # header is authoritative — line-level $0.00 cost rows (gift cards,
-    # take-one brochures) can drift the line-sum below the printed total
-    # when the parser misses a small-cost row. For combined ('ALL') runs,
-    # there is no per-reason header total, so we fall back to the line sum.
+    # header is authoritative.
+    # For combined ('ALL') runs, the parser stores total_amount=0 because
+    # the report has per-reason subtotals rather than one grand total —
+    # in that case, we fall back to summing the matched lines.
+    # The caller can also pass override_total to force a specific value
+    # (useful when the parser missed lines and the operator has the
+    # printed Prism subtotal in hand).
     header_total: Decimal | None = None
     if run_reason == expected_reason and run.get("total_amount") is not None:
         header_total = abs(_money(run["total_amount"]))
 
-    if header_total is not None and header_total != Decimal("0.00"):
+    if override_total is not None:
+        total = abs(_money(override_total))
+        total_source = "override"
+    elif header_total is not None and header_total != Decimal("0.00"):
         total = header_total
         total_source = "report_header"
     else:
@@ -2480,14 +2498,19 @@ def build_store_use_journal(
     actor_email: str,
     expense_account_code: str = DEFAULT_STORE_USE_EXPENSE_ACCOUNT_CODE,
     inventory_account_code: str = DEFAULT_INVENTORY_ACCOUNT_CODE,
+    override_total: Decimal | None = None,
 ) -> dict[str, Any]:
     """
     Reads inventory_adjustment_lines for `import_run_id` whose
-    adjustment_reason is SUPPLIES (store use) and writes a balanced
-    journal_batch:
+    adjustment_reason matches SUPPLIES (store use) and writes a
+    balanced journal_batch:
 
         Dr  Store Supplies Expense  [total]
         Cr  Inventory               [total]
+
+    `override_total` lets the operator pass a specific magnitude when
+    the parser missed lines and the printed Prism subtotal differs
+    from the line sum.
     """
     return _build_inventory_reclass_journal(
         session,
@@ -2499,6 +2522,7 @@ def build_store_use_journal(
         inventory_account_code=inventory_account_code,
         batch_label=BATCH_LABEL_STORE_USE,
         journal_memo="Store use / supplies — inventory reclass",
+        override_total=override_total,
     )
 
 
@@ -2510,10 +2534,12 @@ def build_donation_journal(
     actor_email: str,
     expense_account_code: str = DEFAULT_DONATION_EXPENSE_ACCOUNT_CODE,
     inventory_account_code: str = DEFAULT_INVENTORY_ACCOUNT_CODE,
+    override_total: Decimal | None = None,
 ) -> dict[str, Any]:
     """
     Reads inventory_adjustment_lines for `import_run_id` whose
-    adjustment_reason is DONATION and writes a balanced journal_batch:
+    adjustment_reason matches DONATION and writes a balanced
+    journal_batch:
 
         Dr  Charitable Donations    [total]
         Cr  Inventory               [total]
@@ -2528,6 +2554,7 @@ def build_donation_journal(
         inventory_account_code=inventory_account_code,
         batch_label=BATCH_LABEL_DONATION,
         journal_memo="Charitable donations — inventory reclass",
+        override_total=override_total,
     )
 
 
@@ -2711,6 +2738,316 @@ def build_ar_adjustment_journal(
         "total_credits": str(total),
         "line_count": len(line_rows),
         "direction": direction,
+    }
+
+
+# --------------------------------------------------------------------------
+# POS Financial daily summary journal
+# --------------------------------------------------------------------------
+
+
+def _other_tender(snap_other: Any, label: str) -> Decimal:
+    """Pull a numeric value from pos_financial_snapshots.other_tender_json
+    by label, returning Decimal('0.00') if absent or unparseable."""
+    if not snap_other:
+        return Decimal("0.00")
+    try:
+        if isinstance(snap_other, str):
+            snap_other = json.loads(snap_other)
+        v = snap_other.get(label) if isinstance(snap_other, dict) else None
+        if v is None:
+            return Decimal("0.00")
+        return _money(v)
+    except Exception:
+        return Decimal("0.00")
+
+
+def build_pos_financial_journal(
+    session,
+    *,
+    entity_code: str,
+    import_run_id: str,
+    actor_email: str,
+) -> dict[str, Any]:
+    """
+    Build the daily-summary journal from a pos_financial_snapshots row.
+
+    Tender side (Dr — assets received):
+        Dr 1010  Cash Float          cash_amount + cheque_amount
+        Dr 1020  TD Canada Trust     visa + mc + debit + amex + gift +
+                                     ecommerce + wireless_pin_pad + eft
+        Dr 1085  House Accounts      house_account_debit (charges → AR up)
+        Dr 1096  Loyalty Redemption  loyalty (liability paid down)
+        Dr 5010  COGS                cogs_merchandise + cogs_non_merchandise
+
+    Revenue / liability / clearing side (Cr):
+        Cr 4010  Sales               merchandise_sales + non_merch
+                                     + credit_notes_net (sales contra)
+        Cr 2300  HST Payable         hst_collected + hst_5pct
+        Cr 1085  House Accounts      house_account_credit (payments → AR down)
+        Cr 1120  Inventory           cogs_merchandise + cogs_non_merchandise
+
+    Plus a 6699 Cash Over/Short balancing line for any residual rounding,
+    paid-out/in, and other small tender items.
+
+    The journal is balanced exactly to total_debit_side from the snapshot
+    by adjusting 6699 if needed.
+    """
+    if not actor_email:
+        raise ValueError("actor_email is required")
+
+    entity = _resolve_entity_or_raise(session, entity_code)
+    run = _resolve_import_run_for_journal(
+        session,
+        entity["id"],
+        import_run_id,
+        expected_report_types=(REPORT_TYPE_POS_FINANCIAL,),
+    )
+
+    snap = session.execute(
+        text(
+            """
+            SELECT cash_amount, cheque_amount,
+                   visa_net, mastercard_net, debit_net, amex_net,
+                   gift_card_net, ecommerce_net,
+                   house_account_debit, house_account_credit,
+                   merchandise_sales, non_merchandise_sales,
+                   cogs_merchandise, cogs_non_merchandise,
+                   hst_collected, hst_5pct,
+                   total_debit_side, total_credit_side, is_balanced,
+                   other_tender_json
+            FROM pos_financial_snapshots
+            WHERE entity_id = :entity_id AND import_run_id = :run_id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "run_id": _parse_uuid(import_run_id, "import_run_id"),
+        },
+    ).mappings().first()
+    if not snap:
+        raise ValueError(
+            f"No pos_financial_snapshots row for run {import_run_id}; "
+            "import the POS.txt first."
+        )
+
+    other = snap["other_tender_json"]
+    wireless_pin_pad = _other_tender(other, "Wireless Pin Pad (net)")
+    eft_net = _other_tender(other, "E.F.T. (net)")
+    loyalty = _other_tender(other, "Loyalty Redemption")
+    paid_out_in = _other_tender(other, "Paid Out/In")  # net signed; positive = paid out
+    rounding = _other_tender(other, "Rounding to 5 cents")
+    credit_notes_net = _other_tender(other, "Credit Notes")  # net Cr if positive
+
+    # ----- Build raw account amounts (before balancing) -----
+    cash = _money(snap["cash_amount"]) + _money(snap["cheque_amount"])
+    bank = (
+        _money(snap["visa_net"])
+        + _money(snap["mastercard_net"])
+        + _money(snap["debit_net"])
+        + _money(snap["amex_net"])
+        + _money(snap["gift_card_net"])
+        + _money(snap["ecommerce_net"])
+        + wireless_pin_pad
+        + eft_net
+    )
+    ar_charges = _money(snap["house_account_debit"])
+    ar_payments = _money(snap["house_account_credit"])
+    sales = _money(snap["merchandise_sales"]) + _money(snap["non_merchandise_sales"])
+    hst = _money(snap["hst_collected"]) + _money(snap["hst_5pct"])
+    cogs = _money(snap["cogs_merchandise"]) + _money(snap["cogs_non_merchandise"])
+
+    # ----- Compose the line list -----
+    # Each entry: (account_code, debit_amount, credit_amount, memo)
+    lines: list[tuple[str, Decimal, Decimal, str]] = []
+
+    if cash > 0:
+        lines.append(
+            (DEFAULT_CASH_FLOAT_ACCOUNT_CODE, cash, Decimal("0.00"),
+             "Cash + cheque tender")
+        )
+    if bank > 0:
+        lines.append(
+            (DEFAULT_BANK_ACCOUNT_CODE, bank, Decimal("0.00"),
+             "Card / EFT / e-commerce tender")
+        )
+    if ar_charges > 0:
+        lines.append(
+            (DEFAULT_AR_ACCOUNT_CODE, ar_charges, Decimal("0.00"),
+             "House-account charges (AR up)")
+        )
+    if ar_payments > 0:
+        lines.append(
+            (DEFAULT_AR_ACCOUNT_CODE, Decimal("0.00"), ar_payments,
+             "House-account payments (AR down)")
+        )
+    if loyalty > 0:
+        lines.append(
+            (DEFAULT_LOYALTY_ACCOUNT_CODE, loyalty, Decimal("0.00"),
+             "Loyalty redemption")
+        )
+    if cogs > 0:
+        lines.append(
+            (DEFAULT_COGS_ACCOUNT_CODE, cogs, Decimal("0.00"),
+             "Cost of sales")
+        )
+        lines.append(
+            (DEFAULT_INVENTORY_ACCOUNT_CODE, Decimal("0.00"), cogs,
+             "Inventory reduction (sold)")
+        )
+    # Sales = base sales plus net credit-notes (refunds typically net Cr).
+    sales_net = sales + credit_notes_net
+    if sales_net > 0:
+        lines.append(
+            (DEFAULT_SALES_ACCOUNT_CODE, Decimal("0.00"), sales_net,
+             "Merchandise + non-merch sales (incl. credit-notes net)")
+        )
+    if hst > 0:
+        lines.append(
+            (DEFAULT_HST_PAYABLE_ACCOUNT_CODE, Decimal("0.00"), hst,
+             "HST collected")
+        )
+
+    # ----- Balance with 6699 Cash Over/Short -----
+    total_dr = sum((ln[1] for ln in lines), Decimal("0.00"))
+    total_cr = sum((ln[2] for ln in lines), Decimal("0.00"))
+    diff = total_dr - total_cr
+    # paid-out/in + rounding contribute to Dr/Cr; we collapse them with
+    # the balancing residual into a single 6699 line.
+    if diff > 0:
+        # Need a credit to balance (Dr is higher).
+        lines.append(
+            (DEFAULT_CASH_OVER_SHORT_ACCOUNT_CODE, Decimal("0.00"),
+             abs(diff),
+             "Cash over/short + paid-out + rounding (balancing)")
+        )
+    elif diff < 0:
+        lines.append(
+            (DEFAULT_CASH_OVER_SHORT_ACCOUNT_CODE, abs(diff),
+             Decimal("0.00"),
+             "Cash over/short + paid-out + rounding (balancing)")
+        )
+
+    final_dr = sum((ln[1] for ln in lines), Decimal("0.00"))
+    final_cr = sum((ln[2] for ln in lines), Decimal("0.00"))
+    if final_dr != final_cr:
+        raise ValueError(
+            f"POS financial journal failed to balance: "
+            f"Dr={final_dr} Cr={final_cr} diff={final_dr - final_cr}"
+        )
+    if final_dr == Decimal("0.00"):
+        raise ValueError(
+            "POS financial snapshot has no activity; nothing to post."
+        )
+
+    summary = {
+        "source_run_id": import_run_id,
+        "entity_code": entity_code,
+        "snapshot": {
+            "cash": str(cash),
+            "bank": str(bank),
+            "ar_charges": str(ar_charges),
+            "ar_payments": str(ar_payments),
+            "loyalty": str(loyalty),
+            "sales_net": str(sales_net),
+            "hst": str(hst),
+            "cogs": str(cogs),
+            "credit_notes_net": str(credit_notes_net),
+            "paid_out_in": str(paid_out_in),
+            "rounding": str(rounding),
+            "snapshot_total": str(_money(snap["total_debit_side"])),
+            "is_balanced_at_source": bool(snap["is_balanced"]),
+        },
+        "line_count": len(lines),
+        "total_debits": str(final_dr),
+        "total_credits": str(final_cr),
+    }
+
+    batch = session.execute(
+        text(
+            """
+            INSERT INTO journal_batches (
+                entity_id, accounting_period_id, source_module, batch_label,
+                status, workflow_status,
+                total_debits, total_credits, summary_json
+            ) VALUES (
+                :entity_id, :accounting_period_id, :source_module, :batch_label,
+                'draft', 'draft_ready',
+                :total_debits, :total_credits, CAST(:summary_json AS jsonb)
+            )
+            ON CONFLICT (entity_id, accounting_period_id, source_module, batch_label)
+            DO UPDATE SET
+                status = 'draft',
+                workflow_status = 'draft_ready',
+                total_debits = EXCLUDED.total_debits,
+                total_credits = EXCLUDED.total_credits,
+                summary_json = EXCLUDED.summary_json,
+                submitted_by = NULL, submitted_at = NULL,
+                reviewed_by = NULL, reviewed_at = NULL,
+                approved_by = NULL, approved_at = NULL,
+                approval_note = NULL, rejection_note = NULL,
+                locked_by = NULL, locked_at = NULL,
+                updated_at = NOW()
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "accounting_period_id": run["accounting_period_id"],
+            "source_module": SOURCE_MODULE_POS_IMPORT,
+            "batch_label": BATCH_LABEL_POS_FINANCIAL,
+            "total_debits": final_dr,
+            "total_credits": final_cr,
+            "summary_json": json.dumps(summary),
+        },
+    ).mappings().first()
+    journal_batch_id = batch["id"]
+
+    session.execute(
+        text("DELETE FROM journal_lines WHERE journal_batch_id = :id"),
+        {"id": journal_batch_id},
+    )
+    line_number = 0
+    for acct, dr, cr, memo in lines:
+        line_number += 1
+        session.execute(
+            text(
+                """
+                INSERT INTO journal_lines (
+                    journal_batch_id, line_number, account_code,
+                    debit_amount, credit_amount, memo, source_json
+                ) VALUES (
+                    :id, :ln, :acct, :dr, :cr, :memo, CAST(:src AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": journal_batch_id,
+                "ln": line_number,
+                "acct": acct,
+                "dr": dr,
+                "cr": cr,
+                "memo": memo,
+                "src": json.dumps(
+                    {
+                        "source_module": SOURCE_MODULE_POS_IMPORT,
+                        "import_run_id": import_run_id,
+                        "report_type": REPORT_TYPE_POS_FINANCIAL,
+                    }
+                ),
+            },
+        )
+
+    return {
+        "journal_batch_id": str(journal_batch_id),
+        "entity_code": entity_code,
+        "import_run_id": import_run_id,
+        "line_count": len(lines),
+        "total_debits": str(final_dr),
+        "total_credits": str(final_cr),
+        "is_balanced": final_dr == final_cr,
+        "snapshot_total": str(_money(snap["total_debit_side"])),
+        "summary": summary["snapshot"],
     }
 
 

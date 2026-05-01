@@ -31,6 +31,7 @@ from ..services_auth import require_role
 from ..services_pos_import import (
     build_ar_adjustment_journal,
     build_donation_journal,
+    build_pos_financial_journal,
     build_store_use_journal,
     extract_text_from_upload,
     get_latest_aged_ar_snapshot,
@@ -101,6 +102,15 @@ class BuildJournalRequest(BaseModel):
     inventory_account_code: str | None = Field(
         default=None,
         description="Override for the credit-side inventory account. Defaults to 1120.",
+    )
+    override_total: float | None = Field(
+        default=None,
+        description=(
+            "Force the journal magnitude to this value (e.g. 672.5581 from "
+            "the printed Prism subtotal when the parser missed lines and "
+            "line_sum drifts below the report header). Bypasses run.total_amount "
+            "and the line-sum fallback."
+        ),
     )
 
 
@@ -251,6 +261,9 @@ def post_build_store_use_journal(
                 kwargs["expense_account_code"] = body.expense_account_code
             if body.inventory_account_code:
                 kwargs["inventory_account_code"] = body.inventory_account_code
+            if body.override_total is not None:
+                from decimal import Decimal
+                kwargs["override_total"] = Decimal(str(body.override_total))
             return build_store_use_journal(session, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -272,6 +285,9 @@ def post_build_donation_journal(
                 kwargs["expense_account_code"] = body.expense_account_code
             if body.inventory_account_code:
                 kwargs["inventory_account_code"] = body.inventory_account_code
+            if body.override_total is not None:
+                from decimal import Decimal
+                kwargs["override_total"] = Decimal(str(body.override_total))
             return build_donation_journal(session, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -310,6 +326,31 @@ def post_build_ar_adjustment_journal(
             if body.ar_account_code:
                 kwargs["ar_account_code"] = body.ar_account_code
             return build_ar_adjustment_journal(session, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class BuildPosFinancialJournalRequest(BaseModel):
+    entity_code: str = Field(..., examples=["1877-8"])
+    import_run_id: str = Field(
+        ..., examples=["9ba44c24-40c5-4e6d-acf2-005351ff97f3"]
+    )
+    actor_email: str = Field(..., examples=["controller@bridlewood.ca"])
+
+
+@router.post("/build-pos-financial-journal")
+def post_build_pos_financial_journal(
+    body: BuildPosFinancialJournalRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            return build_pos_financial_journal(
+                session,
+                entity_code=body.entity_code,
+                import_run_id=body.import_run_id,
+                actor_email=body.actor_email,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
