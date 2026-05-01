@@ -2737,9 +2737,9 @@ def list_pos_import_runs(
                    row_count, status, actor_email, created_at
             FROM pos_import_runs
             WHERE entity_id = :entity_id
-              AND (:period_start IS NULL OR period_end >= :period_start)
-              AND (:period_end   IS NULL OR period_start <= :period_end)
-              AND (:report_type IS NULL OR report_type = :report_type)
+              AND (CAST(:period_start AS DATE) IS NULL OR period_end >= CAST(:period_start AS DATE))
+              AND (CAST(:period_end AS DATE) IS NULL OR period_start <= CAST(:period_end AS DATE))
+              AND (CAST(:report_type AS TEXT) IS NULL OR report_type = CAST(:report_type AS TEXT))
             ORDER BY created_at DESC
             LIMIT :limit
             """

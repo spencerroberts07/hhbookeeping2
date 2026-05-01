@@ -994,7 +994,7 @@ def list_bank_csv_import_runs(
                    status, is_preview, actor_email, created_at
             FROM bank_csv_import_runs
             WHERE entity_id = :entity_id
-              AND (:source_account_code IS NULL OR source_account_code = :source_account_code)
+              AND (CAST(:source_account_code AS TEXT) IS NULL OR source_account_code = CAST(:source_account_code AS TEXT))
             ORDER BY created_at DESC
             LIMIT :limit
             """

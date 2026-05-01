@@ -909,7 +909,7 @@ def get_gl_account_transactions(
             FROM gl_transactions
             WHERE entity_id = :entity_id
               AND import_run_id = :run_id
-              AND (:account_code IS NULL OR account_code = :account_code)
+              AND (CAST(:account_code AS TEXT) IS NULL OR account_code = CAST(:account_code AS TEXT))
             ORDER BY account_code, transaction_date, name
             LIMIT :limit
             """
