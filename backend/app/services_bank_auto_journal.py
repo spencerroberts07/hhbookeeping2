@@ -374,33 +374,31 @@ _BRIDLEWOOD_SEED: list[dict[str, Any]] = [
         "priority": 15,
         "notes": "Intuit billing routed through merchant fee bucket; user can recategorize",
     },
-    # ---------- Inflow / deposit rules (debit = bank, credit = clearing) ----------
+    # ---------- Inflow / deposit rules — HARD SKIP ----------
+    # These bank rows are already booked daily by the cash_balancing
+    # module from the Google Sheets entries. The bank_auto_journal must
+    # NOT post a second journal for them or 1095/1010 double-counts.
     {
         "rule_code": "EFT_BATCH_DEPOSIT",
         "description_pattern": "EF0",
         "match_type": "starts_with",
-        # Inflow-style: bank receives the money (Dr 1020), Ecommerce
-        # clearing settles down (Cr 1095). Pattern matches Moneris EFT
-        # batches like "EF0130 14350 MSP", "EF0202 14350 MSP", etc.
         "debit_account": DEFAULT_BANK_ACCOUNT_CODE,
         "credit_account": "1095",
         "transaction_type": "card_settlement_deposit",
         "priority": 8,
-        "notes": "Moneris EFT batch settlements (debit-card / e-commerce). Clears 1095.",
+        "hard_skip": True,
+        "notes": "Moneris EFT batch settlements (debit-card / e-commerce). Already booked by cash_balancing daily; hard-skip here to avoid double-posting 1095.",
     },
     {
         "rule_code": "TD_EXPRESS_DEPOSIT",
         "description_pattern": "TD EXPRESS DEPOSIT",
         "match_type": "starts_with",
-        # Inflow-style: physical cash + cheques deposited via TD's
-        # express deposit slot at the branch. Dr 1020 / Cr 1010 moves
-        # till cash (already booked to 1010 via the daily POS journal)
-        # into the chequing account.
         "debit_account": DEFAULT_BANK_ACCOUNT_CODE,
         "credit_account": "1010",
         "transaction_type": "cash_deposit",
         "priority": 8,
-        "notes": "Daily till deposit. Clears 1010 Cash Float into 1020.",
+        "hard_skip": True,
+        "notes": "Daily till deposit. Already booked by cash_balancing daily; hard-skip here to avoid double-posting 1010.",
     },
 ]
 
@@ -444,12 +442,12 @@ def seed_rules(session, *, entity_code: str, actor_email: str) -> dict[str, Any]
                 INSERT INTO bank_transaction_rules (
                     entity_id, rule_code, description_pattern, match_type,
                     debit_account, credit_account, transaction_type,
-                    requires_split, split_config_json,
+                    requires_split, hard_skip, split_config_json,
                     is_active, priority, notes
                 ) VALUES (
                     :entity_id, :rule_code, :pattern, :match_type,
                     :debit, :credit, :txn_type,
-                    :requires_split, CAST(:split_config AS jsonb),
+                    :requires_split, :hard_skip, CAST(:split_config AS jsonb),
                     TRUE, :priority, :notes
                 )
                 RETURNING id
@@ -464,6 +462,7 @@ def seed_rules(session, *, entity_code: str, actor_email: str) -> dict[str, Any]
                 "credit": cfg.get("credit_account"),
                 "txn_type": cfg.get("transaction_type"),
                 "requires_split": bool(cfg.get("requires_split", False)),
+                "hard_skip": bool(cfg.get("hard_skip", False)),
                 "split_config": json.dumps(cfg.get("split_config_json") or {}),
                 "priority": int(cfg.get("priority", 100)),
                 "notes": cfg.get("notes"),
@@ -497,7 +496,7 @@ def list_rules(session, *, entity_code: str) -> dict[str, Any]:
             """
             SELECT id, rule_code, description_pattern, match_type,
                    debit_account, credit_account, transaction_type,
-                   requires_split, is_active, priority, notes
+                   requires_split, hard_skip, is_active, priority, notes
             FROM bank_transaction_rules
             WHERE entity_id = :entity_id
             ORDER BY priority, rule_code
@@ -518,6 +517,7 @@ def list_rules(session, *, entity_code: str) -> dict[str, Any]:
                 "credit_account": r["credit_account"],
                 "transaction_type": r["transaction_type"],
                 "requires_split": r["requires_split"],
+                "hard_skip": r["hard_skip"],
                 "is_active": r["is_active"],
                 "priority": r["priority"],
                 "notes": r["notes"],
@@ -598,7 +598,7 @@ def run_auto_journal(
             """
             SELECT id, rule_code, description_pattern, match_type,
                    debit_account, credit_account, transaction_type,
-                   requires_split, is_active, priority
+                   requires_split, hard_skip, is_active, priority, notes
             FROM bank_transaction_rules
             WHERE entity_id = :entity_id AND is_active = TRUE
             ORDER BY priority, rule_code
@@ -734,6 +734,53 @@ def run_auto_journal(
             continue
 
         rule = _find_matching_rule(rules, desc)
+        if rule is not None and rule.get("hard_skip"):
+            skip_reason = (
+                rule.get("notes")
+                or f"hard_skip rule {rule['rule_code']}"
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO bank_auto_journal_lines (
+                        entity_id, auto_journal_run_id, bank_transaction_id,
+                        rule_id, matched_status, skip_reason, amount, notes
+                    ) VALUES (
+                        :entity_id, :run_id, :bt_id,
+                        :rule_id, :status, :reason, :amount, NULL
+                    )
+                    ON CONFLICT (entity_id, bank_transaction_id)
+                    DO UPDATE SET
+                        auto_journal_run_id = EXCLUDED.auto_journal_run_id,
+                        rule_id = EXCLUDED.rule_id,
+                        matched_status = EXCLUDED.matched_status,
+                        skip_reason = EXCLUDED.skip_reason,
+                        amount = EXCLUDED.amount,
+                        debit_account = NULL,
+                        credit_account = NULL,
+                        journal_batch_id = NULL
+                    """
+                ),
+                {
+                    "entity_id": entity["id"],
+                    "run_id": run_id,
+                    "bt_id": txn["id"],
+                    "rule_id": rule["id"],
+                    "status": MATCH_STATUS_SKIPPED,
+                    "reason": skip_reason,
+                    "amount": txn["amount"],
+                },
+            )
+            skipped_rows.append(
+                {
+                    "bank_transaction_id": str(txn["id"]),
+                    "description": desc,
+                    "amount": str(txn["amount"]),
+                    "reason": f"rule:{rule['rule_code']}",
+                }
+            )
+            continue
+
         if rule is None:
             # Layer 2: vendor memory.
             mem = vendor_memory_lookup(
