@@ -1125,22 +1125,28 @@ def run_auto_journal(
             # the bank account (1020) on either side:
             #   outflow-style: debit_account=expense, credit_account=1020
             #   inflow-style:  debit_account=1020, credit_account=other
-            # If the txn direction matches the rule's natural direction,
-            # use the accounts as-stored. If it doesn't, flip (e.g. a
-            # refund on a normally-outflow vendor → inflow txn → flip).
+            # Only flip when the txn's direction CONFIRMS the opposite
+            # side. If direction is 'unknown' (the bank-pdf classifier
+            # couldn't tell), trust the rule's natural side rather than
+            # falling through to a flip — most rules encode the typical
+            # direction of that vendor and a flip on 'unknown' silently
+            # mis-posts the side.
             rule_is_outflow_style = (
                 rule["credit_account"] == DEFAULT_BANK_ACCOUNT_CODE
             )
             rule_is_inflow_style = (
                 rule["debit_account"] == DEFAULT_BANK_ACCOUNT_CODE
             )
-            if direction == "outflow" and rule_is_outflow_style:
-                dr, cr = rule["debit_account"], rule["credit_account"]
-            elif direction == "inflow" and rule_is_inflow_style:
-                dr, cr = rule["debit_account"], rule["credit_account"]
-            else:
-                # Direction mismatches the rule's natural side — flip.
+            if direction == "inflow" and rule_is_outflow_style:
+                # Confirmed refund of an outflow vendor — flip.
                 dr, cr = rule["credit_account"], rule["debit_account"]
+            elif direction == "outflow" and rule_is_inflow_style:
+                # Confirmed outflow on an inflow-style rule — flip.
+                dr, cr = rule["credit_account"], rule["debit_account"]
+            else:
+                # direction matches the rule's natural side, OR direction
+                # is 'unknown' → trust the rule.
+                dr, cr = rule["debit_account"], rule["credit_account"]
             prepared_lines.append(
                 {
                     "txn_id": txn["id"],
