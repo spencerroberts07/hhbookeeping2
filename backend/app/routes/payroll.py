@@ -17,6 +17,7 @@ from ..services_payroll import (
     approve_payroll_run,
     build_payroll_journal,
     build_payroll_run,
+    build_payroll_run_from_manual_hours,
     get_payroll_run_detail,
     get_payroll_summary,
     list_employees,
@@ -136,20 +137,25 @@ async def post_upload_hours(
     actor_email: str = Form(...),
     file: UploadFile = File(...),
     stat_pay_overrides: str | None = Form(default=None),
+    vacation_paid_overrides: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     period_start_d = _parse_date("period_start", period_start)
     period_end_d = _parse_date("period_end", period_end)
     pay_date_d = _parse_date("pay_date", pay_date)
-    overrides_dict: dict[str, Any] = {}
-    if stat_pay_overrides:
+
+    def _parse_override(name: str, raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
         try:
-            overrides_dict = json.loads(stat_pay_overrides)
+            return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise HTTPException(
-                status_code=400,
-                detail=f"stat_pay_overrides must be valid JSON: {exc}",
+                status_code=400, detail=f"{name} must be valid JSON: {exc}"
             ) from exc
+
+    stat_dict = _parse_override("stat_pay_overrides", stat_pay_overrides)
+    vac_dict = _parse_override("vacation_paid_overrides", vacation_paid_overrides)
 
     file_bytes = await file.read()
     try:
@@ -164,8 +170,64 @@ async def post_upload_hours(
                 period_start=period_start_d,
                 period_end=period_end_d,
                 pay_date=pay_date_d,
-                stat_pay_overrides=overrides_dict,
+                stat_pay_overrides=stat_dict,
+                vacation_paid_overrides=vac_dict,
                 actor_email=actor_email,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class ManualHoursRow(BaseModel):
+    employee_number: int | None = None
+    employee_id: str | None = None
+    week1_hours: Decimal | None = None
+    week2_hours: Decimal | None = None
+    total_hours: Decimal | None = None
+    is_on_vacation: bool = False
+    is_salary_reg: bool = False
+
+
+class ManualHoursRequest(BaseModel):
+    entity_code: str
+    pay_run_number: str
+    period_number: int
+    period_start: str
+    period_end: str
+    pay_date: str
+    actor_email: str
+    hours: list[ManualHoursRow]
+    stat_pay_overrides: dict[str, Decimal] | None = None
+    vacation_paid_overrides: dict[str, Decimal] | None = None
+
+
+@router.post("/runs/manual-hours")
+def post_manual_hours(
+    body: ManualHoursRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    period_start_d = _parse_date("period_start", body.period_start)
+    period_end_d = _parse_date("period_end", body.period_end)
+    pay_date_d = _parse_date("pay_date", body.pay_date)
+    try:
+        with db_session() as session:
+            return build_payroll_run_from_manual_hours(
+                session,
+                entity_code=body.entity_code,
+                pay_run_number=body.pay_run_number,
+                period_number=body.period_number,
+                period_start=period_start_d,
+                period_end=period_end_d,
+                pay_date=pay_date_d,
+                hours=[h.model_dump() for h in body.hours],
+                stat_pay_overrides=(
+                    dict(body.stat_pay_overrides) if body.stat_pay_overrides else None
+                ),
+                vacation_paid_overrides=(
+                    dict(body.vacation_paid_overrides)
+                    if body.vacation_paid_overrides else None
+                ),
+                actor_email=body.actor_email,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

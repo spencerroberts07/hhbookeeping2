@@ -46,10 +46,12 @@ ACCOUNT_WAGES = "6120"
 ACCOUNT_GROUP_INSURANCE = "6130"
 ACCOUNT_VACATION_PAYABLE = "2220"
 ACCOUNT_BANK = "1020"
-# Bridlewood doesn't yet have a dedicated CRA payroll-payable account
-# in the seed chart of accounts. The user flagged 2300 (HST Payable) as
-# a placeholder until they confirm a separate CRA account exists.
-ACCOUNT_CRA_PAYABLE = "2300"
+# 2320 CRA Payroll Remittances Payable — added 2026-05-04 to separate
+# payroll deductions (FED TAX + CPP + EI) from 2300 HST Payable. Note:
+# user spec asked for 2310 but that code was already in use in
+# Bridlewood's GL for "Income Tax Payable" (corporate income tax), so
+# we use 2320 instead.
+ACCOUNT_CRA_PAYABLE = "2320"
 
 
 def _money(value: Any) -> Decimal:
@@ -613,6 +615,128 @@ def _match_employees(
     return matched, unmatched
 
 
+def build_payroll_run_from_manual_hours(
+    session,
+    *,
+    entity_code: str,
+    pay_run_number: str,
+    period_number: int,
+    period_start: date,
+    period_end: date,
+    pay_date: date,
+    hours: list[dict[str, Any]],
+    stat_pay_overrides: dict[str, str | float | int | Decimal] | None = None,
+    vacation_paid_overrides: dict[str, str | float | int | Decimal] | None = None,
+    actor_email: str,
+) -> dict[str, Any]:
+    """
+    Build a payroll run from a JSON hours array instead of an ODS file.
+    Each row in `hours` must reference an existing employee by either
+    employee_number (preferred) or employee_id, and supply EITHER
+    total_hours OR (week1_hours + week2_hours), OR is_salary_reg=True
+    for salaried employees, OR is_on_vacation=True with hours paid out.
+    """
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    # Resolve each input row to a ParsedHoursRow keyed by employee name
+    # so we can reuse the same downstream pipeline.
+    if not hours:
+        raise ValueError("hours array is required and must be non-empty")
+
+    employees_by_number: dict[int, dict[str, Any]] = {}
+    employees_by_id: dict[str, dict[str, Any]] = {}
+    for emp in session.execute(
+        text(
+            "SELECT id, employee_number, full_name, ods_name_key "
+            "FROM payroll_employees WHERE entity_id = :e"
+        ),
+        {"e": entity["id"]},
+    ).mappings():
+        if emp["employee_number"] is not None:
+            employees_by_number[emp["employee_number"]] = dict(emp)
+        employees_by_id[str(emp["id"])] = dict(emp)
+
+    parsed_rows: list[ParsedHoursRow] = []
+    unresolved: list[dict[str, Any]] = []
+    for row in hours:
+        emp = None
+        if row.get("employee_number") is not None:
+            emp = employees_by_number.get(int(row["employee_number"]))
+        if emp is None and row.get("employee_id"):
+            emp = employees_by_id.get(str(row["employee_id"]))
+        if emp is None:
+            unresolved.append(row)
+            continue
+        is_salary_reg = bool(row.get("is_salary_reg"))
+        is_on_vacation = bool(row.get("is_on_vacation"))
+        if is_salary_reg:
+            parsed_rows.append(
+                ParsedHoursRow(
+                    name=emp["ods_name_key"] or emp["full_name"],
+                    week1_hours=None,
+                    week2_hours=None,
+                    total_hours=None,
+                    is_on_vacation=False,
+                    is_salary_reg=True,
+                )
+            )
+            continue
+        total = _to_decimal(row.get("total_hours"))
+        w1 = _to_decimal(row.get("week1_hours"))
+        w2 = _to_decimal(row.get("week2_hours"))
+        if total is None and w1 is None and w2 is None:
+            unresolved.append(row)
+            continue
+        if total is None:
+            total = (w1 or Decimal("0")) + (w2 or Decimal("0"))
+        if w1 is None and w2 is None:
+            half = (total / Decimal("2")).quantize(Decimal("0.01"))
+            w1 = half
+            w2 = total - half
+        parsed_rows.append(
+            ParsedHoursRow(
+                name=emp["ods_name_key"] or emp["full_name"],
+                week1_hours=w1 or Decimal("0"),
+                week2_hours=w2 or Decimal("0"),
+                total_hours=total,
+                is_on_vacation=is_on_vacation,
+                is_salary_reg=False,
+            )
+        )
+
+    if unresolved:
+        raise ValueError(
+            "Could not resolve these hours rows (need employee_number or "
+            f"employee_id, plus hours/total/salary): {unresolved}"
+        )
+
+    parsed = ParsedHoursResult(
+        period_end=period_end,
+        rows=parsed_rows,
+        warnings=[],
+        raw_period_label="manual",
+    )
+
+    return _build_payroll_run_from_parsed(
+        session,
+        entity=dict(entity),
+        parsed=parsed,
+        file_name="manual_hours",
+        pay_run_number=pay_run_number,
+        period_number=period_number,
+        period_start=period_start,
+        period_end=period_end,
+        pay_date=pay_date,
+        stat_pay_overrides=stat_pay_overrides,
+        vacation_paid_overrides=vacation_paid_overrides,
+        actor_email=actor_email,
+    )
+
+
 def build_payroll_run(
     session,
     *,
@@ -625,6 +749,7 @@ def build_payroll_run(
     period_end: date,
     pay_date: date,
     stat_pay_overrides: dict[str, str | float | int | Decimal] | None = None,
+    vacation_paid_overrides: dict[str, str | float | int | Decimal] | None = None,
     actor_email: str,
 ) -> dict[str, Any]:
     if not actor_email:
@@ -634,6 +759,37 @@ def build_payroll_run(
         raise ValueError(f"Unknown entity code: {entity_code}")
 
     parsed = parse_hours_ods(file_bytes)
+    return _build_payroll_run_from_parsed(
+        session,
+        entity=dict(entity),
+        parsed=parsed,
+        file_name=file_name,
+        pay_run_number=pay_run_number,
+        period_number=period_number,
+        period_start=period_start,
+        period_end=period_end,
+        pay_date=pay_date,
+        stat_pay_overrides=stat_pay_overrides,
+        vacation_paid_overrides=vacation_paid_overrides,
+        actor_email=actor_email,
+    )
+
+
+def _build_payroll_run_from_parsed(
+    session,
+    *,
+    entity: dict[str, Any],
+    parsed: ParsedHoursResult,
+    file_name: str,
+    pay_run_number: str,
+    period_number: int,
+    period_start: date,
+    period_end: date,
+    pay_date: date,
+    stat_pay_overrides: dict[str, str | float | int | Decimal] | None = None,
+    vacation_paid_overrides: dict[str, str | float | int | Decimal] | None = None,
+    actor_email: str,
+) -> dict[str, Any]:
     matched, unmatched = _match_employees(
         session, entity_id=entity["id"], parsed_rows=parsed.rows
     )
@@ -648,8 +804,11 @@ def build_payroll_run(
         session, entity["id"], period_end
     )
 
-    overrides = {
+    stat_overrides = {
         str(k): _money(v) for k, v in (stat_pay_overrides or {}).items()
+    }
+    vac_paid_overrides = {
+        str(k): _money(v) for k, v in (vacation_paid_overrides or {}).items()
     }
 
     # ------------------------------------------------------------------
@@ -671,7 +830,8 @@ def build_payroll_run(
             week2_hours=parsed_row.week2_hours or Decimal("0"),
             period_start=period_start,
             period_end=period_end,
-            stat_pay_override=overrides.get(str(emp["id"])),
+            stat_pay_override=stat_overrides.get(str(emp["id"])),
+            vacation_paid_override=vac_paid_overrides.get(str(emp["id"])),
             is_on_vacation=parsed_row.is_on_vacation,
             pay_periods=BIWEEKLY_PERIODS,
         )
@@ -911,7 +1071,7 @@ def build_payroll_run(
 
     return {
         "payroll_run_id": str(payroll_run_id),
-        "entity_code": entity_code,
+        "entity_code": entity["entity_code"],
         "pay_run_number": pay_run_number,
         "period_number": period_number,
         "period_start": period_start.isoformat(),
