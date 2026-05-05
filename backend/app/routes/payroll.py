@@ -1,108 +1,193 @@
 """
-Payroll control — HTTP routes.
-
-Endpoints:
-    POST /api/payroll/runs/upsert
-    GET  /api/payroll/runs?entity_code=...&period_start=...&period_end=...
-    GET  /api/payroll/runs/{payroll_reference}?entity_code=...
-    POST /api/payroll/runs/{payroll_reference}/submit
-    POST /api/payroll/runs/{payroll_reference}/approve
-    POST /api/payroll/runs/{payroll_reference}/mark-bank-cleared
-    POST /api/payroll/runs/{payroll_reference}/mark-remittance-cleared
-    GET  /api/payroll/summary?entity_code=...&period_start=...&period_end=...
+Payroll module — HTTP routes.
 """
 from __future__ import annotations
 
-from datetime import date as DateType
+import json
+from datetime import date as DateType, datetime
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from sqlalchemy import text
-
 from ..db import db_session
-from ..services import get_entity_by_code
 from ..services_auth import require_role
 from ..services_payroll import (
     approve_payroll_run,
-    get_payroll_run,
+    build_payroll_journal,
+    build_payroll_run,
+    get_payroll_run_detail,
     get_payroll_summary,
+    list_employees,
     list_payroll_runs,
-    mark_bank_cleared,
-    mark_remittance_cleared,
+    schedule_withdrawals,
+    section_payroll as section_payroll_impl,
+    seed_employees,
     submit_payroll_run,
-    upsert_payroll_run,
+    upsert_employee,
+)
+from ..services_payroll_calc import (
+    BIWEEKLY_PERIODS,
+    calculate_employee_payroll,
 )
 
 
 router = APIRouter(prefix="/api/payroll", tags=["payroll"])
 
 
-class UpsertPayrollRunRequest(BaseModel):
-    entity_code: str
-    payroll_reference: str
-    pay_period_start: DateType
-    pay_period_end: DateType
-    pay_date: DateType
-    actor_email: str
-    processor: str | None = None
-    gross_wages: Decimal | None = None
-    employer_cpp: Decimal | None = None
-    employer_ei: Decimal | None = None
-    employer_benefits: Decimal | None = None
-    employee_cpp: Decimal | None = None
-    employee_ei: Decimal | None = None
-    employee_tax: Decimal | None = None
-    employee_benefits: Decimal | None = None
-    net_pay: Decimal | None = None
-    remittance_amount: Decimal | None = None
-    total_employer_cost: Decimal | None = None
-    notes: str | None = None
-    raw_import_json: dict[str, Any] = Field(default_factory=dict)
+def _parse_date(name: str, value: str) -> DateType:
+    try:
+        return DateType.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be YYYY-MM-DD, got {value!r}"
+        ) from exc
 
 
-class WorkflowRequest(BaseModel):
+# ----------------------------------------------------------------------
+# Employees
+# ----------------------------------------------------------------------
+
+
+class SeedEmployeesRequest(BaseModel):
     entity_code: str
     actor_email: str
-    notes: str | None = None
 
 
-class MarkClearedRequest(BaseModel):
-    entity_code: str
-    bank_transaction_id: str
-    actor_email: str
-
-
-@router.post("/runs/upsert")
-def post_upsert(
-    body: UpsertPayrollRunRequest,
+@router.post("/employees/seed")
+def post_seed_employees(
+    body: SeedEmployeesRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
-            return upsert_payroll_run(
+            return seed_employees(
                 session,
                 entity_code=body.entity_code,
-                payroll_reference=body.payroll_reference,
-                pay_period_start=body.pay_period_start,
-                pay_period_end=body.pay_period_end,
-                pay_date=body.pay_date,
-                processor=body.processor,
-                gross_wages=body.gross_wages,
-                employer_cpp=body.employer_cpp,
-                employer_ei=body.employer_ei,
-                employer_benefits=body.employer_benefits,
-                employee_cpp=body.employee_cpp,
-                employee_ei=body.employee_ei,
-                employee_tax=body.employee_tax,
-                employee_benefits=body.employee_benefits,
-                net_pay=body.net_pay,
-                remittance_amount=body.remittance_amount,
-                total_employer_cost=body.total_employer_cost,
-                notes=body.notes,
-                raw_import_json=body.raw_import_json,
+                actor_email=body.actor_email,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/employees")
+def get_employees(entity_code: str = Query(...)) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            return list_employees(session, entity_code=entity_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class UpsertEmployeeRequest(BaseModel):
+    entity_code: str
+    employee_number: int
+    actor_email: str
+    first_name: str | None = None
+    last_name: str | None = None
+    employment_type: str | None = None
+    hourly_rate: Decimal | None = None
+    biweekly_salary: Decimal | None = None
+    vacation_rate: Decimal | None = None
+    has_life_insurance: bool | None = None
+    life_insurance_biweekly: Decimal | None = None
+    is_active: bool | None = None
+    ods_name_key: str | None = None
+    notes: str | None = None
+    bank_transit: str | None = None
+    bank_institution: str | None = None
+    bank_account: str | None = None
+
+
+@router.post("/employees/upsert")
+def post_upsert_employee(
+    body: UpsertEmployeeRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            return upsert_employee(
+                session,
+                entity_code=body.entity_code,
+                employee_number=body.employee_number,
+                actor_email=body.actor_email,
+                data=body.model_dump(
+                    exclude={"entity_code", "employee_number", "actor_email"}
+                ),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ----------------------------------------------------------------------
+# Payroll runs
+# ----------------------------------------------------------------------
+
+
+@router.post("/runs/upload-hours")
+async def post_upload_hours(
+    entity_code: str = Form(...),
+    pay_run_number: str = Form(...),
+    period_number: int = Form(...),
+    period_start: str = Form(...),
+    period_end: str = Form(...),
+    pay_date: str = Form(...),
+    actor_email: str = Form(...),
+    file: UploadFile = File(...),
+    stat_pay_overrides: str | None = Form(default=None),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    period_start_d = _parse_date("period_start", period_start)
+    period_end_d = _parse_date("period_end", period_end)
+    pay_date_d = _parse_date("pay_date", pay_date)
+    overrides_dict: dict[str, Any] = {}
+    if stat_pay_overrides:
+        try:
+            overrides_dict = json.loads(stat_pay_overrides)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"stat_pay_overrides must be valid JSON: {exc}",
+            ) from exc
+
+    file_bytes = await file.read()
+    try:
+        with db_session() as session:
+            return build_payroll_run(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                file_name=file.filename or "hours.ods",
+                pay_run_number=pay_run_number,
+                period_number=period_number,
+                period_start=period_start_d,
+                period_end=period_end_d,
+                pay_date=pay_date_d,
+                stat_pay_overrides=overrides_dict,
+                actor_email=actor_email,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class BuildJournalRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/runs/{payroll_run_id}/build-journal")
+def post_build_journal(
+    body: BuildJournalRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            return build_payroll_journal(
+                session,
+                entity_code=body.entity_code,
+                payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
             )
     except ValueError as exc:
@@ -112,217 +197,239 @@ def post_upsert(
 @router.get("/runs")
 def get_runs(
     entity_code: str = Query(...),
-    period_start: DateType | None = Query(default=None),
-    period_end: DateType | None = Query(default=None),
+    period_end: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
+    period_end_d = _parse_date("period_end", period_end) if period_end else None
     try:
         with db_session() as session:
             return list_payroll_runs(
-                session,
-                entity_code=entity_code,
-                period_start=period_start,
-                period_end=period_end,
+                session, entity_code=entity_code,
+                period_end=period_end_d, limit=limit,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("/runs/{payroll_reference}")
-def get_one_run(
-    payroll_reference: str = Path(...),
+@router.get("/runs/{payroll_run_id}")
+def get_run(
+    payroll_run_id: str = Path(...),
     entity_code: str = Query(...),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
-            return get_payroll_run(
-                session, entity_code=entity_code, payroll_reference=payroll_reference
+            return get_payroll_run_detail(
+                session, entity_code=entity_code, payroll_run_id=payroll_run_id
             )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/runs/{payroll_reference}/submit")
+@router.get("/runs/{payroll_run_id}/summary")
+def get_run_summary(
+    payroll_run_id: str = Path(...),
+    entity_code: str = Query(...),
+) -> dict[str, Any]:
+    try:
+        with db_session() as session:
+            return get_payroll_summary(
+                session, entity_code=entity_code, payroll_run_id=payroll_run_id
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class WorkflowRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/runs/{payroll_run_id}/submit")
 def post_submit(
     body: WorkflowRequest,
-    payroll_reference: str = Path(...),
-    _user: dict = Depends(require_role("approver")),
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
             return submit_payroll_run(
                 session,
                 entity_code=body.entity_code,
-                payroll_reference=payroll_reference,
+                payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
-                notes=body.notes,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/runs/{payroll_reference}/approve")
+@router.post("/runs/{payroll_run_id}/approve")
 def post_approve(
     body: WorkflowRequest,
-    payroll_reference: str = Path(...),
-    _user: dict = Depends(require_role("approver")),
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
             return approve_payroll_run(
                 session,
                 entity_code=body.entity_code,
-                payroll_reference=payroll_reference,
+                payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
-                notes=body.notes,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/runs/{payroll_reference}/mark-bank-cleared")
-def post_mark_bank_cleared(
-    body: MarkClearedRequest,
-    payroll_reference: str = Path(...),
+@router.post("/runs/{payroll_run_id}/schedule-withdrawals")
+def post_schedule_withdrawals(
+    body: WorkflowRequest,
+    payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     try:
         with db_session() as session:
-            return mark_bank_cleared(
+            return schedule_withdrawals(
                 session,
                 entity_code=body.entity_code,
-                payroll_reference=payroll_reference,
-                bank_transaction_id=body.bank_transaction_id,
+                payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/runs/{payroll_reference}/mark-remittance-cleared")
-def post_mark_remittance_cleared(
-    body: MarkClearedRequest,
-    payroll_reference: str = Path(...),
-    _user: dict = Depends(require_role("bookkeeper")),
-) -> dict[str, Any]:
+# ----------------------------------------------------------------------
+# Validation endpoint — Period 5 actuals from Feb 2026 register
+# ----------------------------------------------------------------------
+
+
+_FEB_PERIOD_4_TARGETS = {
+    "gross": Decimal("10465.43"),
+    "net_pay": Decimal("8872.68"),
+    "fed_tax": Decimal("924.96"),
+    "cpp_ee": Decimal("497.18"),
+    "cpp_er": Decimal("497.18"),
+    "ei_ee": Decimal("170.61"),
+    "ei_er": Decimal("238.84"),
+    "life_taxable": Decimal("16.93"),
+    "vacation_earned": Decimal("644.89"),
+    "cra_remittance": Decimal("2328.77"),
+}
+
+_FEB_PERIOD_5_TARGETS = {
+    "gross": Decimal("11260.95"),
+    "net_pay": Decimal("9534.00"),
+    "fed_tax": Decimal("1005.64"),
+    "cpp_ee": Decimal("537.77"),
+    "cpp_er": Decimal("537.77"),
+    "ei_ee": Decimal("183.54"),
+    "ei_er": Decimal("256.96"),
+    "life_taxable": Decimal("16.93"),
+    "vacation_earned_net": Decimal("107.76"),
+    "stat_pay": Decimal("1027.27"),
+    "vacation_paid": Decimal("528.00"),
+    "cra_remittance": Decimal("2521.68"),
+}
+
+
+@router.get("/validate-feb-2026")
+def get_validate_feb_2026(entity_code: str = Query(default="1877-8")) -> dict[str, Any]:
+    """
+    Compare the latest stored payroll_runs in Feb 2026 against the
+    known register actuals. Reports per-line variance for the
+    bookkeeper.
+    """
     try:
         with db_session() as session:
-            return mark_remittance_cleared(
-                session,
-                entity_code=body.entity_code,
-                payroll_reference=payroll_reference,
-                bank_transaction_id=body.bank_transaction_id,
-                actor_email=body.actor_email,
-            )
+            runs = list_payroll_runs(
+                session, entity_code=entity_code, limit=10
+            )["runs"]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    feb_runs = [
+        r for r in runs
+        if r["period_end"].startswith("2026-02")
+    ]
 
-@router.get("/draft-from-bank")
-def get_draft_from_bank(
-    entity_code: str = Query(...),
-) -> dict[str, Any]:
-    """
-    List payroll_runs that are still in 'draft' workflow_status AND
-    have a bank_transaction_id wired up — i.e. drafts created by the
-    bank auto-journal's auto_draft_payroll handler that the bookkeeper
-    hasn't completed yet.
-    """
-    try:
+    variances: list[dict[str, Any]] = []
+    for r in feb_runs:
+        period_num = r["period_number"]
+        targets = (
+            _FEB_PERIOD_4_TARGETS if period_num == 4
+            else _FEB_PERIOD_5_TARGETS if period_num == 5
+            else None
+        )
+        if targets is None:
+            continue
         with db_session() as session:
-            entity = get_entity_by_code(session, entity_code)
-            if not entity:
-                raise ValueError(f"Unknown entity code: {entity_code}")
-            rows = session.execute(
-                text(
-                    """
-                    SELECT pr.id, pr.payroll_reference, pr.pay_period_start,
-                           pr.pay_period_end, pr.pay_date, pr.processor,
-                           pr.gross_wages, pr.net_pay, pr.status,
-                           pr.workflow_status, pr.notes,
-                           pr.bank_transaction_id, pr.created_at,
-                           bt.transaction_date AS bank_transaction_date,
-                           bt.amount AS bank_amount,
-                           bt.description AS bank_description,
-                           bt.review_status AS bank_review_status
-                    FROM payroll_runs pr
-                    LEFT JOIN bank_transactions bt ON bt.id = pr.bank_transaction_id
-                    WHERE pr.entity_id = :entity_id
-                      AND pr.workflow_status = 'draft'
-                      AND pr.bank_transaction_id IS NOT NULL
-                    ORDER BY pr.pay_date DESC, pr.created_at DESC
-                    """
-                ),
-                {"entity_id": entity["id"]},
-            ).mappings().all()
-            return {
-                "entity_code": entity_code,
-                "count": len(rows),
-                "drafts": [
-                    {
-                        "id": str(r["id"]),
-                        "payroll_reference": r["payroll_reference"],
-                        "pay_period_start": (
-                            r["pay_period_start"].isoformat()
-                            if r["pay_period_start"]
-                            else None
-                        ),
-                        "pay_period_end": (
-                            r["pay_period_end"].isoformat()
-                            if r["pay_period_end"]
-                            else None
-                        ),
-                        "pay_date": (
-                            r["pay_date"].isoformat() if r["pay_date"] else None
-                        ),
-                        "processor": r["processor"],
-                        "gross_wages": (
-                            str(r["gross_wages"]) if r["gross_wages"] is not None else None
-                        ),
-                        "net_pay": (
-                            str(r["net_pay"]) if r["net_pay"] is not None else None
-                        ),
-                        "status": r["status"],
-                        "workflow_status": r["workflow_status"],
-                        "notes": r["notes"],
-                        "bank_transaction_id": (
-                            str(r["bank_transaction_id"])
-                            if r["bank_transaction_id"]
-                            else None
-                        ),
-                        "bank_transaction_date": (
-                            r["bank_transaction_date"].isoformat()
-                            if r["bank_transaction_date"]
-                            else None
-                        ),
-                        "bank_amount": (
-                            str(r["bank_amount"]) if r["bank_amount"] is not None else None
-                        ),
-                        "bank_description": r["bank_description"],
-                        "bank_review_status": r["bank_review_status"],
-                        "created_at": (
-                            r["created_at"].isoformat() if r["created_at"] else None
-                        ),
-                    }
-                    for r in rows
-                ],
+            detail = get_payroll_run_detail(
+                session, entity_code=entity_code, payroll_run_id=r["id"]
+            )
+        run = detail["run"]
+        line_variance = []
+        for k, target in targets.items():
+            calc_key_map = {
+                "gross": "total_gross",
+                "net_pay": "total_net_pay",
+                "fed_tax": "total_fed_tax",
+                "cpp_ee": "total_cpp_ee",
+                "cpp_er": "total_cpp_er",
+                "ei_ee": "total_ei_ee",
+                "ei_er": "total_ei_er",
+                "life_taxable": "total_life_taxable",
+                "vacation_earned": "total_vacation_earned",
+                "vacation_earned_net": "total_vacation_earned",
+                "stat_pay": "total_stat_pay",
+                "vacation_paid": "total_vacation_paid",
+                "cra_remittance": "cra_remittance_amount",
             }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.get("/summary")
-def get_summary(
-    entity_code: str = Query(...),
-    period_start: DateType = Query(...),
-    period_end: DateType = Query(...),
-) -> dict[str, Any]:
-    try:
-        with db_session() as session:
-            return get_payroll_summary(
-                session,
-                entity_code=entity_code,
-                period_start=period_start,
-                period_end=period_end,
+            calc_field = calc_key_map.get(k)
+            if calc_field is None:
+                continue
+            calculated = Decimal(run.get(calc_field, "0"))
+            variance = (calculated - target).quantize(Decimal("0.01"))
+            line_variance.append(
+                {
+                    "metric": k,
+                    "actual": str(target),
+                    "calculated": str(calculated),
+                    "variance": str(variance),
+                }
             )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        variances.append(
+            {
+                "pay_run_number": r["pay_run_number"],
+                "period_number": period_num,
+                "comparison": line_variance,
+            }
+        )
+
+    return {
+        "entity_code": entity_code,
+        "feb_runs_found": [r["pay_run_number"] for r in feb_runs],
+        "validation": variances,
+        "note": (
+            "Tax-engine variance is expected: this is a simplified "
+            "annualize-and-bracket implementation, not a full PDOC clone. "
+            "If a metric is off by > $5 per employee, override fed_tax on "
+            "the payroll_run_lines row with the bookkeeper's actual."
+        ),
+    }
+
+
+# ----------------------------------------------------------------------
+# Close-control-center wrapper (used via services_month_end_close)
+# ----------------------------------------------------------------------
+
+
+def section_payroll(session, entity_code, period_start, period_end):  # noqa: ARG001
+    # Backward-compatible wrapper for the close-center.
+    from ..services import get_entity_by_code  # noqa: WPS433
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        return {"status": "no_data", "module_present": False, "summary": "Entity not found"}
+    return section_payroll_impl(
+        session, entity_id=entity["id"],
+        period_start=period_start, period_end=period_end,
+    )

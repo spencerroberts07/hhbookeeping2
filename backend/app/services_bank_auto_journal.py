@@ -267,9 +267,10 @@ _BRIDLEWOOD_SEED: list[dict[str, Any]] = [
         "match_type": "contains",
         "debit_account": "6120",
         "credit_account": DEFAULT_BANK_ACCOUNT_CODE,
-        "transaction_type": TRANSACTION_TYPE_AUTO_DRAFT_PAYROLL,
+        "transaction_type": "payroll_processor_payment",
         "priority": 15,
-        "notes": "Auto-drafts a payroll_run from the bank net-pay debit. The bookkeeper splits gross/CPP/EI/tax/fees in the payroll module before approving.",
+        "hard_skip": True,
+        "notes": "Net-pay EFT issued by ENetEmployer. The proper payroll module (services_payroll) builds the GL journal from the calculated payroll run; bank_auto_journal must NOT post a duplicate entry here.",
     },
     # ---------- Utilities ----------
     {
@@ -970,121 +971,10 @@ def run_auto_journal(
             )
             continue
 
-        if rule.get("transaction_type") == TRANSACTION_TYPE_AUTO_DRAFT_PAYROLL:
-            # ENetEmployer (or any payroll-processor) bank withdrawal:
-            # create a payroll_run draft seeded with net_pay = abs(amount)
-            # and let the bookkeeper fill in gross / CPP / EI / fees
-            # before approving. We do NOT post a journal entry here —
-            # the eventual journal comes out of the payroll module.
-            net_pay = abs(_money(txn["amount"]))
-            txn_date = txn["transaction_date"]
-            payroll_reference = f"ENET-{txn_date.isoformat()}"
-            session.execute(
-                text(
-                    """
-                    INSERT INTO payroll_runs (
-                        entity_id, accounting_period_id, payroll_reference,
-                        pay_period_start, pay_period_end, pay_date,
-                        processor, net_pay, status, workflow_status,
-                        bank_transaction_id, notes, actor_email,
-                        raw_import_json
-                    ) VALUES (
-                        :entity_id, :accounting_period_id, :payroll_reference,
-                        :pay_period_start, :pay_period_end, :pay_date,
-                        'ENetEmployer', :net_pay, 'draft', 'draft',
-                        :bank_transaction_id, :notes, :actor_email,
-                        CAST(:raw AS jsonb)
-                    )
-                    ON CONFLICT (entity_id, payroll_reference)
-                    DO UPDATE SET
-                        net_pay = EXCLUDED.net_pay,
-                        bank_transaction_id = EXCLUDED.bank_transaction_id,
-                        notes = COALESCE(payroll_runs.notes, EXCLUDED.notes),
-                        raw_import_json = EXCLUDED.raw_import_json,
-                        updated_at = NOW()
-                    """
-                ),
-                {
-                    "entity_id": entity["id"],
-                    "accounting_period_id": accounting_period_id,
-                    "payroll_reference": payroll_reference,
-                    "pay_period_start": txn_date,
-                    "pay_period_end": txn_date,
-                    "pay_date": txn_date,
-                    "net_pay": net_pay,
-                    "bank_transaction_id": txn["id"],
-                    "notes": (
-                        "Auto-drafted from bank transaction - "
-                        "complete gross/deductions before approving"
-                    ),
-                    "actor_email": actor_email,
-                    "raw": json.dumps(
-                        {
-                            "auto_drafted_from_bank": True,
-                            "bank_description": desc,
-                            "bank_amount": str(txn["amount"]),
-                            "bank_transaction_id": str(txn["id"]),
-                            "rule_code": rule["rule_code"],
-                        }
-                    ),
-                },
-            )
-            session.execute(
-                text(
-                    """
-                    INSERT INTO bank_auto_journal_lines (
-                        entity_id, auto_journal_run_id, bank_transaction_id,
-                        rule_id, matched_status, amount, notes
-                    ) VALUES (
-                        :entity_id, :run_id, :bt_id,
-                        :rule_id, :status, :amount,
-                        'Auto-drafted payroll_run; awaiting gross/deductions split'
-                    )
-                    ON CONFLICT (entity_id, bank_transaction_id)
-                    DO UPDATE SET
-                        auto_journal_run_id = EXCLUDED.auto_journal_run_id,
-                        rule_id = EXCLUDED.rule_id,
-                        matched_status = EXCLUDED.matched_status,
-                        amount = EXCLUDED.amount,
-                        notes = EXCLUDED.notes,
-                        debit_account = NULL,
-                        credit_account = NULL,
-                        journal_batch_id = NULL
-                    """
-                ),
-                {
-                    "entity_id": entity["id"],
-                    "run_id": run_id,
-                    "bt_id": txn["id"],
-                    "rule_id": rule["id"],
-                    "status": MATCH_STATUS_AUTO_DRAFT_PAYROLL,
-                    "amount": txn["amount"],
-                },
-            )
-            # Keep the bank transaction in needs_review so the bookkeeper
-            # sees it until they approve the payroll run.
-            session.execute(
-                text(
-                    """
-                    UPDATE bank_transactions
-                       SET review_status = 'needs_review'
-                     WHERE id = :id
-                       AND review_status NOT IN ('matched','ignored')
-                    """
-                ),
-                {"id": txn["id"]},
-            )
-            auto_draft_payroll_rows.append(
-                {
-                    "bank_transaction_id": str(txn["id"]),
-                    "transaction_date": txn_date.isoformat(),
-                    "description": desc,
-                    "amount": str(txn["amount"]),
-                    "rule_code": rule["rule_code"],
-                    "payroll_reference": payroll_reference,
-                }
-            )
-            continue
+        # NOTE: The previous auto_draft_payroll path that created stub
+        # payroll_runs from ENetEmployer bank rows was removed when the
+        # full payroll module shipped (migration 024). ENetEmployer
+        # rows are now hard_skip=TRUE and handled above.
 
         # If rule['id'] is a real UUID, this came from Layer 1 (the
         # bank_transaction_rules table). We don't record a

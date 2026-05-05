@@ -883,15 +883,14 @@ def _section_journal_batches(
 
 def _section_payroll(
     session,
-    entity_code: str,
+    entity_id: UUID,
     period_start: date,
     period_end: date,
 ) -> dict[str, Any]:
     """
-    Wraps services_payroll.get_payroll_summary() into the standard section
-    shape used by this aggregator. Imported lazily to avoid forcing the
-    payroll module to load when the close control center is read on
-    environments where 013_payroll_control.sql has not been applied yet.
+    Wraps services_payroll.section_payroll() — the new (migration 024)
+    payroll module's close-center summary. Reports blocked when no
+    approved payroll run covers the period.
     """
     if not _has_table(session, "payroll_runs"):
         return {
@@ -899,18 +898,14 @@ def _section_payroll(
             "module_present": False,
             "summary": "payroll_runs table not present",
         }
-    from .services_payroll import get_payroll_summary  # noqa: WPS433
+    from .services_payroll import section_payroll  # noqa: WPS433
 
-    summary = get_payroll_summary(
+    return section_payroll(
         session,
-        entity_code=entity_code,
+        entity_id=entity_id,
         period_start=period_start,
         period_end=period_end,
     )
-    # services_payroll.get_payroll_summary already returns a dict with a
-    # 'status' field that uses the same vocabulary as our other sections,
-    # so we can return it directly with the right key.
-    return summary
 
 
 # ----------------------------------------------------------------------
@@ -1210,7 +1205,7 @@ def get_month_end_close_status(
             session, entity["id"], accounting_period_id
         ),
         "payroll": _section_payroll(
-            session, entity_code, period_start, period_end_date
+            session, entity["id"], period_start, period_end_date
         ),
         "pos_reports": _section_pos_reports(
             session, entity["id"], period_start, period_end_date
