@@ -52,16 +52,23 @@ SANITY_TOLERANCE = Decimal("1000.00")
 
 # Inventory-adjustment reasons that the spec treats as shrinkage. Match
 # against the cleaned reason (leading digits + underscore stripped, then
-# uppercased) — the POS parser concatenates the cost's fractional digits
-# onto the reason, so the raw value looks like "0570_CYCLE_COUNT".
-# Truncated tails ("…ON_HA", "…ON_H") follow the parser's column width.
+# uppercased). The POS parser used to concatenate the cost's fractional
+# digits onto the reason — the v0.7 fix strips that — but historical
+# rows in the DB may still carry truncated tails like "…ON_HA" / "…ON_H"
+# from the era when the digit-bleed shifted the slice. Both forms are
+# accepted here.
 SHRINKAGE_REASONS = frozenset({
     "CYCLE_COUNT",
-    "CYCLE_COUNT_ADJ_QTY_ON_HA",
+    "CYCLE_COUNT_ADJ_QTY_ON_HAND",
+    "CYCLE_COUNT_ADJ_QTY_ON_HAN",  # legacy truncation (-1 char)
+    "CYCLE_COUNT_ADJ_QTY_ON_HA",   # legacy truncation (-2 chars)
     "BROKEN_IN_STORE",
     "EXPIRED_GOODS",
     "STOLEN_ITEMS",
-    "ITEM_RECOUNT_ADJ_QTY_ON_H",
+    "ITEM_RECOUNT_ADJ_QTY_ON_HAND",
+    "ITEM_RECOUNT_ADJ_QTY_ON_HAN",  # legacy truncation
+    "ITEM_RECOUNT_ADJ_QTY_ON_HA",   # legacy truncation
+    "ITEM_RECOUNT_ADJ_QTY_ON_H",    # legacy truncation
     "LOSS_OTHER_REASONS",
 })
 

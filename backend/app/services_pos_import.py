@@ -471,12 +471,17 @@ def _split_lines(file_text: str) -> list[str]:
 _INV_ADJ_SLICES = [
     ("sku_number", 0, 7),
     ("description", 7, 43),
-    ("date_adjusted", 43, 51),
-    ("quantity_adjusted", 51, 61),
-    ("quantity_after", 61, 71),
-    ("adjustment_cost", 71, 86),
-    ("reason_description", 86, 116),
-    ("employee_id", 116, 124),
+    # Date column needs 9 chars (1 leading space + 8-char "26/02/17"):
+    # [43, 51) only caught 7 chars of date for days >= 10, and Python
+    # strptime is lenient enough to accept "26/02/1" as Feb 1 — silently
+    # storing the wrong day AND blocking the cost-fallback trigger
+    # because date_adjusted is no longer None. Slice extended to [43, 52).
+    ("date_adjusted", 43, 52),
+    ("quantity_adjusted", 52, 62),
+    ("quantity_after", 62, 72),
+    ("adjustment_cost", 72, 87),
+    ("reason_description", 87, 117),
+    ("employee_id", 117, 125),
 ]
 
 _RE_TOTAL_FOR_REPORT = re.compile(
@@ -605,6 +610,18 @@ def parse_inventory_adjustment_report(file_text: str) -> dict[str, Any]:
             if not sku:
                 continue
 
+            # The reason slice can pick up the trailing digits of a wide
+            # cost value (e.g. "-23.9970" ends past the cost slice and
+            # bleeds "970 " into the reason). Strip leading digits +
+            # whitespace before storing so downstream consumers see
+            # "EXPIRED GOODS" rather than "970 EXPIRED GOODS".
+            reason_raw = row["reason_description"]
+            reason_clean = (
+                re.sub(r"^[\d.\-]+\s*", "", reason_raw).strip()
+                if reason_raw
+                else None
+            )
+
             row_data: dict[str, Any] = {
                 "sku_number": sku,
                 "description": row["description"] or None,
@@ -615,16 +632,16 @@ def parse_inventory_adjustment_report(file_text: str) -> dict[str, Any]:
                 ),
                 "quantity_after": _money4(row["quantity_after"].replace(",", "")),
                 "adjustment_cost": _parse_signed_money_token(row["adjustment_cost"]),
-                "reason_description": row["reason_description"] or None,
+                "reason_description": reason_clean or None,
                 "employee_id": row["employee_id"] or None,
             }
 
-            # If the row is short and the slices yielded almost nothing,
-            # fall back to whitespace-split parsing.
-            if (
-                row_data["adjustment_cost"] == Decimal("0")
-                and row_data["date_adjusted"] is None
-            ):
+            # If the slice-derived cost is 0, fall back to whitespace-
+            # split parsing. Even when the date slice yields a date
+            # successfully, the cost slice can still straddle qty_after
+            # and a truncated cost (yielding 0) — so we trigger on cost
+            # alone rather than requiring date to also be None.
+            if row_data["adjustment_cost"] == Decimal("0"):
                 tokens = line.split()
                 if len(tokens) >= 5:
                     fallback_sku = tokens[0]
