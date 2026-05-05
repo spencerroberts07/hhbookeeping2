@@ -151,17 +151,28 @@ def _resolve_shrinkage(
 ) -> dict[str, Any]:
     """
     Walk inventory_adjustment_lines for the period and bucket them into
-    shrinkage (losses on cycle counts, broken, expired, stolen, recount,
-    loss-other), greeting card returns, and other (informational).
+    shrinkage (cycle counts, broken, expired, stolen, recount,
+    loss-other) and greeting card returns.
+
+    Shrinkage uses NET SIGNED SUM across the spec reasons. A positive
+    cycle-count adjustment (found more stock than expected) offsets a
+    negative one — the net is the true inventory impact, and therefore
+    the true COGS impact. Returning losses-only would over-state COGS
+    by the gains.
 
     Returns:
-        shrinkage_cogs: ABS(sum of negative shrinkage costs) — positive
+        shrinkage_cogs: -1 * net adjustment_cost — positive when net
+            shrinkage is a loss (typical), negative when gains exceed
+            losses. Added to base_cogs in the journal so the COGS line
+            is correct in either direction.
+        shrinkage_net_adjustment_cost: signed net before flip (negative
+            for losses, positive for gains)
         greeting_card_adj: signed sum of greeting-card-returns lines
-        shrinkage_breakdown: list of (reason, n, total, losses_only)
     """
     if not _has_table(session, "inventory_adjustment_lines"):
         return {
             "shrinkage_cogs": Decimal("0.00"),
+            "shrinkage_net_adjustment_cost": Decimal("0.00"),
             "greeting_card_adj": Decimal("0.00"),
             "shrinkage_breakdown": [],
             "greeting_card_breakdown": [],
@@ -183,7 +194,7 @@ def _resolve_shrinkage(
         },
     ).mappings().all()
 
-    shrinkage_total = Decimal("0.00")
+    shrinkage_net = Decimal("0.00")
     greeting_total = Decimal("0.00")
     shrinkage_by_reason: dict[str, dict[str, Any]] = {}
     greeting_by_reason: dict[str, dict[str, Any]] = {}
@@ -192,13 +203,21 @@ def _resolve_shrinkage(
         cost = _money(r["adjustment_cost"])
         if reason_clean in SHRINKAGE_REASONS:
             entry = shrinkage_by_reason.setdefault(
-                reason_clean, {"n": 0, "total": Decimal("0.00"), "losses": Decimal("0.00")}
+                reason_clean,
+                {
+                    "n": 0,
+                    "total": Decimal("0.00"),
+                    "losses": Decimal("0.00"),
+                    "gains": Decimal("0.00"),
+                },
             )
             entry["n"] += 1
-            entry["total"] += cost
+            entry["total"] += cost  # signed
             if cost < 0:
                 entry["losses"] += cost
-                shrinkage_total += cost  # negative
+            elif cost > 0:
+                entry["gains"] += cost
+            shrinkage_net += cost  # signed sum across all spec rows
         elif reason_clean in GREETING_CARD_REASONS:
             entry = greeting_by_reason.setdefault(
                 reason_clean, {"n": 0, "total": Decimal("0.00")}
@@ -207,8 +226,13 @@ def _resolve_shrinkage(
             entry["total"] += cost
             greeting_total += cost  # signed
 
+    # Flip sign: positive shrinkage_cogs means COGS goes UP (a loss),
+    # negative means COGS goes DOWN (gains exceeded losses).
+    shrinkage_cogs = -shrinkage_net
+
     return {
-        "shrinkage_cogs": abs(shrinkage_total),
+        "shrinkage_cogs": shrinkage_cogs,
+        "shrinkage_net_adjustment_cost": shrinkage_net,
         "greeting_card_adj": greeting_total,
         "shrinkage_breakdown": [
             {
@@ -216,6 +240,7 @@ def _resolve_shrinkage(
                 "n": entry["n"],
                 "total": str(entry["total"]),
                 "losses_only": str(entry["losses"]),
+                "gains_only": str(entry["gains"]),
             }
             for reason, entry in sorted(shrinkage_by_reason.items())
         ],
@@ -433,12 +458,20 @@ def build_cogs_journal(
             }
         )
 
-    # COMPONENT 1: POS-based COGS + shrinkage  Dr 5010 / Cr 1120
+    # COMPONENT 1: POS-based COGS + net shrinkage  Dr 5010 / Cr 1120
+    # shrinkage_cogs is the sign-flipped net of the spec reasons:
+    #   positive = net loss (raises COGS)
+    #   negative = net gain (lowers COGS — i.e. gains exceeded losses)
     if cogs_dr_5010 > 0:
         if shrinkage_cogs > 0:
             line1_memo = (
                 f"Inventory adjustment - POS COGS ${base_cogs} + "
-                f"shrinkage ${shrinkage_cogs}"
+                f"net shrinkage ${shrinkage_cogs}"
+            )
+        elif shrinkage_cogs < 0:
+            line1_memo = (
+                f"Inventory adjustment - POS COGS ${base_cogs} - "
+                f"net inventory gain ${abs(shrinkage_cogs)}"
             )
         else:
             line1_memo = "Inventory adjustment"
