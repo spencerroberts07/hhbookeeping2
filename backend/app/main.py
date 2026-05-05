@@ -10,6 +10,7 @@ from .routes.bank_csv import router as bank_csv_router
 from .routes.bank_pdf import router as bank_pdf_router
 from .routes.card_settlement import router as card_settlement_router
 from .routes.cash_balancing import router as cash_balancing_router
+from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
 from .routes.depreciation import router as depreciation_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
@@ -75,6 +76,10 @@ app.include_router(bank_auto_journal_router)
 # v1.0 module: self-improving vendor classification (Layers 2 + 3 of
 # the bank auto-journal classifier — vendor memory + Claude API).
 app.include_router(vendor_classification_router)
+
+# v1.2 module: monthly COGS journal builder (POS COGS + HHSL dating
+# carry-forward).
+app.include_router(cogs_router)
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -1052,6 +1052,30 @@ def _section_accruals_wrapper(
     )
 
 
+def _section_cogs_wrapper(
+    session,
+    entity_id: UUID,
+    accounting_period_id: UUID | None,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    if not _has_table(session, "cogs_journal_inputs"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "cogs_journal_inputs table not present",
+        }
+    from .services_cogs import section_cogs  # noqa: WPS433
+
+    return section_cogs(
+        session,
+        entity_id=entity_id,
+        accounting_period_id=accounting_period_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
 # ----------------------------------------------------------------------
 # Roll-up
 # ----------------------------------------------------------------------
@@ -1202,6 +1226,10 @@ def get_month_end_close_status(
         ),
         "accruals": _section_accruals_wrapper(
             session, entity["id"], accounting_period_id, period_end_date
+        ),
+        "cogs": _section_cogs_wrapper(
+            session, entity["id"], accounting_period_id,
+            period_start, period_end_date,
         ),
     }
 
