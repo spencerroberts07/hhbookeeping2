@@ -18,6 +18,7 @@ from ..services_payroll import (
     build_payroll_journal,
     build_payroll_run,
     build_payroll_run_from_manual_hours,
+    build_payroll_run_from_register,
     get_payroll_run_detail,
     get_payroll_summary,
     list_employees,
@@ -228,6 +229,40 @@ def post_manual_hours(
                     if body.vacation_paid_overrides else None
                 ),
                 actor_email=body.actor_email,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/runs/upload-register")
+async def post_upload_register(
+    entity_code: str = Form(...),
+    actor_email: str = Form(...),
+    file: UploadFile = File(...),
+    pay_run_number: str | None = Form(default=None),
+    period_number: int | None = Form(default=None),
+    pay_date: str | None = Form(default=None),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """
+    PRIMARY entry point: upload an ENetEmployer payroll register PDF.
+    Parses the exact per-employee deductions and totals, persists the
+    payroll_run + payroll_run_lines at status='draft_confirmed'. Use
+    this in place of upload-hours for any run that will hit the GL.
+    """
+    pay_date_d = _parse_date("pay_date", pay_date) if pay_date else None
+    file_bytes = await file.read()
+    try:
+        with db_session() as session:
+            return build_payroll_run_from_register(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                file_name=file.filename or "payroll_register.pdf",
+                actor_email=actor_email,
+                pay_run_number_override=pay_run_number,
+                period_number_override=period_number,
+                pay_date_override=pay_date_d,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

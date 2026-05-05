@@ -1,23 +1,36 @@
 """
 Payroll module — services layer.
 
-Pipeline:
-    1. seed_employees(entity_code) — one-time seed of payroll_employees
-       from Bridlewood's Feb 2026 register.
-    2. parse_hours_ods(file_bytes) — parse the bookkeeper's ODS hours
-       sheet into per-employee biweekly hours.
-    3. build_payroll_run(...) — match ODS rows to employees, run
-       calculate_employee_payroll for each, persist payroll_runs +
-       payroll_run_lines.
-    4. build_payroll_journal(payroll_run_id, ...) — produce the
-       Dr 6120/6130/2220 + Cr 2300/1020 journal_batch.
-    5. submit/approve through the existing journal_batch_workflow
-       endpoints; bank withdrawals tracked in payroll_bank_withdrawals.
+PRIMARY pipeline (use ENetEmployer's exact numbers):
+    1. seed_employees(entity_code) — one-time seed of payroll_employees.
+    2. parse_payroll_register_pdf(file_bytes) — read ENetEmployer's
+       payroll register PDF and extract per-employee deductions /
+       gross / net pay using the EXACT amounts ENetEmployer (a
+       CRA-certified payroll processor) computed.
+    3. build_payroll_run_from_register(...) — persist with status
+       'draft_confirmed' / workflow 'draft_ready'.
+    4. build_payroll_journal(payroll_run_id, ...) — Dr 6120/6130/2220
+       + Cr 2320/1020 journal_batch with the register's exact numbers.
+    5. submit/approve through the existing journal_batch_workflow.
+
+SECONDARY pipeline (estimate-only — for previewing before running
+ENetEmployer):
+    1. parse_hours_ods(file_bytes) — parse hours sheet
+    2. build_payroll_run(...) — runs the simplified tax engine in
+       services_payroll_calc to produce an ESTIMATED payroll. Status
+       lands at 'draft_estimated' — explicitly not for posting until
+       a register PDF replaces it.
+
+Why two pipelines? CRA's T4127 PDOC formula is too complex (and
+changes annually) to clone with $0.01 fidelity. ENetEmployer is a
+certified payroll processor; its register IS the truth. The estimator
+exists so the bookkeeper can sanity-check before running ENetEmployer.
 """
 from __future__ import annotations
 
 import io
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -916,7 +929,7 @@ def _build_payroll_run_from_parsed(
             ) VALUES (
                 :entity_id, :accounting_period_id, :pay_run_number, :period_number,
                 :period_start, :period_end, :pay_date, 'Normal',
-                'calculated', 'draft_ready',
+                'draft_estimated', 'draft_ready',
                 :active_employees, :paid_employees,
                 :total_gross, :total_net_pay, :total_fed_tax,
                 :total_cpp_ee, :total_cpp_er, :total_ei_ee, :total_ei_er,
@@ -930,7 +943,7 @@ def _build_payroll_run_from_parsed(
                 period_start = EXCLUDED.period_start,
                 period_end = EXCLUDED.period_end,
                 pay_date = EXCLUDED.pay_date,
-                status = 'calculated',
+                status = 'draft_estimated',
                 workflow_status = 'draft_ready',
                 active_employees = EXCLUDED.active_employees,
                 paid_employees = EXCLUDED.paid_employees,
@@ -1087,6 +1100,672 @@ def _build_payroll_run_from_parsed(
 
 
 # ----------------------------------------------------------------------
+# Register PDF parser (PRIMARY — uses ENetEmployer's exact numbers)
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class ParsedRegisterEmployee:
+    employee_number: int
+    name_in_register: str
+    reg_hours: Decimal = Decimal("0.00")
+    reg_hours_rate: Decimal | None = None
+    reg_hours_amount: Decimal = Decimal("0.00")
+    overtime_amount: Decimal = Decimal("0.00")
+    salary_amount: Decimal = Decimal("0.00")
+    stat_pay_hours: Decimal = Decimal("0.00")
+    stat_pay_amount: Decimal = Decimal("0.00")
+    vacation_hours: Decimal = Decimal("0.00")
+    vacation_amount: Decimal = Decimal("0.00")
+    fed_tax: Decimal = Decimal("0.00")
+    cpp_ee: Decimal = Decimal("0.00")
+    cpp_er: Decimal = Decimal("0.00")
+    ei_ee: Decimal = Decimal("0.00")
+    ei_er: Decimal = Decimal("0.00")
+    life_taxable: Decimal = Decimal("0.00")
+    accrued_vacation: Decimal = Decimal("0.00")
+    gross_pay: Decimal = Decimal("0.00")
+    net_pay: Decimal = Decimal("0.00")
+
+
+@dataclass
+class ParsedRegisterResult:
+    pay_run_number: str | None = None
+    period_number: int | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+    pay_date: date | None = None
+    business_number: str | None = None
+    employees: list[ParsedRegisterEmployee] = field(default_factory=list)
+    summary_total_fed_tax: Decimal = Decimal("0.00")
+    summary_total_cpp_ee: Decimal = Decimal("0.00")
+    summary_total_cpp_er: Decimal = Decimal("0.00")
+    summary_total_ei_ee: Decimal = Decimal("0.00")
+    summary_total_ei_er: Decimal = Decimal("0.00")
+    summary_total_life_taxable: Decimal = Decimal("0.00")
+    summary_total_vacation_earned: Decimal = Decimal("0.00")
+    summary_total_vacation_paid: Decimal = Decimal("0.00")
+    summary_total_stat_pay: Decimal = Decimal("0.00")
+    summary_total_gross: Decimal = Decimal("0.00")
+    summary_total_net_pay: Decimal = Decimal("0.00")
+    summary_active_employees: int = 0
+    summary_paid_employees: int = 0
+    cra_remittance_amount: Decimal = Decimal("0.00")
+    warnings: list[str] = field(default_factory=list)
+
+
+_NUM_RE = r"-?[\d,]+\.\d{2}"
+
+
+def _dec(token: str | None) -> Decimal:
+    if token is None:
+        return Decimal("0.00")
+    s = str(token).strip().replace(",", "")
+    try:
+        return Decimal(s).quantize(Decimal("0.01"))
+    except Exception:
+        return Decimal("0.00")
+
+
+def _parse_register_period_dates(text: str) -> tuple[date | None, date | None]:
+    m = re.search(
+        r"(\d{1,2}/\d{1,2}/\d{2})\s*-\s*(\d{1,2}/\d{1,2}/\d{2})", text
+    )
+    if not m:
+        return None, None
+    start, end = None, None
+    for fmt in ("%m/%d/%y", "%d/%m/%y"):
+        try:
+            start = datetime.strptime(m.group(1), fmt).date()
+            end = datetime.strptime(m.group(2), fmt).date()
+            break
+        except ValueError:
+            continue
+    return start, end
+
+
+def _parse_register_pay_date(text: str) -> date | None:
+    m = re.search(
+        r"Pay Date:\s*([A-Z][a-z]+\s+\d{1,2},\s*\d{4})", text
+    )
+    if not m:
+        return None
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(m.group(1), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_employee_block(
+    name: str, employee_number: int, block: str
+) -> ParsedRegisterEmployee:
+    """
+    Parse a single employee section between the header line and the
+    next employee header (or 'Final Total').
+    """
+    emp = ParsedRegisterEmployee(
+        employee_number=employee_number, name_in_register=name
+    )
+
+    # Reg Hours: rate, hours, current_amount, ytd_amount
+    m = re.search(
+        rf"Reg Hours\s+({_NUM_RE})\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}",
+        block,
+    )
+    if m:
+        emp.reg_hours_rate = _dec(m.group(1))
+        emp.reg_hours = _dec(m.group(2))
+        emp.reg_hours_amount = _dec(m.group(3))
+
+    # Overtime
+    m = re.search(
+        rf"Overtime\s+({_NUM_RE})\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}",
+        block,
+    )
+    if m:
+        emp.overtime_amount = _dec(m.group(3))
+
+    # Salary: hours, current_amount, ytd_amount (no rate)
+    m = re.search(
+        rf"Salary\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}", block
+    )
+    if m:
+        emp.salary_amount = _dec(m.group(2))
+
+    # Stat Pay: rate, hours, current, ytd
+    m = re.search(
+        rf"Stat Pay\s+({_NUM_RE})\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}",
+        block,
+    )
+    if m:
+        emp.stat_pay_hours = _dec(m.group(2))
+        emp.stat_pay_amount = _dec(m.group(3))
+
+    # Vacation: hours, current, ytd (no rate)
+    m = re.search(
+        rf"Vacation\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}", block
+    )
+    if m:
+        emp.vacation_hours = _dec(m.group(1))
+        emp.vacation_amount = _dec(m.group(2))
+
+    # FED TAX: current, ytd
+    m = re.search(rf"FED TAX\s+({_NUM_RE})\s+{_NUM_RE}", block)
+    if m:
+        emp.fed_tax = _dec(m.group(1))
+
+    # CPP: ee_current, ee_ytd, er_current, er_ytd
+    m = re.search(
+        rf"CPP\s+({_NUM_RE})\s+{_NUM_RE}\s+({_NUM_RE})\s+{_NUM_RE}", block
+    )
+    if m:
+        emp.cpp_ee = _dec(m.group(1))
+        emp.cpp_er = _dec(m.group(2))
+
+    # EI: ee_current, ee_ytd, er_current, er_ytd
+    m = re.search(
+        rf"EI\s+({_NUM_RE})\s+{_NUM_RE}\s+({_NUM_RE})\s+{_NUM_RE}", block
+    )
+    if m:
+        emp.ei_ee = _dec(m.group(1))
+        emp.ei_er = _dec(m.group(2))
+
+    # Life Taxable Benefit: current, ytd
+    m = re.search(rf"Life Taxable\s+({_NUM_RE})\s+{_NUM_RE}", block)
+    if m:
+        emp.life_taxable = _dec(m.group(1))
+
+    # Accrued vacation: current, ytd (can be negative)
+    m = re.search(rf"Accrued\s+({_NUM_RE})\s+{_NUM_RE}", block)
+    if m:
+        emp.accrued_vacation = _dec(m.group(1))
+
+    # NET PAY xxx GROSS xxx ytd
+    m = re.search(
+        rf"NET PAY\s+({_NUM_RE})\s+GROSS\s+({_NUM_RE})\s+{_NUM_RE}",
+        block,
+    )
+    if m:
+        emp.net_pay = _dec(m.group(1))
+        emp.gross_pay = _dec(m.group(2))
+
+    return emp
+
+
+def _parse_register_summary(full_text: str, result: ParsedRegisterResult) -> None:
+    """
+    Page 4 of the ENetEmployer register has a 'Final Total' table.
+    Layout (single-column extraction, numbers-jumbled):
+
+        FED TAX <current> <ytd>
+        CPP <ee_curr> <ee_ytd> <er_curr> <er_ytd>
+        EI <ee_curr> <ee_ytd> <er_curr> <er_ytd>
+        Grp Ins. <current> <ytd>
+        Life Taxable Benefit <current> <ytd>
+        Accrued <current> <ytd>
+        Active Employees <n>
+        Paid Employees <n>
+        Net Pay <amount>
+        ...
+        <gross_ytd><gross_current>GROSS
+        ...
+        Stat Pay <hours> <current> <ytd>
+        ...
+        Vacation <hours> <current> <ytd>
+    """
+    # Locate the Final Total section
+    ft_idx = full_text.find("Final Total")
+    if ft_idx == -1:
+        return
+    section = full_text[ft_idx:full_text.find("Page: 5", ft_idx) if "Page: 5" in full_text[ft_idx:] else len(full_text)]
+
+    m = re.search(rf"FED TAX\s+({_NUM_RE})\s+{_NUM_RE}", section)
+    if m:
+        result.summary_total_fed_tax = _dec(m.group(1))
+
+    m = re.search(
+        rf"CPP\s+({_NUM_RE})\s+{_NUM_RE}\s+({_NUM_RE})\s+{_NUM_RE}", section
+    )
+    if m:
+        result.summary_total_cpp_ee = _dec(m.group(1))
+        result.summary_total_cpp_er = _dec(m.group(2))
+
+    m = re.search(
+        rf"EI\s+({_NUM_RE})\s+{_NUM_RE}\s+({_NUM_RE})\s+{_NUM_RE}", section
+    )
+    if m:
+        result.summary_total_ei_ee = _dec(m.group(1))
+        result.summary_total_ei_er = _dec(m.group(2))
+
+    m = re.search(rf"Life Taxable Benefit\s+({_NUM_RE})\s+{_NUM_RE}", section)
+    if m:
+        result.summary_total_life_taxable = _dec(m.group(1))
+
+    m = re.search(rf"Accrued\s+({_NUM_RE})\s+{_NUM_RE}", section)
+    if m:
+        result.summary_total_vacation_earned = _dec(m.group(1))
+
+    m = re.search(r"Active Employees\s+(\d+)", section)
+    if m:
+        result.summary_active_employees = int(m.group(1))
+    m = re.search(r"Paid Employees\s+(\d+)", section)
+    if m:
+        result.summary_paid_employees = int(m.group(1))
+
+    m = re.search(rf"Net Pay\s+({_NUM_RE})", section)
+    if m:
+        result.summary_total_net_pay = _dec(m.group(1))
+
+    # GROSS line: "{ytd}{current}GROSS"
+    m = re.search(rf"({_NUM_RE})({_NUM_RE})GROSS", section)
+    if m:
+        result.summary_total_gross = _dec(m.group(2))
+
+    # Stat Pay total: "Stat Pay <hours> <current> <ytd>"
+    m = re.search(
+        rf"Stat Pay\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}", section
+    )
+    if m:
+        result.summary_total_stat_pay = _dec(m.group(2))
+
+    # Vacation total: "Vacation <hours> <current> <ytd>"
+    m = re.search(
+        rf"Vacation\s+({_NUM_RE})\s+({_NUM_RE})\s+{_NUM_RE}", section
+    )
+    if m:
+        result.summary_total_vacation_paid = _dec(m.group(2))
+
+
+def _parse_register_remittance(
+    full_text: str, result: ParsedRegisterResult
+) -> None:
+    m = re.search(
+        rf"Total Remittance Amount\s+({_NUM_RE})\s+{_NUM_RE}", full_text
+    )
+    if m:
+        result.cra_remittance_amount = _dec(m.group(1))
+    m = re.search(r"(\d{9,15}RP\d{4})", full_text)
+    if m:
+        result.business_number = m.group(1)
+
+
+def parse_payroll_register_pdf(file_bytes: bytes) -> ParsedRegisterResult:
+    """
+    Parse an ENetEmployer payroll register PDF and return per-employee
+    deductions and run-level totals using the EXACT amounts ENetEmployer
+    computed (no recalculation).
+    """
+    from pypdf import PdfReader  # noqa: WPS433
+
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pages = [p.extract_text() or "" for p in reader.pages]
+    full_text = "\n".join(pages)
+
+    result = ParsedRegisterResult()
+
+    # Pay run number + period number: "Pay Run: Normal 2026-71, Period 5"
+    # PDF text reorders this — search across compact form
+    m = re.search(r"(\d{4}-\d{1,3}),\s*Period\s*(\d+)", full_text)
+    if m:
+        result.pay_run_number = m.group(1)
+        result.period_number = int(m.group(2))
+
+    period_start, period_end = _parse_register_period_dates(full_text)
+    result.period_start = period_start
+    result.period_end = period_end
+    result.pay_date = _parse_register_pay_date(full_text)
+
+    # Find each employee block. The PDF wraps each employee section
+    # in a header that ends with "{empno} ON\n{BN}".
+    employee_pattern = re.compile(
+        r"([A-Z][A-Za-z\-']+,\s*[A-Z][A-Za-z\-' ]+?)\n"
+        r"BN\nEI Hrs/Insrble\nTaxable\n"
+        r"(\d+)\s+ON\n",
+        re.MULTILINE,
+    )
+    matches = list(employee_pattern.finditer(full_text))
+
+    if not matches:
+        result.warnings.append(
+            "Could not find any employee header blocks in the PDF"
+        )
+
+    final_total_idx = full_text.find("Final Total")
+    if final_total_idx == -1:
+        final_total_idx = len(full_text)
+
+    for i, m in enumerate(matches):
+        block_start = m.end()
+        block_end = (
+            matches[i + 1].start()
+            if i + 1 < len(matches)
+            else final_total_idx
+        )
+        block = full_text[block_start:block_end]
+        emp = _parse_employee_block(
+            name=m.group(1).strip(),
+            employee_number=int(m.group(2)),
+            block=block,
+        )
+        result.employees.append(emp)
+
+    _parse_register_summary(full_text, result)
+    _parse_register_remittance(full_text, result)
+    return result
+
+
+# ----------------------------------------------------------------------
+# Run builder from register
+# ----------------------------------------------------------------------
+
+
+def build_payroll_run_from_register(
+    session,
+    *,
+    entity_code: str,
+    file_bytes: bytes,
+    file_name: str,
+    actor_email: str,
+    pay_run_number_override: str | None = None,
+    period_number_override: int | None = None,
+    pay_date_override: date | None = None,
+) -> dict[str, Any]:
+    """
+    Parse the ENetEmployer payroll register PDF and persist a
+    payroll_run + payroll_run_lines using EXACT amounts. Status lands
+    at 'draft_confirmed' / workflow 'draft_ready'. Use this in place
+    of build_payroll_run for any run that will hit the GL.
+    """
+    if not actor_email:
+        raise ValueError("actor_email is required")
+    entity = get_entity_by_code(session, entity_code)
+    if not entity:
+        raise ValueError(f"Unknown entity code: {entity_code}")
+
+    parsed = parse_payroll_register_pdf(file_bytes)
+
+    pay_run_number = pay_run_number_override or parsed.pay_run_number
+    if not pay_run_number:
+        raise ValueError(
+            "Could not extract pay_run_number from PDF; supply via override"
+        )
+    period_number = (
+        period_number_override
+        if period_number_override is not None
+        else parsed.period_number
+    )
+    if period_number is None:
+        raise ValueError(
+            "Could not extract period_number from PDF; supply via override"
+        )
+    period_start = parsed.period_start
+    period_end = parsed.period_end
+    pay_date = pay_date_override or parsed.pay_date or period_end
+    if not period_start or not period_end:
+        raise ValueError("Could not extract period dates from PDF")
+
+    # Match each register employee → payroll_employees row by employee_number
+    employees_by_number: dict[int, dict[str, Any]] = {}
+    for emp in session.execute(
+        text(
+            "SELECT id, employee_number, full_name, employment_type, "
+            "ods_name_key FROM payroll_employees WHERE entity_id = :e"
+        ),
+        {"e": entity["id"]},
+    ).mappings():
+        employees_by_number[emp["employee_number"]] = dict(emp)
+
+    unmatched: list[str] = []
+    matched: list[tuple[ParsedRegisterEmployee, dict[str, Any]]] = []
+    for r in parsed.employees:
+        emp = employees_by_number.get(r.employee_number)
+        if emp is None:
+            unmatched.append(
+                f"#{r.employee_number} {r.name_in_register}"
+            )
+            continue
+        matched.append((r, emp))
+
+    if unmatched:
+        raise ValueError(
+            f"Register has employees not in payroll_employees: {unmatched}"
+        )
+
+    accounting_period_id = get_or_create_accounting_period(
+        session, entity["id"], period_end
+    )
+
+    # Totals — use SUMMARY values from the register so we match
+    # ENetEmployer's printed totals exactly. Cross-check against
+    # per-employee sums as a sanity warning.
+    totals = {
+        "gross": parsed.summary_total_gross,
+        "net_pay": parsed.summary_total_net_pay,
+        "fed_tax": parsed.summary_total_fed_tax,
+        "cpp_ee": parsed.summary_total_cpp_ee,
+        "cpp_er": parsed.summary_total_cpp_er,
+        "ei_ee": parsed.summary_total_ei_ee,
+        "ei_er": parsed.summary_total_ei_er,
+        "life_taxable": parsed.summary_total_life_taxable,
+        "vacation_earned": parsed.summary_total_vacation_earned,
+        "vacation_paid": parsed.summary_total_vacation_paid,
+        "stat_pay": parsed.summary_total_stat_pay,
+    }
+    cra_remittance = parsed.cra_remittance_amount or (
+        totals["fed_tax"] + totals["cpp_ee"] + totals["cpp_er"]
+        + totals["ei_ee"] + totals["ei_er"]
+    )
+
+    warnings: list[str] = list(parsed.warnings)
+    sum_gross = sum((r.gross_pay for r, _ in matched), Decimal("0.00"))
+    if abs(sum_gross - totals["gross"]) > Decimal("1.00"):
+        warnings.append(
+            f"Per-employee gross sum ${sum_gross} vs summary ${totals['gross']} — "
+            "register sections don't reconcile."
+        )
+
+    # Persist
+    summary = {
+        "source": "enet_register_pdf",
+        "pay_run_number": pay_run_number,
+        "period_number": period_number,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "pay_date": pay_date.isoformat() if pay_date else None,
+        "active_employees": parsed.summary_active_employees,
+        "paid_employees": parsed.summary_paid_employees,
+        "totals": {k: str(v) for k, v in totals.items()},
+        "cra_remittance_amount": str(cra_remittance),
+        "business_number": parsed.business_number,
+        "warnings": warnings,
+        "hours_import_file": file_name,
+    }
+
+    run_row = session.execute(
+        text(
+            """
+            INSERT INTO payroll_runs (
+                entity_id, accounting_period_id, pay_run_number, period_number,
+                period_start, period_end, pay_date, pay_type,
+                status, workflow_status,
+                active_employees, paid_employees,
+                total_gross, total_net_pay, total_fed_tax,
+                total_cpp_ee, total_cpp_er, total_ei_ee, total_ei_er,
+                total_life_taxable, total_vacation_earned, total_vacation_paid,
+                total_stat_pay, cra_remittance_amount,
+                hours_import_file, summary_json, actor_email
+            ) VALUES (
+                :entity_id, :accounting_period_id, :pay_run_number, :period_number,
+                :period_start, :period_end, :pay_date, 'Normal',
+                'draft_confirmed', 'draft_ready',
+                :active_employees, :paid_employees,
+                :total_gross, :total_net_pay, :total_fed_tax,
+                :total_cpp_ee, :total_cpp_er, :total_ei_ee, :total_ei_er,
+                :total_life_taxable, :total_vacation_earned, :total_vacation_paid,
+                :total_stat_pay, :cra_remittance_amount,
+                :hours_import_file, CAST(:summary_json AS jsonb), :actor_email
+            )
+            ON CONFLICT (entity_id, pay_run_number) DO UPDATE SET
+                accounting_period_id = EXCLUDED.accounting_period_id,
+                period_number = EXCLUDED.period_number,
+                period_start = EXCLUDED.period_start,
+                period_end = EXCLUDED.period_end,
+                pay_date = EXCLUDED.pay_date,
+                status = 'draft_confirmed',
+                workflow_status = 'draft_ready',
+                active_employees = EXCLUDED.active_employees,
+                paid_employees = EXCLUDED.paid_employees,
+                total_gross = EXCLUDED.total_gross,
+                total_net_pay = EXCLUDED.total_net_pay,
+                total_fed_tax = EXCLUDED.total_fed_tax,
+                total_cpp_ee = EXCLUDED.total_cpp_ee,
+                total_cpp_er = EXCLUDED.total_cpp_er,
+                total_ei_ee = EXCLUDED.total_ei_ee,
+                total_ei_er = EXCLUDED.total_ei_er,
+                total_life_taxable = EXCLUDED.total_life_taxable,
+                total_vacation_earned = EXCLUDED.total_vacation_earned,
+                total_vacation_paid = EXCLUDED.total_vacation_paid,
+                total_stat_pay = EXCLUDED.total_stat_pay,
+                cra_remittance_amount = EXCLUDED.cra_remittance_amount,
+                hours_import_file = EXCLUDED.hours_import_file,
+                summary_json = EXCLUDED.summary_json,
+                actor_email = EXCLUDED.actor_email,
+                journal_batch_id = NULL,
+                submitted_by = NULL, submitted_at = NULL,
+                approved_by = NULL, approved_at = NULL,
+                updated_at = NOW()
+            RETURNING id
+            """
+        ),
+        {
+            "entity_id": entity["id"],
+            "accounting_period_id": accounting_period_id,
+            "pay_run_number": pay_run_number,
+            "period_number": int(period_number),
+            "period_start": period_start,
+            "period_end": period_end,
+            "pay_date": pay_date,
+            "active_employees": parsed.summary_active_employees,
+            "paid_employees": parsed.summary_paid_employees,
+            "total_gross": totals["gross"],
+            "total_net_pay": totals["net_pay"],
+            "total_fed_tax": totals["fed_tax"],
+            "total_cpp_ee": totals["cpp_ee"],
+            "total_cpp_er": totals["cpp_er"],
+            "total_ei_ee": totals["ei_ee"],
+            "total_ei_er": totals["ei_er"],
+            "total_life_taxable": totals["life_taxable"],
+            "total_vacation_earned": totals["vacation_earned"],
+            "total_vacation_paid": totals["vacation_paid"],
+            "total_stat_pay": totals["stat_pay"],
+            "cra_remittance_amount": cra_remittance,
+            "hours_import_file": file_name,
+            "summary_json": json.dumps(summary),
+            "actor_email": actor_email,
+        },
+    ).mappings().first()
+    payroll_run_id = run_row["id"]
+
+    session.execute(
+        text("DELETE FROM payroll_run_lines WHERE payroll_run_id = :id"),
+        {"id": payroll_run_id},
+    )
+    line_records: list[dict[str, Any]] = []
+    for r, emp in matched:
+        gross = r.gross_pay or (
+            r.reg_hours_amount + r.salary_amount + r.overtime_amount
+            + r.stat_pay_amount + r.vacation_amount
+        )
+        taxable = gross + r.life_taxable
+        is_on_vacation = r.vacation_amount > 0 and r.reg_hours_amount == 0 and r.salary_amount == 0
+        # week split: register doesn't track per-week, so place all in week2
+        week1 = Decimal("0.00")
+        week2 = r.reg_hours
+        session.execute(
+            text(
+                """
+                INSERT INTO payroll_run_lines (
+                    payroll_run_id, employee_id, employment_type,
+                    week1_hours, week2_hours, total_hours, hourly_rate,
+                    reg_hours_pay, overtime_pay, salary_pay, stat_pay,
+                    vacation_paid, gross_pay, taxable_gross,
+                    fed_tax, cpp_ee, cpp_er, ei_ee, ei_er,
+                    life_taxable_benefit, vacation_earned, net_pay,
+                    is_on_vacation, notes
+                ) VALUES (
+                    :payroll_run_id, :employee_id, :employment_type,
+                    :week1_hours, :week2_hours, :total_hours, :hourly_rate,
+                    :reg_hours_pay, :overtime_pay, :salary_pay, :stat_pay,
+                    :vacation_paid, :gross_pay, :taxable_gross,
+                    :fed_tax, :cpp_ee, :cpp_er, :ei_ee, :ei_er,
+                    :life_taxable_benefit, :vacation_earned, :net_pay,
+                    :is_on_vacation, :notes
+                )
+                """
+            ),
+            {
+                "payroll_run_id": payroll_run_id,
+                "employee_id": emp["id"],
+                "employment_type": emp["employment_type"],
+                "week1_hours": week1,
+                "week2_hours": week2,
+                "total_hours": r.reg_hours,
+                "hourly_rate": r.reg_hours_rate,
+                "reg_hours_pay": r.reg_hours_amount,
+                "overtime_pay": r.overtime_amount,
+                "salary_pay": r.salary_amount,
+                "stat_pay": r.stat_pay_amount,
+                "vacation_paid": r.vacation_amount,
+                "gross_pay": gross,
+                "taxable_gross": taxable,
+                "fed_tax": r.fed_tax,
+                "cpp_ee": r.cpp_ee,
+                "cpp_er": r.cpp_er,
+                "ei_ee": r.ei_ee,
+                "ei_er": r.ei_er,
+                "life_taxable_benefit": r.life_taxable,
+                "vacation_earned": r.accrued_vacation,
+                "net_pay": r.net_pay,
+                "is_on_vacation": is_on_vacation,
+                "notes": "Source: ENetEmployer register PDF",
+            },
+        )
+        line_records.append(
+            {
+                "employee_id": str(emp["id"]),
+                "employee_number": emp["employee_number"],
+                "full_name": emp["full_name"],
+                "gross_pay": str(gross),
+                "fed_tax": str(r.fed_tax),
+                "cpp_ee": str(r.cpp_ee),
+                "ei_ee": str(r.ei_ee),
+                "net_pay": str(r.net_pay),
+            }
+        )
+
+    return {
+        "payroll_run_id": str(payroll_run_id),
+        "entity_code": entity["entity_code"],
+        "pay_run_number": pay_run_number,
+        "period_number": period_number,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "pay_date": pay_date.isoformat() if pay_date else None,
+        "status": "draft_confirmed",
+        "active_employees": parsed.summary_active_employees,
+        "paid_employees": parsed.summary_paid_employees,
+        "totals": {k: str(v) for k, v in totals.items()},
+        "cra_remittance_amount": str(cra_remittance),
+        "business_number": parsed.business_number,
+        "lines": line_records,
+        "warnings": warnings,
+        "source": "enet_register_pdf",
+    }
+
+
+# ----------------------------------------------------------------------
 # Journal builder
 # ----------------------------------------------------------------------
 
@@ -1109,7 +1788,7 @@ def build_payroll_journal(
         text(
             """
             SELECT id, entity_id, accounting_period_id, pay_run_number,
-                   period_start, period_end, pay_date,
+                   period_start, period_end, pay_date, status,
                    total_gross, total_net_pay, total_fed_tax,
                    total_cpp_ee, total_cpp_er, total_ei_ee, total_ei_er,
                    total_life_taxable, total_vacation_earned,
@@ -1125,6 +1804,14 @@ def build_payroll_journal(
     if run["accounting_period_id"] is None:
         raise ValueError(
             f"payroll_run has no accounting_period_id (period_end={run['period_end']})"
+        )
+    if run["status"] == "draft_estimated":
+        raise ValueError(
+            f"Refusing to build journal from a draft_estimated run "
+            f"(pay_run_number={run['pay_run_number']}). The estimator "
+            "is preview-only — upload the ENetEmployer register PDF "
+            "via /api/payroll/runs/upload-register first to confirm "
+            "the exact deductions before posting to the GL."
         )
 
     # Pull per-line data so we can split the wages debit into reg / salary / etc.
