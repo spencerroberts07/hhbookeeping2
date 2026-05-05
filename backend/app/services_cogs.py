@@ -50,6 +50,38 @@ ACCOUNT_AP_HHSL = "2030"
 
 SANITY_TOLERANCE = Decimal("1000.00")
 
+# Inventory-adjustment reasons that the spec treats as shrinkage. Match
+# against the cleaned reason (leading digits + underscore stripped, then
+# uppercased) — the POS parser concatenates the cost's fractional digits
+# onto the reason, so the raw value looks like "0570_CYCLE_COUNT".
+# Truncated tails ("…ON_HA", "…ON_H") follow the parser's column width.
+SHRINKAGE_REASONS = frozenset({
+    "CYCLE_COUNT",
+    "CYCLE_COUNT_ADJ_QTY_ON_HA",
+    "BROKEN_IN_STORE",
+    "EXPIRED_GOODS",
+    "STOLEN_ITEMS",
+    "ITEM_RECOUNT_ADJ_QTY_ON_H",
+    "LOSS_OTHER_REASONS",
+})
+
+GREETING_CARD_REASONS = frozenset({
+    "GREETING_CARD_RETURNS",
+})
+
+
+def _clean_reason(value: Any) -> str:
+    if value is None:
+        return ""
+    raw = str(value).upper().strip()
+    # Strip leading "NNNN_" prefix added by the POS parser
+    i = 0
+    while i < len(raw) and raw[i].isdigit():
+        i += 1
+    if i > 0 and i < len(raw) and raw[i] == "_":
+        return raw[i + 1 :]
+    return raw
+
 
 def _money(value: Any) -> Decimal:
     return Decimal(str(value or 0)).quantize(Decimal("0.01"))
@@ -105,6 +137,91 @@ def _last_period_dating_new(
     if not row:
         return Decimal("0.00")
     return _money(row["dating_new_amount"])
+
+
+def _resolve_shrinkage(
+    session, *, entity_id: UUID, period_start: date, period_end: date
+) -> dict[str, Any]:
+    """
+    Walk inventory_adjustment_lines for the period and bucket them into
+    shrinkage (losses on cycle counts, broken, expired, stolen, recount,
+    loss-other), greeting card returns, and other (informational).
+
+    Returns:
+        shrinkage_cogs: ABS(sum of negative shrinkage costs) — positive
+        greeting_card_adj: signed sum of greeting-card-returns lines
+        shrinkage_breakdown: list of (reason, n, total, losses_only)
+    """
+    if not _has_table(session, "inventory_adjustment_lines"):
+        return {
+            "shrinkage_cogs": Decimal("0.00"),
+            "greeting_card_adj": Decimal("0.00"),
+            "shrinkage_breakdown": [],
+            "greeting_card_breakdown": [],
+            "module_present": False,
+        }
+    rows = session.execute(
+        text(
+            """
+            SELECT adjustment_reason, adjustment_cost
+            FROM inventory_adjustment_lines
+            WHERE entity_id = :entity_id
+              AND date_adjusted BETWEEN :period_start AND :period_end
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().all()
+
+    shrinkage_total = Decimal("0.00")
+    greeting_total = Decimal("0.00")
+    shrinkage_by_reason: dict[str, dict[str, Any]] = {}
+    greeting_by_reason: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        reason_clean = _clean_reason(r["adjustment_reason"])
+        cost = _money(r["adjustment_cost"])
+        if reason_clean in SHRINKAGE_REASONS:
+            entry = shrinkage_by_reason.setdefault(
+                reason_clean, {"n": 0, "total": Decimal("0.00"), "losses": Decimal("0.00")}
+            )
+            entry["n"] += 1
+            entry["total"] += cost
+            if cost < 0:
+                entry["losses"] += cost
+                shrinkage_total += cost  # negative
+        elif reason_clean in GREETING_CARD_REASONS:
+            entry = greeting_by_reason.setdefault(
+                reason_clean, {"n": 0, "total": Decimal("0.00")}
+            )
+            entry["n"] += 1
+            entry["total"] += cost
+            greeting_total += cost  # signed
+
+    return {
+        "shrinkage_cogs": abs(shrinkage_total),
+        "greeting_card_adj": greeting_total,
+        "shrinkage_breakdown": [
+            {
+                "reason": reason,
+                "n": entry["n"],
+                "total": str(entry["total"]),
+                "losses_only": str(entry["losses"]),
+            }
+            for reason, entry in sorted(shrinkage_by_reason.items())
+        ],
+        "greeting_card_breakdown": [
+            {
+                "reason": reason,
+                "n": entry["n"],
+                "total": str(entry["total"]),
+            }
+            for reason, entry in sorted(greeting_by_reason.items())
+        ],
+        "module_present": True,
+    }
 
 
 def get_suggested_dating_reversal(
@@ -210,6 +327,7 @@ def build_cogs_journal(
     other_adjustment_amount: Decimal | None,
     other_adjustment_memo: str | None,
     actor_email: str,
+    shrinkage_included: bool = True,
 ) -> dict[str, Any]:
     if not actor_email:
         raise ValueError("actor_email is required")
@@ -245,6 +363,15 @@ def build_cogs_journal(
             "cogs_non_merchandise). Refusing to build a $0 journal."
         )
 
+    shrinkage_data = _resolve_shrinkage(
+        session, entity_id=entity["id"],
+        period_start=period_start, period_end=period_end,
+    )
+    shrinkage_cogs = (
+        shrinkage_data["shrinkage_cogs"] if shrinkage_included else Decimal("0.00")
+    )
+    greeting_card_adj = shrinkage_data["greeting_card_adj"]
+
     new_amt = _money(dating_new_amount) if dating_new_amount is not None else Decimal("0.00")
     rev_amt = (
         _money(dating_reversal_amount)
@@ -256,12 +383,13 @@ def build_cogs_journal(
     other_amt = _money(other_adjustment_amount) if other_adjustment_amount is not None else Decimal("0.00")
 
     # Net effects (in QBO debit-positive convention):
-    #   net_5010  = base_cogs + dating_reversal - dating_new + other
-    #   net_1120  = -base_cogs   (credit)
+    #   net_5010  = base_cogs + shrinkage + dating_reversal - dating_new + other
+    #   net_1120  = -base_cogs - shrinkage  (credits — inventory went down)
     #   net_2030  = -dating_reversal + dating_new   (credit on reversal,
     #                                                debit on new dating)
-    net_5010 = base_cogs + rev_amt - new_amt + other_amt
-    net_1120 = -base_cogs
+    cogs_dr_5010 = base_cogs + shrinkage_cogs
+    net_5010 = cogs_dr_5010 + rev_amt - new_amt + other_amt
+    net_1120 = -cogs_dr_5010
     net_2030_dating = -rev_amt + new_amt
 
     # ------------------------------------------------------------------
@@ -298,9 +426,17 @@ def build_cogs_journal(
             }
         )
 
-    # COMPONENT 1: POS-based COGS  Dr 5010 / Cr 1120
-    _add_pair(ACCOUNT_COGS, ACCOUNT_INVENTORY, base_cogs,
-              "Inventory adjustment", "pos_cogs")
+    # COMPONENT 1: POS-based COGS + shrinkage  Dr 5010 / Cr 1120
+    if cogs_dr_5010 > 0:
+        if shrinkage_cogs > 0:
+            line1_memo = (
+                f"Inventory adjustment - POS COGS ${base_cogs} + "
+                f"shrinkage ${shrinkage_cogs}"
+            )
+        else:
+            line1_memo = "Inventory adjustment"
+        _add_pair(ACCOUNT_COGS, ACCOUNT_INVENTORY, cogs_dr_5010,
+                  line1_memo, "pos_cogs")
 
     # COMPONENT 2: Reverse prior month dating
     if rev_amt > 0:
@@ -402,6 +538,11 @@ def build_cogs_journal(
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "base_cogs": str(base_cogs),
+        "shrinkage_cogs": str(shrinkage_cogs),
+        "shrinkage_included": shrinkage_included,
+        "shrinkage_breakdown": shrinkage_data["shrinkage_breakdown"],
+        "greeting_card_adj": str(greeting_card_adj),
+        "greeting_card_breakdown": shrinkage_data["greeting_card_breakdown"],
         "dating_new_amount": str(new_amt),
         "dating_reversal_amount": str(rev_amt),
         "other_adjustment_amount": str(other_amt),
@@ -502,7 +643,8 @@ def build_cogs_journal(
             INSERT INTO cogs_journal_inputs (
                 entity_id, accounting_period_id, pos_import_run_id,
                 period_start, period_end,
-                base_cogs, dating_new_amount, dating_reversal_amount,
+                base_cogs, shrinkage_cogs, shrinkage_included, greeting_card_adj,
+                dating_new_amount, dating_reversal_amount,
                 other_adjustment_amount, other_adjustment_memo,
                 net_5010_amount, net_1120_amount, net_2030_dating_amount,
                 sanity_check_vs_gl_variance, sanity_check_vs_inventory_movement,
@@ -511,7 +653,8 @@ def build_cogs_journal(
             ) VALUES (
                 :entity_id, :accounting_period_id, :pos_import_run_id,
                 :period_start, :period_end,
-                :base_cogs, :dating_new_amount, :dating_reversal_amount,
+                :base_cogs, :shrinkage_cogs, :shrinkage_included, :greeting_card_adj,
+                :dating_new_amount, :dating_reversal_amount,
                 :other_adjustment_amount, :other_adjustment_memo,
                 :net_5010_amount, :net_1120_amount, :net_2030_dating_amount,
                 :sanity_check_vs_gl_variance, :sanity_check_vs_inventory_movement,
@@ -523,6 +666,9 @@ def build_cogs_journal(
                 accounting_period_id = EXCLUDED.accounting_period_id,
                 pos_import_run_id = EXCLUDED.pos_import_run_id,
                 base_cogs = EXCLUDED.base_cogs,
+                shrinkage_cogs = EXCLUDED.shrinkage_cogs,
+                shrinkage_included = EXCLUDED.shrinkage_included,
+                greeting_card_adj = EXCLUDED.greeting_card_adj,
                 dating_new_amount = EXCLUDED.dating_new_amount,
                 dating_reversal_amount = EXCLUDED.dating_reversal_amount,
                 other_adjustment_amount = EXCLUDED.other_adjustment_amount,
@@ -546,6 +692,9 @@ def build_cogs_journal(
             "period_start": period_start,
             "period_end": period_end,
             "base_cogs": base_cogs,
+            "shrinkage_cogs": shrinkage_cogs,
+            "shrinkage_included": shrinkage_included,
+            "greeting_card_adj": greeting_card_adj,
             "dating_new_amount": new_amt,
             "dating_reversal_amount": rev_amt,
             "other_adjustment_amount": other_amt,
@@ -568,6 +717,16 @@ def build_cogs_journal(
         "period_end": period_end.isoformat(),
         "journal_batch_id": str(journal_batch_id),
         "base_cogs": str(base_cogs),
+        "shrinkage_cogs": str(shrinkage_cogs),
+        "shrinkage_included": shrinkage_included,
+        "shrinkage_breakdown": shrinkage_data["shrinkage_breakdown"],
+        "greeting_card_adj": str(greeting_card_adj),
+        "greeting_card_breakdown": shrinkage_data["greeting_card_breakdown"],
+        "greeting_card_note": (
+            "Greeting card returns are surfaced separately. Bookkeeper "
+            "decides whether they belong in COGS (Dr 5010 / Cr 1120) or "
+            "as a vendor return AP adjustment (Dr 2020 / Cr 1120)."
+        ) if abs(greeting_card_adj) > 0 else None,
         "dating_new_amount": str(new_amt),
         "dating_reversal_amount": str(rev_amt),
         "other_adjustment_amount": str(other_amt),
@@ -634,7 +793,8 @@ def _cogs_status_for_entity(
     inputs_row = session.execute(
         text(
             """
-            SELECT base_cogs, dating_new_amount, dating_reversal_amount,
+            SELECT base_cogs, shrinkage_cogs, shrinkage_included, greeting_card_adj,
+                   dating_new_amount, dating_reversal_amount,
                    other_adjustment_amount, net_5010_amount,
                    sanity_check_warning, sanity_check_notes,
                    journal_batch_id, updated_at
@@ -681,6 +841,9 @@ def _cogs_status_for_entity(
         "inputs": (
             {
                 "base_cogs": str(inputs_row["base_cogs"]),
+                "shrinkage_cogs": str(inputs_row["shrinkage_cogs"]),
+                "shrinkage_included": inputs_row["shrinkage_included"],
+                "greeting_card_adj": str(inputs_row["greeting_card_adj"]),
                 "dating_new_amount": str(inputs_row["dating_new_amount"]),
                 "dating_reversal_amount": str(inputs_row["dating_reversal_amount"]),
                 "other_adjustment_amount": str(inputs_row["other_adjustment_amount"]),

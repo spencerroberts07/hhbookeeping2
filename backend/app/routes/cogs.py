@@ -40,6 +40,7 @@ class BuildCogsJournalRequest(BaseModel):
     dating_reversal_amount: Decimal | None = None
     other_adjustment_amount: Decimal | None = None
     other_adjustment_memo: str | None = None
+    shrinkage_included: bool = True
 
 
 @router.post("/build-journal")
@@ -59,6 +60,7 @@ def post_build_journal(
                 other_adjustment_amount=body.other_adjustment_amount,
                 other_adjustment_memo=body.other_adjustment_memo,
                 actor_email=body.actor_email,
+                shrinkage_included=body.shrinkage_included,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
