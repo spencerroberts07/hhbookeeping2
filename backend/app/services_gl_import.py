@@ -60,7 +60,7 @@ VARIANCE_TOLERANCE = Decimal("0.05")  # within 5 cents = no variance flag
 # To compare apples to apples we negate the app's net activity for
 # accounts whose code begins with any prefix in this set before
 # computing the variance.
-_FLIP_APP_SIGN_PREFIXES = ("2", "4")
+_FLIP_APP_SIGN_PREFIXES = ("2", "4", "7")
 
 
 # ----------------------------------------------------------------------
