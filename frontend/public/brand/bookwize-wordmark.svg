@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="150" viewBox="0 0 760 150" fill="none">
+  <title>BookWize logo</title>
+  
+  <defs>
+    <linearGradient id="blueGrad" x1="82" y1="70" x2="178" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B2E72"/>
+      <stop offset="1" stop-color="#1454C8"/>
+    </linearGradient>
+    <linearGradient id="tealGrad" x1="78" y1="34" x2="173" y2="126" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#13B8B4"/>
+      <stop offset="1" stop-color="#0A9F9B"/>
+    </linearGradient>
+  </defs>
+  
+  <style>
+    .word { font-family: Inter, "Aptos Display", "Segoe UI", Arial, sans-serif; font-weight: 800; letter-spacing: -4px; }
+    .tag { font-family: Inter, Aptos, "Segoe UI", Arial, sans-serif; font-weight: 700; letter-spacing: 6px; }
+  </style>
+
+  
+  <text x="20" y="112" class="word" font-size="96" fill="#0B2E72">Book</text>
+  <text x="272" y="112" class="word" font-size="96" fill="#13B8B4">Wize</text>
+  
+</svg>

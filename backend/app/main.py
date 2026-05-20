@@ -9,6 +9,7 @@ from .routes.auto_match import router as auto_match_router
 from .routes.bank_auto_journal import router as bank_auto_journal_router
 from .routes.bank_csv import router as bank_csv_router
 from .routes.bank_pdf import router as bank_pdf_router
+from .routes.billing import router as billing_router, webhook_router as stripe_webhook_router
 from .routes.card_settlement import router as card_settlement_router
 from .routes.cash_balancing import router as cash_balancing_router
 from .routes.clerk_webhook import router as clerk_webhook_router
@@ -16,6 +17,7 @@ from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
 from .routes.depreciation import router as depreciation_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
+from .routes.entities import me_router as me_router, router as entities_router
 from .routes.gl_import import router as gl_import_router
 from .routes.hh_ap import router as hh_ap_router
 from .routes import hh_ap_overrides
@@ -55,13 +57,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clerk webhook receiver — must be reachable without an auth header.
-# Registered first so it appears at the top of /docs.
+# Webhook receivers — must be reachable without an auth header.
+# Registered first so they appear at the top of /docs.
 app.include_router(clerk_webhook_router)
+app.include_router(stripe_webhook_router)
+
+# Billing endpoints (Clerk admins only)
+app.include_router(billing_router)
 
 # Auth (user) and QBO OAuth (formerly the only auth router)
 app.include_router(auth_router)
 app.include_router(qbo_auth_router)
+
+# Entity management (admin) + caller-scoped entity lookup
+app.include_router(entities_router)
+app.include_router(me_router)
 
 app.include_router(sync_router)
 app.include_router(qbo_bank_sync_router)

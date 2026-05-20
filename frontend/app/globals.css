@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bookwize-deep-navy: #0B2E72;
+    --bookwize-ledger-blue: #1454C8;
+    --bookwize-teal: #13B8B4;
+    --bookwize-aqua: #2DD4BF;
+    --bookwize-cloud: #F4F7FB;
+    --bookwize-gradient-primary: linear-gradient(135deg, #0B2E72, #1454C8, #13B8B4);
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-cloud text-ink font-sans antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Numeric tabular figures for money columns */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* Print stylesheet for /reports pages — hides nav chrome */
+  @media print {
+    .no-print, aside, nav, header.app-topbar {
+      display: none !important;
+    }
+    main {
+      padding: 0 !important;
+    }
+    body {
+      background: #fff !important;
+    }
+    .print-only {
+      display: block !important;
+    }
+  }
+
+  .print-only {
+    display: none;
+  }
+}

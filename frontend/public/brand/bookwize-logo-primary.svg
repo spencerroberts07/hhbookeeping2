@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="250" viewBox="0 0 1020 250" fill="none">
+  <title>BookWize logo</title>
+  
+  <defs>
+    <linearGradient id="blueGrad" x1="82" y1="70" x2="178" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B2E72"/>
+      <stop offset="1" stop-color="#1454C8"/>
+    </linearGradient>
+    <linearGradient id="tealGrad" x1="78" y1="34" x2="173" y2="126" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#13B8B4"/>
+      <stop offset="1" stop-color="#0A9F9B"/>
+    </linearGradient>
+  </defs>
+  
+  <style>
+    .word { font-family: Inter, "Aptos Display", "Segoe UI", Arial, sans-serif; font-weight: 800; letter-spacing: -4px; }
+    .tag { font-family: Inter, Aptos, "Segoe UI", Arial, sans-serif; font-weight: 700; letter-spacing: 6px; }
+  </style>
+
+  <g transform="translate(28 24) scale(1.03)">
+    <path d="M29 52C52 49 74 57 91 75V170C69 157 49 153 29 159C24 160 20 156 20 150V60C20 55 24 52 29 52Z" fill="#FFFFFF" stroke="#0B2E72" stroke-width="7" stroke-linejoin="round"/>
+    <path d="M91 75C112 66 141 66 166 71C171 72 174 76 174 82V147C174 153 169 158 163 157C137 152 113 156 91 170V75Z" fill="url(#blueGrad)" stroke="#0B2E72" stroke-width="7" stroke-linejoin="round"/>
+    <path d="M43 77H75" stroke="#0B2E72" stroke-width="5" stroke-linecap="round"/>
+    <path d="M43 96H70" stroke="#0B2E72" stroke-width="5" stroke-linecap="round"/>
+    <path d="M43 115H66" stroke="#0B2E72" stroke-width="5" stroke-linecap="round"/>
+    <rect x="110" y="54" width="15" height="47" rx="7.5" fill="url(#tealGrad)"/>
+    <rect x="134" y="39" width="15" height="62" rx="7.5" fill="url(#tealGrad)"/>
+    <rect x="158" y="24" width="15" height="77" rx="7.5" fill="url(#tealGrad)"/>
+    <path d="M24 147C49 145 68 136 88 119C111 99 131 84 166 80C147 74 125 78 105 91C83 105 68 126 46 139C36 145 29 147 24 147Z" fill="url(#tealGrad)"/>
+    <path d="M34 145C56 142 76 132 96 115" stroke="#FFFFFF" stroke-opacity="0.78" stroke-width="6" stroke-linecap="round"/>
+    <path d="M117 125L133 140L158 107" stroke="#FFFFFF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M21 151C42 145 70 149 91 170" stroke="#0B2E72" stroke-width="7" stroke-linecap="round"/>
+    <path d="M91 170C116 156 139 153 164 157" stroke="#0B2E72" stroke-width="7" stroke-linecap="round"/>
+  </g>
+  <text x="265" y="132" class="word" font-size="92" fill="#0B2E72">Book</text>
+  <text x="500" y="132" class="word" font-size="92" fill="#13B8B4">Wize</text>
+  
+</svg>

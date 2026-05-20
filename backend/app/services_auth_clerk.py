@@ -588,11 +588,22 @@ def sync_clerk_org_from_webhook(
     """
     Handle organization.created / .updated.
 
-    We do NOT create new rows in entities here — entity creation is a heavy
-    operation (fiscal year, base currency, QBO realm linkage) that must
-    happen via the admin flow. Instead, if the Clerk org metadata names an
-    existing entity_code, we wire entities.clerk_org_id to that row.
+    Behaviour (per q26):
+      - If the Clerk org metadata names an existing entity_code, wire
+        entities.clerk_org_id to that row.
+      - If the metadata names an entity_code that does NOT exist yet AND
+        the metadata also provides fiscal_year_end_month/day + entity_name,
+        auto-create the entity row. This is the path the onboarding wizard
+        uses: it calls POST /api/entities synchronously, then creates the
+        Clerk org with private_metadata={entity_code, entity_name,
+        fiscal_year_end_month, fiscal_year_end_day, province}; this webhook
+        binds the freshly-created org back to the entity.
+
+    We do NOT speculatively create entities from a bare entity_code — the
+    fiscal year and base currency must come from somewhere deterministic.
     """
+    from uuid import uuid4
+
     clerk_org_id = data.get("id")
     if not clerk_org_id:
         logger.warning("Clerk org webhook missing 'id': %s", event_type)
@@ -600,10 +611,9 @@ def sync_clerk_org_from_webhook(
 
     private_meta = data.get("private_metadata") or {}
     public_meta = data.get("public_metadata") or {}
+    meta = {**public_meta, **private_meta}  # private wins
     entity_code = (
-        private_meta.get("entity_code")
-        or public_meta.get("entity_code")
-        or data.get("slug")  # last-resort: slug equals entity_code
+        meta.get("entity_code") or data.get("slug")  # last-resort
     )
     if not entity_code:
         logger.info(
@@ -624,6 +634,65 @@ def sync_clerk_org_from_webhook(
         {"org_id": clerk_org_id, "entity_code": entity_code},
     )
     if res.rowcount == 0:
+        # No matching entity row. Auto-create iff we have enough metadata.
+        entity_name = meta.get("entity_name") or data.get("name")
+        fy_month = meta.get("fiscal_year_end_month")
+        fy_day = meta.get("fiscal_year_end_day")
+        province = meta.get("province")
+
+        if entity_name and fy_month and fy_day:
+            try:
+                fy_month_i = int(fy_month)
+                fy_day_i = int(fy_day)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Clerk org %s metadata.fiscal_year_end_month/day "
+                    "invalid: %r / %r — skipping auto-create",
+                    clerk_org_id, fy_month, fy_day,
+                )
+                return
+            organization_id = uuid4()
+            session.execute(
+                text(
+                    """
+                    INSERT INTO organizations (id, name, created_at)
+                    VALUES (:id, :name, NOW())
+                    ON CONFLICT (id) DO NOTHING
+                    """
+                ),
+                {"id": organization_id, "name": entity_name},
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO entities (
+                        id, organization_id, entity_code, entity_name,
+                        fiscal_year_end_month, fiscal_year_end_day,
+                        base_currency, province, clerk_org_id, created_at
+                    ) VALUES (
+                        uuid_generate_v4(), :organization_id, :entity_code,
+                        :entity_name, :fy_month, :fy_day,
+                        'CAD', :province, :clerk_org_id, NOW()
+                    )
+                    ON CONFLICT (entity_code) DO NOTHING
+                    """
+                ),
+                {
+                    "organization_id": organization_id,
+                    "entity_code": entity_code,
+                    "entity_name": entity_name,
+                    "fy_month": fy_month_i,
+                    "fy_day": fy_day_i,
+                    "province": province,
+                    "clerk_org_id": clerk_org_id,
+                },
+            )
+            logger.info(
+                "Clerk org %s auto-created entity %s from webhook metadata",
+                clerk_org_id, entity_code,
+            )
+            return
+
         logger.warning(
             "Clerk org %s metadata.entity_code=%s but no matching entity "
             "row was updated (entity missing or already bound to a different org)",

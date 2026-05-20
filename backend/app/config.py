@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     clerk_jwks_url: str | None = None
     use_clerk_auth: bool = False
 
+    # Stripe billing
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_starter_price_id: str | None = None
+    stripe_professional_price_id: str | None = None
+    stripe_additional_store_price_id: str | None = None
+    bookwize_app_url: str = "https://bookwize.ca"
+
     @field_validator("jwt_secret")
     @classmethod
     def _validate_jwt_secret(cls, value: str) -> str:
