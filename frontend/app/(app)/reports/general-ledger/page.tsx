@@ -1,18 +1,27 @@
 'use client';
 
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ReportShell } from '@/components/reports/report-shell';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { listGlRuns, getGlTransactions } from '@/lib/api/gl';
 import { formatMoney, formatDate } from '@/lib/utils';
+import { MultiFileUpload } from '@/components/shared/multi-file-upload';
+import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 
 export default function GeneralLedgerPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const [accountCode, setAccountCode] = useState('');
+  const [showUpload, setShowUpload] = useState(false);
+  const [glPeriodStart, setGlPeriodStart] = useState('');
+  const [glPeriodEnd, setGlPeriodEnd] = useState('');
+  const uploadDefaults = useUploadDefaults();
+  const qc = useQueryClient();
 
   // Use the latest GL import run as the data source (no live ledger yet).
   // TODO: backend endpoint not built — app-native /api/reports/general-ledger.
@@ -39,6 +48,60 @@ export default function GeneralLedgerPage() {
           : 'No GL import on file'
       }
     >
+      <div className="mb-4 no-print">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setShowUpload((s) => !s)}
+        >
+          {showUpload ? (
+            <ChevronDown className="h-4 w-4" strokeWidth={1.5} />
+          ) : (
+            <ChevronRight className="h-4 w-4" strokeWidth={1.5} />
+          )}
+          {showUpload ? 'Hide GL upload' : 'Upload a new GL export'}
+        </Button>
+        {showUpload && (
+          <div className="mt-3 space-y-3">
+            <div className="grid grid-cols-2 gap-3 max-w-md">
+              <div>
+                <Label htmlFor="gl-ps">Period start (optional)</Label>
+                <Input
+                  id="gl-ps"
+                  type="date"
+                  value={glPeriodStart}
+                  onChange={(e) => setGlPeriodStart(e.target.value)}
+                />
+              </div>
+              <div>
+                <Label htmlFor="gl-pe">Period end (optional)</Label>
+                <Input
+                  id="gl-pe"
+                  type="date"
+                  value={glPeriodEnd}
+                  onChange={(e) => setGlPeriodEnd(e.target.value)}
+                />
+              </div>
+            </div>
+            <MultiFileUpload
+              endpoint="/api/gl-import/upload"
+              fileKey="file"
+              accept=".xlsx"
+              extraFields={{
+                ...uploadDefaults,
+                period_start: glPeriodStart || undefined,
+                period_end: glPeriodEnd || undefined,
+              }}
+              label="GL export (xlsx)"
+              description="Drop the QuickBooks GL export. Builds a trial-balance comparison automatically once imported."
+              onComplete={() =>
+                qc.invalidateQueries({ queryKey: ['gl-runs'] })
+              }
+            />
+          </div>
+        )}
+      </div>
+
       <div className="grid grid-cols-2 gap-3 mb-4 max-w-md no-print">
         <div>
           <Label htmlFor="acct">Account code</Label>

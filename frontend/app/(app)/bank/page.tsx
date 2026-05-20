@@ -1,9 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Topbar } from '@/components/layout/topbar';
-import { Card, CardContent } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -23,6 +23,8 @@ import {
   type BankReviewStatus,
 } from '@/lib/api/bank';
 import { formatDate, formatMoney } from '@/lib/utils';
+import { MultiFileUpload } from '@/components/shared/multi-file-upload';
+import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
 
 const MATCH_LABEL: Record<BankMatchState, string> = {
   matched: 'Matched',
@@ -66,10 +68,77 @@ export default function BankPage() {
       }),
   });
 
+  const qc = useQueryClient();
+  const uploadDefaults = useUploadDefaults();
+  const refreshTxns = () => qc.invalidateQueries({ queryKey: ['bank-txns'] });
+  const [showUploads, setShowUploads] = useState(false);
+
   return (
     <>
       <Topbar title="Bank" />
       <main className="p-6 space-y-4">
+        {/* Upload section — collapsed by default so the transactions grid
+            is the primary content. The "Upload statement" button on the
+            dashboard quick-actions deep-links here with ?upload=1. */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center justify-between">
+              <span>Upload bank statement</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setShowUploads((s) => !s)}
+              >
+                {showUploads ? 'Hide' : 'Show'}
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          {showUploads && (
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <MultiFileUpload
+                  endpoint="/api/bank-pdf/upload"
+                  fileKey="file"
+                  accept=".pdf"
+                  extraFields={uploadDefaults}
+                  label="Bank PDF — upload"
+                  description="Parse and persist transactions. One statement per file."
+                  onComplete={refreshTxns}
+                />
+                <MultiFileUpload
+                  endpoint="/api/bank-pdf/preview"
+                  fileKey="file"
+                  accept=".pdf"
+                  extraFields={{ entity_code: uploadDefaults.entity_code }}
+                  label="Bank PDF — preview"
+                  description="See parsed transactions before committing. No data is written."
+                  note="Use this if it's a new bank format you haven't uploaded before."
+                />
+                <MultiFileUpload
+                  endpoint="/api/bank-csv/upload"
+                  fileKey="file"
+                  accept=".csv"
+                  extraFields={{ ...uploadDefaults, mapping_profile: 'generic' }}
+                  label="Bank CSV — upload"
+                  description="Fallback for banks BookWize doesn't parse PDF for yet."
+                  onComplete={refreshTxns}
+                />
+                <MultiFileUpload
+                  endpoint="/api/bank-csv/preview"
+                  fileKey="file"
+                  accept=".csv"
+                  extraFields={{
+                    entity_code: uploadDefaults.entity_code,
+                    mapping_profile: 'generic',
+                  }}
+                  label="Bank CSV — preview"
+                  description="Check the column mapping before importing."
+                />
+              </div>
+            </CardContent>
+          )}
+        </Card>
+
         <Card>
           <CardContent className="p-4">
             <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">

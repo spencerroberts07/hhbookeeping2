@@ -1,154 +1,253 @@
 'use client';
 
 import { useState } from 'react';
-import { Upload } from 'lucide-react';
-import { useUser } from '@clerk/nextjs';
+import { useQueryClient } from '@tanstack/react-query';
 import { Card } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { toast } from 'sonner';
-import { uploadBankPdf } from '@/lib/api/bank';
-import { uploadHHAPDocuments } from '@/lib/api/hh_ap';
-import { importPos } from '@/lib/api/pos';
-import { uploadPayrollRegister } from '@/lib/api/payroll';
-import { uploadGl } from '@/lib/api/gl';
-
-type DocType =
-  | 'bank_pdf'
-  | 'hh_ap'
-  | 'pos_financial'
-  | 'inventory_adj'
-  | 'payroll_p1'
-  | 'payroll_p2'
-  | 'aged_ar'
-  | 'gl_export';
-
-interface DocConfig {
-  key: DocType;
-  label: string;
-  hint: string;
-  required: boolean;
-  accept: string;
-}
-
-const DOCS: DocConfig[] = [
-  { key: 'bank_pdf', label: 'Bank PDF statement', hint: 'Monthly statement from your bank', required: true, accept: 'application/pdf' },
-  { key: 'hh_ap', label: 'HH AP statement', hint: 'Home Hardware monthly statement', required: true, accept: 'application/pdf' },
-  { key: 'pos_financial', label: 'POS Financial report', hint: 'Monthly POS Financial summary', required: true, accept: 'text/plain,application/pdf' },
-  { key: 'inventory_adj', label: 'Inventory adjustment', hint: 'Cycle count adjustments', required: false, accept: 'text/plain,application/pdf' },
-  { key: 'payroll_p1', label: 'Payroll register — P1', hint: 'ENetEmployer register PDF (first pay period)', required: true, accept: 'application/pdf' },
-  { key: 'payroll_p2', label: 'Payroll register — P2', hint: 'Second pay period', required: true, accept: 'application/pdf' },
-  { key: 'aged_ar', label: 'Aged AR report', hint: 'Customer AR balances', required: false, accept: 'text/plain,application/pdf' },
-  { key: 'gl_export', label: 'GL export (optional)', hint: 'For trial balance comparison', required: false, accept: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
-];
+import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { MultiFileUpload } from '@/components/shared/multi-file-upload';
+import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
 
 interface Props {
   entityCode: string;
   periodEnd: string;
 }
 
-export function StepDocuments({ entityCode, periodEnd }: Props) {
-  const { user } = useUser();
-  const actorEmail = user?.primaryEmailAddress?.emailAddress ?? '';
-  const [uploaded, setUploaded] = useState<Partial<Record<DocType, { name: string; uploaded_at: string }>>>({});
-  const [uploading, setUploading] = useState<Partial<Record<DocType, boolean>>>({});
+type DocStatus = 'not_uploaded' | 'uploaded' | 'error';
 
-  const handleUpload = async (doc: DocConfig, file: File) => {
-    setUploading((u) => ({ ...u, [doc.key]: true }));
-    try {
-      switch (doc.key) {
-        case 'bank_pdf':
-          await uploadBankPdf({ entity_code: entityCode, actor_email: actorEmail, file });
-          break;
-        case 'hh_ap':
-          await uploadHHAPDocuments({
-            entity_code: entityCode,
-            document_type: 'monthly_statement',
-            document_date: periodEnd,
-            files: [file],
-          });
-          break;
-        case 'pos_financial':
-          await importPos('pos-financial', { entity_code: entityCode, actor_email: actorEmail, file });
-          break;
-        case 'inventory_adj':
-          await importPos('inventory-adjustment', { entity_code: entityCode, actor_email: actorEmail, file });
-          break;
-        case 'payroll_p1':
-        case 'payroll_p2':
-          await uploadPayrollRegister({ entity_code: entityCode, actor_email: actorEmail, file });
-          break;
-        case 'aged_ar':
-          await importPos('aged-ar', { entity_code: entityCode, actor_email: actorEmail, file, snapshot_date: periodEnd });
-          break;
-        case 'gl_export':
-          await uploadGl({ entity_code: entityCode, actor_email: actorEmail, file, period_end: periodEnd });
-          break;
-      }
-      setUploaded((u) => ({
-        ...u,
-        [doc.key]: { name: file.name, uploaded_at: new Date().toISOString() },
-      }));
-      toast.success(`${doc.label} uploaded`);
-    } finally {
-      setUploading((u) => ({ ...u, [doc.key]: false }));
-    }
-  };
+interface DocState {
+  status: DocStatus;
+  records?: number;
+  fileName?: string;
+}
+
+interface DocConfig {
+  key: string;
+  label: string;
+  description: string;
+  endpoint: string;
+  fileKey: 'file' | 'files';
+  accept: string;
+  required: boolean;
+  /** Endpoint-specific extra fields (entity_code + actor_email added automatically). */
+  buildExtra?: (periodEnd: string, snapshotDate: string) => Record<string, string>;
+  /** Which React Query keys to invalidate after a successful upload. */
+  invalidate?: string[];
+}
+
+const DOCS: DocConfig[] = [
+  {
+    key: 'bank_pdf',
+    label: 'Bank PDF statement',
+    description: 'Monthly statement from your bank.',
+    endpoint: '/api/bank-pdf/upload',
+    fileKey: 'file',
+    accept: '.pdf',
+    required: true,
+    invalidate: ['bank-txns'],
+  },
+  {
+    key: 'hh_ap_invoices',
+    label: 'HH AP invoice batch',
+    description:
+      'All invoice PDFs for the period. The marquee upload — drop hundreds at once.',
+    endpoint: '/api/hh-ap/invoices/upload-and-parse-batch',
+    fileKey: 'files',
+    accept: '.pdf',
+    required: true,
+    buildExtra: (periodEnd) => ({ document_date: periodEnd }),
+    invalidate: ['hh-ap-summary', 'hh-ap-invoices'],
+  },
+  {
+    key: 'hh_ap_documents',
+    label: 'HH AP statement / documents',
+    description: 'Monthly statement, remittances, credit notes.',
+    endpoint: '/api/hh-ap/upload-documents',
+    fileKey: 'files',
+    accept: '.pdf',
+    required: true,
+    buildExtra: (periodEnd) => ({
+      document_date: periodEnd,
+      document_type: 'monthly_statement',
+    }),
+    invalidate: ['hh-ap-summary'],
+  },
+  {
+    key: 'pos_financial',
+    label: 'POS Financial report',
+    description: 'Monthly POS Financial summary — used for validation.',
+    endpoint: '/api/pos-import/pos-financial',
+    fileKey: 'file',
+    accept: '.pdf,.xlsx,.txt',
+    required: true,
+    invalidate: ['pos-runs', 'pos-latest'],
+  },
+  {
+    key: 'inventory_adjustment',
+    label: 'Inventory adjustment',
+    description: 'Cycle count + shrinkage adjustments.',
+    endpoint: '/api/pos-import/inventory-adjustment',
+    fileKey: 'file',
+    accept: '.pdf,.xlsx,.txt',
+    required: false,
+    invalidate: ['pos-runs'],
+  },
+  {
+    key: 'payroll_p1',
+    label: 'Payroll register — P1',
+    description: 'First pay period of the month (ENetEmployer register PDF).',
+    endpoint: '/api/payroll/runs/upload-register',
+    fileKey: 'file',
+    accept: '.pdf',
+    required: true,
+    invalidate: ['payroll-runs'],
+  },
+  {
+    key: 'payroll_p2',
+    label: 'Payroll register — P2',
+    description: 'Second pay period.',
+    endpoint: '/api/payroll/runs/upload-register',
+    fileKey: 'file',
+    accept: '.pdf',
+    required: true,
+    invalidate: ['payroll-runs'],
+  },
+  {
+    key: 'aged_ar',
+    label: 'Aged AR',
+    description: 'Customer AR balances at period end.',
+    endpoint: '/api/pos-import/aged-ar',
+    fileKey: 'file',
+    accept: '.pdf,.xlsx,.txt',
+    required: false,
+    buildExtra: (_periodEnd, snapshotDate) => ({ snapshot_date: snapshotDate }),
+    invalidate: ['ar-aging'],
+  },
+  {
+    key: 'gl_export',
+    label: 'GL export (optional)',
+    description: 'QuickBooks general ledger export for trial-balance comparison.',
+    endpoint: '/api/gl-import/upload',
+    fileKey: 'file',
+    accept: '.xlsx',
+    required: false,
+    buildExtra: (periodEnd) => ({
+      period_end: periodEnd,
+      // period_start is optional on the backend — the GL parser derives it
+      // from the file when omitted.
+    }),
+    invalidate: ['gl-runs'],
+  },
+];
+
+export function StepDocuments({ entityCode, periodEnd }: Props) {
+  const uploadDefaults = useUploadDefaults();
+  const qc = useQueryClient();
+  // Per-document local status. Source of truth for "uploaded" is the
+  // backend's import-runs lists, which we invalidate so other pages pick
+  // up the new data immediately.
+  const [state, setState] = useState<Record<string, DocState>>({});
+  // For aged-ar / gl endpoints we expose a separate snapshot-date input,
+  // defaulted to period_end.
+  const [snapshotDate, setSnapshotDate] = useState(periodEnd);
+
+  // Defensive — the page already reads entity from the same Zustand store
+  // as the upload defaults, so this should never trip. Surface clearly if
+  // it ever does (e.g. mid-render entity switch).
+  if (!uploadDefaults.entity_code || uploadDefaults.entity_code !== entityCode) {
+    return (
+      <p className="text-sm text-red-700">
+        Entity mismatch — refresh the page or pick the right entity from the
+        switcher.
+      </p>
+    );
+  }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {DOCS.map((doc) => {
-        const status = uploaded[doc.key];
-        const isUploading = uploading[doc.key];
-        return (
-          <Card key={doc.key} className="p-4">
-            <div className="flex items-start justify-between gap-2 mb-2">
-              <div>
-                <div className="font-semibold text-deep-navy">
-                  {doc.label}
-                  {doc.required && <span className="text-bw-teal ml-1">*</span>}
+    <div className="space-y-4">
+      <div className="flex items-end gap-3 max-w-md">
+        <div className="flex-1">
+          <Label htmlFor="snap-date">Snapshot date (for AR / GL only)</Label>
+          <Input
+            id="snap-date"
+            type="date"
+            value={snapshotDate}
+            onChange={(e) => setSnapshotDate(e.target.value)}
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {DOCS.map((doc) => {
+          const cur = state[doc.key] ?? { status: 'not_uploaded' as const };
+          const extra = doc.buildExtra
+            ? doc.buildExtra(periodEnd, snapshotDate)
+            : {};
+          return (
+            <Card key={doc.key} className="p-4 flex flex-col gap-3">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="font-semibold text-deep-navy">
+                    {doc.label}
+                    {doc.required && <span className="text-bw-teal ml-1">*</span>}
+                  </div>
+                  <p className="text-xs text-slate">{doc.description}</p>
                 </div>
-                <div className="text-xs text-slate">{doc.hint}</div>
+                <StatusBadge status={cur.status} records={cur.records} />
               </div>
-              {status && (
-                <span className="text-xs text-bw-teal font-semibold">
-                  Uploaded
-                </span>
-              )}
-            </div>
-            <label className="flex items-center gap-2 rounded-lg border border-dashed border-input bg-cloud px-3 py-2 cursor-pointer hover:bg-white transition">
-              <Upload className="h-4 w-4 text-slate" strokeWidth={1.5} />
-              <span className="text-xs text-slate truncate flex-1">
-                {status?.name ?? (isUploading ? 'Uploading…' : 'Click to upload')}
-              </span>
-              <input
-                type="file"
+              <MultiFileUpload
+                endpoint={doc.endpoint}
+                fileKey={doc.fileKey}
                 accept={doc.accept}
-                className="hidden"
-                disabled={!!isUploading || !actorEmail}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleUpload(doc, f);
+                extraFields={{ ...uploadDefaults, ...extra }}
+                label={doc.label}
+                description={doc.description}
+                onFileSuccess={(r) =>
+                  setState((s) => ({
+                    ...s,
+                    [doc.key]: {
+                      status: 'uploaded',
+                      records: r.recordCount,
+                      fileName: r.fileName,
+                    },
+                  }))
+                }
+                onComplete={(results) => {
+                  for (const key of doc.invalidate ?? []) {
+                    qc.invalidateQueries({ queryKey: [key] });
+                  }
+                  if (results.every((r) => r.status === 'error')) {
+                    setState((s) => ({ ...s, [doc.key]: { status: 'error' } }));
+                  }
                 }}
               />
-            </label>
-            {status && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="mt-2 text-xs"
-                onClick={() => setUploaded((u) => {
-                  const next = { ...u };
-                  delete next[doc.key];
-                  return next;
-                })}
-              >
-                Re-upload
-              </Button>
-            )}
-          </Card>
-        );
-      })}
+            </Card>
+          );
+        })}
+      </div>
+      <p className="text-xs text-slate">
+        Required documents are marked <span className="text-bw-teal">*</span>.
+        Re-uploads are idempotent on bank / HH AP / GL endpoints (matched by
+        file hash) and supersede prior runs on POS / payroll endpoints.
+      </p>
     </div>
   );
+}
+
+function StatusBadge({
+  status,
+  records,
+}: {
+  status: DocStatus;
+  records?: number;
+}) {
+  if (status === 'uploaded')
+    return (
+      <Badge variant="complete">
+        Uploaded{records !== undefined ? ` · ${records}` : ''}
+      </Badge>
+    );
+  if (status === 'error') return <Badge variant="error">Error</Badge>;
+  return <Badge variant="info">Not uploaded</Badge>;
 }

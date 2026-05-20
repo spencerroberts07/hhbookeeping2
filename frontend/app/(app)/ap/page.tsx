@@ -1,23 +1,47 @@
 'use client';
 
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Topbar } from '@/components/layout/topbar';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { useEntityStore } from '@/lib/store/entity';
 import { getHHAPSummary, listHHAPInvoices } from '@/lib/api/hh_ap';
 import { formatMoney, formatDate } from '@/lib/utils';
-import { Upload } from 'lucide-react';
+import { MultiFileUpload } from '@/components/shared/multi-file-upload';
+import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
 import Link from 'next/link';
 
 type Tab = 'hh' | 'vendor';
 
+const HH_AP_DOCUMENT_TYPES = [
+  { value: 'monthly_statement', label: 'Monthly statement' },
+  { value: 'remittance', label: 'Remittance' },
+  { value: 'credit_note', label: 'Credit note' },
+  { value: 'other', label: 'Other' },
+];
+
 export default function ApPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const [tab, setTab] = useState<Tab>('hh');
+  const qc = useQueryClient();
+  const uploadDefaults = useUploadDefaults();
+  const today = new Date().toISOString().slice(0, 10);
+  const [docType, setDocType] = useState<string>('monthly_statement');
+  const [docDate, setDocDate] = useState<string>(today);
+  const refreshAp = () => {
+    qc.invalidateQueries({ queryKey: ['hh-ap-summary'] });
+    qc.invalidateQueries({ queryKey: ['hh-ap-invoices'] });
+  };
 
   const summary = useQuery({
     queryKey: ['hh-ap-summary', entityCode],
@@ -58,14 +82,6 @@ export default function ApPage() {
               Other vendors
             </button>
           </nav>
-          {tab === 'hh' && (
-            <Link href="/month-end">
-              <Button variant="accent">
-                <Upload className="h-4 w-4" strokeWidth={1.5} />
-                Upload statement
-              </Button>
-            </Link>
-          )}
         </div>
 
         {tab === 'hh' && (
@@ -89,6 +105,73 @@ export default function ApPage() {
                 </>
               ) : null}
             </section>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Upload HH invoices & documents</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-2xl">
+                  <div className="md:col-span-2">
+                    <Label htmlFor="ap-doc-date">Document date</Label>
+                    <input
+                      id="ap-doc-date"
+                      type="date"
+                      className="flex h-10 w-full rounded-lg border border-input bg-white px-3 py-2 text-sm text-ink"
+                      value={docDate}
+                      onChange={(e) => setDocDate(e.target.value)}
+                    />
+                    <p className="text-xs text-slate mt-1">
+                      The statement / invoice date. Used to bucket aging.
+                    </p>
+                  </div>
+                </div>
+                <MultiFileUpload
+                  endpoint="/api/hh-ap/invoices/upload-and-parse-batch"
+                  fileKey="files"
+                  accept=".pdf"
+                  extraFields={{
+                    entity_code: uploadDefaults.entity_code,
+                    document_date: docDate,
+                  }}
+                  label="Invoice batch — parse all at once"
+                  description="The main HH AP upload. Drop every invoice PDF for the period in one go."
+                  note="Upload all invoice PDFs for this period"
+                  variant="prominent"
+                  onComplete={refreshAp}
+                />
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-md">
+                  <div>
+                    <Label htmlFor="ap-doc-type">Document type</Label>
+                    <Select value={docType} onValueChange={setDocType}>
+                      <SelectTrigger id="ap-doc-type">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {HH_AP_DOCUMENT_TYPES.map((t) => (
+                          <SelectItem key={t.value} value={t.value}>
+                            {t.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <MultiFileUpload
+                  endpoint="/api/hh-ap/upload-documents"
+                  fileKey="files"
+                  accept=".pdf"
+                  extraFields={{
+                    entity_code: uploadDefaults.entity_code,
+                    document_type: docType,
+                    document_date: docDate,
+                  }}
+                  label="HH AP documents (statements, remittances, credit notes)"
+                  description="Non-invoice HH AP paperwork. Pick a document type above before uploading."
+                  onComplete={refreshAp}
+                />
+              </CardContent>
+            </Card>
 
             <Card>
               <CardHeader>
