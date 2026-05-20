@@ -30,7 +30,7 @@ export function AlertsFeed() {
     ...(pending.data?.suggestions ?? []).map((s) => ({
       icon: AlertCircle,
       label: `Classification suggestion · ${s.vendor_key}`,
-      detail: `${s.suggested_account_code} (${s.confidence.toFixed(0)}%)`,
+      detail: `${s.suggested_account_code ?? 'UNCLASSIFIED'} (${(s.confidence ?? 0).toFixed(0)}%)`,
     })),
     // TODO: backend endpoint not built — unified alerts feed (period-locks,
     // unmatched bank, missing documents)

@@ -37,7 +37,7 @@ export function ApAgingChart({ aging, total }: Props) {
           <YAxis
             stroke="#64748B"
             fontSize={11}
-            tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`}
+            tickFormatter={(v) => `$${((v ?? 0) / 1000).toFixed(0)}k`}
           />
           <Tooltip
             contentStyle={{

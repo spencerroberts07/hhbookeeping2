@@ -32,7 +32,7 @@ export function SalesChart() {
         <YAxis
           stroke="#64748B"
           fontSize={12}
-          tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`}
+          tickFormatter={(v) => `$${((v ?? 0) / 1000).toFixed(0)}k`}
         />
         <Tooltip
           contentStyle={{

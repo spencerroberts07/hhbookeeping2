@@ -83,7 +83,7 @@ export function StepReviewQueue({ entityCode }: { entityCode: string }) {
                 <Badge variant="info">{s.source}</Badge>
               </td>
               <td className="px-4 py-2 tabular-nums text-slate">
-                {s.confidence.toFixed(0)}%
+                {(s.confidence ?? 0).toFixed(0)}%
               </td>
               <td className="px-4 py-2 text-right">
                 <Button
