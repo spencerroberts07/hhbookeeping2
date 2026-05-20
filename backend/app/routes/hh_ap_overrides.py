@@ -3,11 +3,12 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
+from ..services_auth import enforce_entity_code, require_role
 
 router = APIRouter(prefix="/api/hh-ap", tags=["hh-ap-review"])
 
@@ -72,7 +73,11 @@ class HHAPInvoiceOverrideUpsertRequest(BaseModel):
 
 
 @router.post("/invoice-overrides/upsert")
-def hh_ap_invoice_override_upsert(payload: HHAPInvoiceOverrideUpsertRequest):
+def hh_ap_invoice_override_upsert(
+    payload: HHAPInvoiceOverrideUpsertRequest,
+    _user: Any = Depends(require_role("bookkeeper")),
+):
+    enforce_entity_code(_user, payload.entity_code)
     if payload.review_status not in {"approved", "pending", "rejected"}:
         raise HTTPException(
             status_code=400,

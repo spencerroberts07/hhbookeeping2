@@ -68,6 +68,23 @@ class Settings(BaseSettings):
     stripe_additional_store_price_id: str | None = None
     bookwize_app_url: str = "https://bookwize.ca"
 
+    # Cloudflare R2 object storage. All optional with empty-string defaults
+    # so the app boots cleanly when R2 isn't configured; storage_service
+    # then degrades to returning None on every call.
+    r2_bucket_name: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_endpoint_url: str = ""
+
+    @property
+    def r2_enabled(self) -> bool:
+        return bool(
+            self.r2_bucket_name
+            and self.r2_access_key_id
+            and self.r2_secret_access_key
+            and self.r2_endpoint_url
+        )
+
     @field_validator("jwt_secret")
     @classmethod
     def _validate_jwt_secret(cls, value: str) -> str:

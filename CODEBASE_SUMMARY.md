@@ -600,30 +600,31 @@ Add new origins here before pointing them at the API. The frontend currently liv
 
 ## 10. Known bugs + incomplete features
 
-### Production-blocking when Clerk path is on
-*(All resolved as of `77fa779` — listed here for the runbook.)*
-- Migration 027 has been applied. Migration 026 too. Migration 025 too. No outstanding DB changes.
-- Stripe webhook endpoint exists but Stripe webhook **must be registered in the Stripe dashboard** before checkout payments will sync back to `billing_subscriptions`. Until then, `GET /api/billing/subscription` returns empty.
+### ✅ Resolved since `77fa779`
+- **Auth-surface gaps closed.** `cash_balancing.py:POST /sync` (bookkeeper), `hh_ap_overrides.py:POST /invoice-overrides/upsert` (bookkeeper), `sync.py:POST /chart-of-accounts` + `/transactions` (admin), and `qbo_bank_sync.py:POST /sync` + `/review-status` + `/match` + `/unmatch/{match_id}` (bookkeeper) all now have `require_role` + `enforce_entity_code`. Note: the original summary referenced `cash_balancing.py:POST /days*` endpoints that don't exist in this codebase — the actual writer is `POST /sync` and that's what's now gated.
+- **`bank_review.py` deleted.** Functional duplicate of `qbo_bank_sync.py`'s matching surface; never wired in main.py; frontend never called the `bank-review` prefix.
+- **Reports backend built.** New `routes/reports.py` provides `GET /api/reports/income-statement`, `/balance-sheet`, `/trial-balance`. Queries `journal_lines` joined to `journal_batches` + `accounting_periods` (no `posting_date` column exists; date scope comes from period_end). Account types derived from 4-digit prefix convention. Frontend wired off the mocks.
+- **Cash position card** wired to a new `GET /api/cash-balancing/latest` endpoint.
+- **Accounting period creation.** New `POST /api/period-close/periods` (bookkeeper). One-open-period-per-entity enforced. `lib/api/month_end.ts::createAccountingPeriod()` available for the frontend. Bridlewood Feb 2026 period already existed at status `draft`.
+- **R2 file storage scaffold.** `services_storage.py` + boto3 + migration 028 adding `file_path` columns. Invoice-documents upload archives to R2 and persists object_key; GET responses include 1-hour presigned `file_url`. View-PDF buttons live on `/ap/unmatched` rows and in the `/transactions` Source Documents section (disabled-with-tooltip when no file_url).
 
-### Auth-surface gaps (write endpoints with no `require_role`)
-The following write endpoints lack a `require_role` dependency. Anyone with a session can call them (and `enforce_entity_code` only fires when explicitly invoked, which these don't do). Treat as security gaps to plug:
-- `routes/cash_balancing.py` — `POST /days`, `POST /days/{id}/post-journal`
-- `routes/hh_ap_overrides.py` — all writes
-- `routes/sync.py` — `POST /sync`
-- `routes/qbo_bank_sync.py` — write endpoints (`/runs/{id}/match`, `/unmatch`, `/set-review-status`) are bookkeeper-required but have **no `enforce_entity_code`** — entity_code is inferred from `transaction_id`, which the caller picks. Add an entity-match check in the handler.
+### Still production-blocking
+- Stripe webhook **must be registered in the Stripe dashboard** before Checkout payments sync back. Until then `GET /api/billing/subscription` returns empty.
+
+### Deferred from the most recent session (specced but not built)
+- **CRA remittance backend** (`GET /api/payroll/cra-remittance`) + `/payroll` CRA tab wire-up — still explanatory copy only.
+- **Chart of accounts** (`GET /api/accounts`, `POST /api/accounts`, migration with `chart_of_accounts` table + 1877-8 seed) — `/settings/accounts` still shows the static 10-row sample.
+- **Notification preferences** (`entities.notification_preferences` JSONB column, `GET`/`PATCH /api/entities/{entity_code}/notifications`) — `/settings/notifications` toggle state still in-component only.
+- **R2 wire-up on non-invoice endpoints.** `services_storage.upload_file(...)` needs to be called from each of: `bank_pdf.py` (preview + upload), `bank_csv.py` (preview + upload), `hh_ap.py` (`upload-documents`, `invoices/upload-and-parse-batch`), `payroll.py` (`runs/upload-hours`, `runs/upload-register`), `pos_import.py` (5 import endpoints), `gl_import.py` (upload). Migration 028 already added the `file_path` columns to those tables; what remains is the handler-side upload call + persistence. Each is a ~10 line edit per handler.
+- **Frontend "Start period" UI.** The `createAccountingPeriod()` client exists; the dashboard's empty-state link still routes to `/month-end` rather than triggering creation directly. Add a month-picker + button in a follow-up.
 
 ### Wiring gaps
-- `routes/bank_review.py` exists on disk but is **not included in `main.py`** (no `app.include_router(...)` call). The frontend uses `qbo_bank_sync` instead. Either wire `bank_review.py` or delete it.
-- The legacy `users` / `user_entity_roles` pair is still consulted by `services_auth.require_role` under `USE_CLERK_AUTH=false`. If you ship Clerk-only, those tables can stop being maintained.
+- Legacy `users` / `user_entity_roles` still consulted by `services_auth.require_role` under `USE_CLERK_AUTH=false`. If you ship Clerk-only, those tables can stop being maintained.
 
 ### Backend endpoints still TODO (frontend uses mocks)
-- `/api/reports/income-statement`, `/api/reports/balance-sheet`, `/api/reports/trial-balance-as-of` — frontend has the UI but pulls from `lib/api/reports.ts` mocks.
 - `/api/admin/dealers`, `/api/admin/revenue`, `/api/admin/users/search`, `/api/admin/entity-org-link` — admin portal mocks.
 - `/api/documents` (unified) — frontend aggregates from per-module endpoints client-side.
-- `/api/documents/{id}/file` — PDF source files are not archived on the server; no viewer.
-- `/api/accounts` (chart admin) — `/settings/accounts` is placeholder content.
-- `/api/me/notifications` — `/settings/notifications` toggle state lives only in component memory.
-- `/api/payroll/cra-remittance` — `/payroll` CRA tab shows explanatory copy only.
+- `/api/documents/{id}/file` — partly handled by R2 file_url where archived (invoice_documents only); other domains still need their handlers updated.
 - `/api/vendors` (vendor master) — `/ap` other-vendor balance view is explanatory only.
 - Live general-ledger / live balance — both depend on dealer GL exports today; no continuously-maintained app ledger.
 

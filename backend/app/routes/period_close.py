@@ -128,6 +128,103 @@ def post_reopen(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class CreatePeriodRequest(BaseModel):
+    entity_code: str
+    period_start: str = Field(examples=["2026-02-01"])
+    period_end: str = Field(examples=["2026-02-28"])
+    period_label: str | None = None
+    actor_email: str
+
+
+@router.post("/periods", status_code=201)
+def create_accounting_period(
+    body: CreatePeriodRequest,
+    _user: Any = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """
+    Create a new accounting_periods row. Idempotent on (entity_id, period_end).
+    Enforces one OPEN period per entity by rejecting if another period for
+    the same entity already has status='open'.
+    """
+    from sqlalchemy import text as _text
+    from .. import services_auth as _svc_auth
+
+    _svc_auth.enforce_entity_code(_user, body.entity_code)
+
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Entity {body.entity_code!r} not found")
+
+        # Reject if there's already an open period (excluding one for the
+        # exact same period_end — that's idempotent re-creation).
+        other_open = session.execute(
+            _text(
+                """
+                SELECT period_label, period_end FROM accounting_periods
+                 WHERE entity_id = :eid
+                   AND status = 'open'
+                   AND period_end <> :pe
+                 ORDER BY period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"eid": entity["id"], "pe": body.period_end},
+        ).mappings().first()
+        if other_open:
+            raise HTTPException(
+                409,
+                f"Another period is already open: {other_open['period_label']} "
+                f"({other_open['period_end']}). Close it before opening a new one.",
+            )
+
+        label = body.period_label or body.period_end[:7]
+        row = session.execute(
+            _text(
+                """
+                INSERT INTO accounting_periods (
+                    entity_id, period_label, period_start, period_end, status
+                ) VALUES (
+                    :eid, :label, :ps, :pe, 'open'
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id, period_label, period_start, period_end, status
+                """
+            ),
+            {
+                "eid": entity["id"],
+                "label": label,
+                "ps": body.period_start,
+                "pe": body.period_end,
+            },
+        ).mappings().first()
+        if not row:
+            # Already exists at that period_end — fetch and return it (idempotent).
+            row = session.execute(
+                _text(
+                    """
+                    SELECT id, period_label, period_start, period_end, status
+                      FROM accounting_periods
+                     WHERE entity_id = :eid AND period_end = :pe
+                     LIMIT 1
+                    """
+                ),
+                {"eid": entity["id"], "pe": body.period_end},
+            ).mappings().first()
+    if not row:
+        raise HTTPException(500, "Could not create or locate the period")
+    return {
+        "id": str(row["id"]),
+        "period_label": row["period_label"],
+        "period_start": row["period_start"].isoformat() if hasattr(row["period_start"], "isoformat") else str(row["period_start"]),
+        "period_end": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else str(row["period_end"]),
+        "status": row["status"],
+    }
+
+
 @router.get("/current")
 def get_current_period(
     entity_code: str = Query(...),

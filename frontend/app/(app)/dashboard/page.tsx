@@ -12,6 +12,7 @@ import { getQuickbooksStatus } from '@/lib/api/dashboard';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestPosFinancial } from '@/lib/api/pos';
+import { getLatestCashBalancing } from '@/lib/api/cash_balancing';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
@@ -58,6 +59,12 @@ export default function DashboardPage() {
     queryKey: ['pos-latest', entityCode],
     enabled: !!entityCode,
     queryFn: () => getLatestPosFinancial(entityCode!),
+  });
+  const cashLatest = useQuery({
+    queryKey: ['cash-balancing-latest', entityCode],
+    enabled: !!entityCode,
+    retry: false,
+    queryFn: () => getLatestCashBalancing(entityCode!),
   });
 
   if (!entityCode) {
@@ -125,20 +132,45 @@ export default function DashboardPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {qbo.isLoading ? (
+              {cashLatest.isLoading ? (
+                <Skeleton className="h-9 w-32" />
+              ) : cashLatest.data ? (
+                <>
+                  <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
+                    {formatMoney(cashLatest.data.closing_balance)}
+                  </div>
+                  <p className="text-xs text-slate mt-1">
+                    Closing cash · {cashLatest.data.business_date}
+                    {cashLatest.data.variance !== null && (
+                      <>
+                        {' · '}
+                        <span
+                          className={
+                            cashLatest.data.status === 'balanced'
+                              ? 'text-bw-teal'
+                              : 'text-amber-700'
+                          }
+                        >
+                          {cashLatest.data.status === 'balanced'
+                            ? 'Balanced'
+                            : `Variance ${formatMoney(cashLatest.data.variance, { signed: true })}`}
+                        </span>
+                      </>
+                    )}
+                  </p>
+                </>
+              ) : qbo.isLoading ? (
                 <Skeleton className="h-9 w-32" />
               ) : qbo.data?.is_connected ? (
                 <>
-                  <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                    {/* TODO: backend endpoint not built — exact bank balance.
-                         For now showing connection status only. */}
-                    {qbo.data.company_name ?? 'QBO connected'}
+                  <div className="text-2xl font-bold text-slate">
+                    No cash data yet
                   </div>
                   <p className="text-xs text-slate mt-1">
-                    Last synced{' '}
+                    QBO connected{' '}
                     {qbo.data.last_synced_at
-                      ? new Date(qbo.data.last_synced_at).toLocaleString()
-                      : '—'}
+                      ? `· last synced ${new Date(qbo.data.last_synced_at).toLocaleString()}`
+                      : ''}
                   </p>
                 </>
               ) : (

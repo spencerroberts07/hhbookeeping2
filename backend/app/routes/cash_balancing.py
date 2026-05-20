@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 import json
+from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..config import settings
 from ..db import db_session
+from ..services_auth import enforce_entity_code, require_role
 from ..google_sheets import (
     DailyCashLine,
     GoogleSheetsClient,
@@ -174,7 +176,11 @@ def get_accounting_period_for_date(session, entity_id: str, business_date: str):
 
 
 @router.post("/sync")
-async def sync_cash_balancing(payload: CashBalancingSyncRequest):
+async def sync_cash_balancing(
+    payload: CashBalancingSyncRequest,
+    _user: Any = Depends(require_role("bookkeeper")),
+):
+    enforce_entity_code(_user, payload.entity_code)
     selected_tabs: list[str] = dedupe_preserve_order(payload.sheet_tabs)
 
     with db_session() as session:
@@ -627,6 +633,66 @@ async def sync_cash_balancing(payload: CashBalancingSyncRequest):
                 },
             )
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/latest")
+def cash_balancing_latest(entity_code: str = Query(...)) -> dict[str, Any]:
+    """
+    Return the most recent cash_balancing_days row for the entity. Used by
+    the dashboard's Cash Position card. 404 if no rows exist.
+    """
+    with db_session() as session:
+        entity = session.execute(
+            text("SELECT id FROM entities WHERE entity_code = :entity_code"),
+            {"entity_code": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        row = session.execute(
+            text(
+                """
+                SELECT business_date, opening_cash, closing_cash, total_sales,
+                       total_hst, tab_name, raw_json
+                  FROM cash_balancing_days
+                 WHERE entity_id = :entity_id
+                 ORDER BY business_date DESC
+                 LIMIT 1
+                """
+            ),
+            {"entity_id": entity["id"]},
+        ).mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cash-balancing days for entity {entity_code!r}",
+        )
+
+    opening = row["opening_cash"]
+    closing = row["closing_cash"]
+    sales = row["total_sales"]
+    deposits = sales or 0
+    # Variance proxy: (closing - opening) vs sales — flags whether the
+    # day's till math reconciles. Caller decides what to do with the value.
+    variance = (
+        (float(closing) - float(opening) - float(sales))
+        if (closing is not None and opening is not None and sales is not None)
+        else None
+    )
+    return {
+        "business_date": (
+            row["business_date"].isoformat()
+            if hasattr(row["business_date"], "isoformat")
+            else str(row["business_date"])
+        ),
+        "opening_balance": float(opening) if opening is not None else None,
+        "closing_balance": float(closing) if closing is not None else None,
+        "total_deposits": float(deposits) if deposits else 0.0,
+        "total_withdrawals": None,  # not modelled — Google Sheet doesn't separate
+        "variance": variance,
+        "status": "balanced" if variance is not None and abs(variance) < 0.05 else "review",
+        "tab_name": row["tab_name"],
+    }
 
 
 @router.get("/status")

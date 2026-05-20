@@ -29,7 +29,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Check, X, Pencil } from 'lucide-react';
+import { Check, X, Pencil, FileText } from 'lucide-react';
 import { toast } from 'sonner';
 
 type FilterType = 'all' | 'hh_ap' | 'outside_vendor';
@@ -350,8 +350,23 @@ function RowActions({
   canPost: boolean;
 }) {
   const [busy, setBusy] = useState(false);
+  const fileUrl = row.invoice.file_url;
   return (
     <div className="flex justify-end gap-1">
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => fileUrl && window.open(fileUrl, '_blank')}
+        disabled={!fileUrl}
+        aria-label="View PDF"
+        title={
+          fileUrl
+            ? 'View PDF'
+            : 'PDF not available — file was uploaded before storage was configured'
+        }
+      >
+        <FileText className="h-4 w-4" strokeWidth={1.5} />
+      </Button>
       <Button size="sm" variant="ghost" onClick={onEdit} aria-label="Edit">
         <Pencil className="h-4 w-4" strokeWidth={1.5} />
       </Button>

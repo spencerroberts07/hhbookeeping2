@@ -45,6 +45,7 @@ from ..services_invoice_matching import (
     run_period_match_sweep,
     SweepSummary,
 )
+from ..services_storage import storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,16 @@ async def upload_invoice_documents(
             parsed_number = _parse_invoice_number(blob)
             parsed_vendor = _parse_vendor_name(blob, filename)
 
+            # Archive to R2 before persisting. None on failure or when R2 is
+            # not configured — that's fine; the parsed row is still useful.
+            object_key = storage_service.upload_file(
+                file_bytes=file_bytes,
+                original_filename=filename,
+                entity_code=entity_code,
+                document_type="invoices",
+                content_type=upload.content_type or "application/pdf",
+            )
+
             with db_session() as session:
                 existing = session.execute(
                     text(
@@ -288,16 +299,17 @@ async def upload_invoice_documents(
                             entity_code, invoice_type, invoice_number,
                             vendor_name, invoice_date, amount, currency,
                             status, ap_account, file_name, file_size_bytes,
-                            source_hash, uploaded_by_clerk_user_id, uploaded_at
+                            file_path, source_hash,
+                            uploaded_by_clerk_user_id, uploaded_at
                         ) VALUES (
                             :ec, :itype, :inum, :vname, :idate, :amt, 'CAD',
                             'unmatched', :ap_account, :fname, :fsize,
-                            :sh, :uid, NOW()
+                            :file_path, :sh, :uid, NOW()
                         )
                         RETURNING id, entity_code, invoice_type, invoice_number,
                                   vendor_name, invoice_date, amount, status,
                                   ap_account, file_name, file_size_bytes,
-                                  uploaded_at
+                                  file_path, uploaded_at
                         """
                     ),
                     {
@@ -310,6 +322,7 @@ async def upload_invoice_documents(
                         "ap_account": ap_account,
                         "fname": filename,
                         "fsize": len(file_bytes),
+                        "file_path": object_key,
                         "sh": source_hash,
                         "uid": clerk_user_id,
                     },
@@ -413,7 +426,7 @@ def list_invoice_documents(
                 SELECT id, entity_code, invoice_type, invoice_number,
                        vendor_name, invoice_date, due_date, amount,
                        currency, status, ap_account, file_name,
-                       file_size_bytes, uploaded_at, matched_at,
+                       file_size_bytes, file_path, uploaded_at, matched_at,
                        match_confidence, notes
                   FROM invoice_documents
                  WHERE {where_clause}
@@ -464,7 +477,7 @@ def get_unmatched_queue(
                 SELECT id, entity_code, invoice_type, invoice_number,
                        vendor_name, invoice_date, due_date, amount,
                        currency, status, ap_account, file_name,
-                       file_size_bytes, uploaded_at, notes
+                       file_size_bytes, file_path, uploaded_at, notes
                   FROM invoice_documents
                  WHERE {' AND '.join(where)}
                  ORDER BY uploaded_at DESC
@@ -514,7 +527,7 @@ def get_invoice_document(
                 SELECT id, entity_code, invoice_type, invoice_number,
                        vendor_name, invoice_date, due_date, amount,
                        currency, status, ap_account, file_name,
-                       file_size_bytes, uploaded_at, matched_at,
+                       file_size_bytes, file_path, uploaded_at, matched_at,
                        match_confidence, notes
                   FROM invoice_documents
                  WHERE id = :id AND entity_code = :ec
@@ -942,7 +955,7 @@ def update_invoice(
                 RETURNING id, entity_code, invoice_type, invoice_number,
                           vendor_name, invoice_date, due_date, amount,
                           currency, status, ap_account, file_name,
-                          file_size_bytes, uploaded_at, matched_at,
+                          file_size_bytes, file_path, uploaded_at, matched_at,
                           match_confidence, notes
                 """
             ),
@@ -992,6 +1005,9 @@ def run_sweep(
 
 
 def _invoice_to_dict(row: Any) -> dict[str, Any]:
+    file_path = row.get("file_path") if hasattr(row, "get") else (
+        row["file_path"] if "file_path" in row.keys() else None  # type: ignore[index]
+    )
     return {
         "id": str(row["id"]),
         "entity_code": row["entity_code"],
@@ -1010,16 +1026,18 @@ def _invoice_to_dict(row: Any) -> dict[str, Any]:
         "ap_account": row["ap_account"],
         "file_name": row["file_name"],
         "file_size_bytes": row["file_size_bytes"],
+        "file_path": file_path,
+        "file_url": storage_service.get_presigned_url(file_path),
         "uploaded_at": (
             row["uploaded_at"].isoformat() if row["uploaded_at"] else None
         ),
         "matched_at": (
-            row["matched_at"].isoformat() if row.get("matched_at") else None
+            row["matched_at"].isoformat() if hasattr(row, "get") and row.get("matched_at") else None
         ),
         "match_confidence": (
             float(row["match_confidence"])
-            if row.get("match_confidence") is not None
+            if hasattr(row, "get") and row.get("match_confidence") is not None
             else None
         ),
-        "notes": row.get("notes"),
+        "notes": row.get("notes") if hasattr(row, "get") else None,
     }

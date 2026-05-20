@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException, Path, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from ..db import db_session
 from ..schemas import (
@@ -19,12 +21,17 @@ from ..services import (
     set_bank_transaction_review_status,
     sync_qbo_bank_transactions,
 )
+from ..services_auth import enforce_entity_code, require_role
 
 router = APIRouter(prefix="/api/qbo-bank-sync", tags=["qbo-bank-sync"])
 
 
 @router.post("/sync", response_model=BankSyncResponse)
-async def sync_qbo_bank_activity(request: BankSyncRequest) -> BankSyncResponse:
+async def sync_qbo_bank_activity(
+    request: BankSyncRequest,
+    _user: Any = Depends(require_role("bookkeeper")),
+) -> BankSyncResponse:
+    enforce_entity_code(_user, request.entity_code)
     try:
         with db_session() as session:
             result = await sync_qbo_bank_transactions(
@@ -95,7 +102,9 @@ def set_qbo_bank_transaction_review_status(
     request: BankTransactionReviewStatusRequest,
     transaction_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: Any = Depends(require_role("bookkeeper")),
 ) -> BankTransactionActionResponse:
+    enforce_entity_code(_user, entity_code)
     try:
         with db_session() as session:
             result = set_bank_transaction_review_status(
@@ -119,7 +128,9 @@ def match_qbo_bank_transaction(
     request: BankTransactionMatchRequest,
     transaction_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: Any = Depends(require_role("bookkeeper")),
 ) -> BankTransactionActionResponse:
+    enforce_entity_code(_user, entity_code)
     try:
         with db_session() as session:
             result = create_bank_transaction_match(
@@ -152,7 +163,9 @@ def unmatch_qbo_bank_transaction(
     transaction_id: str = Path(...),
     match_id: str = Path(...),
     entity_code: str = Query(...),
+    _user: Any = Depends(require_role("bookkeeper")),
 ) -> BankTransactionActionResponse:
+    enforce_entity_code(_user, entity_code)
     try:
         with db_session() as session:
             result = release_bank_transaction_match(

@@ -23,6 +23,10 @@ export interface InvoiceDocument {
   ap_account: ApAccount | null;
   file_name: string | null;
   file_size_bytes: number | null;
+  /** R2 object key — opaque, use file_url to open. */
+  file_path: string | null;
+  /** Presigned R2 URL valid ~1 hour. Null when no file was archived. */
+  file_url: string | null;
   uploaded_at: string | null;
   matched_at: string | null;
   match_confidence: number | null;

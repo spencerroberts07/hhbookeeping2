@@ -33,6 +33,7 @@ from .routes.month_end_workflow import router as month_end_workflow_router
 from .routes.payroll import router as payroll_router
 from .routes.period_close import router as period_close_router
 from .routes.pos_import import router as pos_import_router
+from .routes.reports import router as reports_router
 from .routes.qbo_auth import router as qbo_auth_router
 from .routes.qbo_bank_sync import router as qbo_bank_sync_router
 from .routes.sync import router as sync_router
@@ -119,6 +120,9 @@ app.include_router(cogs_router)
 # Invoice audit trail: PDF upload, auto-matching to bank/HH-AP/journal,
 # unmatched queue, post-to-AP workflow.
 app.include_router(invoice_documents_router)
+
+# Live financial reports (Income Statement, Balance Sheet, Trial Balance).
+app.include_router(reports_router)
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -1,225 +1,156 @@
 /**
- * Reports — frontend mock surface.
+ * Real backend-backed financial reports.
  *
- * The backend does NOT have Income Statement, Balance Sheet, app-native
- * General Ledger, "as-of" Trial Balance, or live AR/AP aging endpoints yet
- * (see backend/docs/endpoint_catalog.md, section D). These functions return
- * mock data so the UI renders end-to-end while the backend catches up.
+ * The three top reports (Income Statement, Balance Sheet, Trial Balance)
+ * now live at /api/reports/* — see backend/app/routes/reports.py. The
+ * earlier mock implementations have been retired.
  *
- * Every function here is flagged with a TODO marker that the QA pass and
- * the deliverables doc both pick up.
+ * The historical re-export helpers (getArAging / getApAging from POS + HH
+ * AP modules) stay because those reports are sourced from snapshot tables,
+ * not from journal_lines.
  */
+import { api } from './client';
 import type { PlanTier } from './billing';
 
-export interface IncomeStatementSection {
-  label: string;
-  rows: Array<{ account_code: string; account_name: string; amount: number }>;
-  subtotal: number;
+// --------------------------------------------------------------------------
+// Income Statement
+// --------------------------------------------------------------------------
+
+export interface IncomeStatementRow {
+  account_code: string;
+  account_name: string;
+  amount: number;
 }
 
-export interface IncomeStatementReport {
-  entity_code: string;
-  period_start: string;
-  period_end: string;
-  revenue: IncomeStatementSection;
-  cogs: IncomeStatementSection;
+export interface IncomeStatementBody {
+  revenue: IncomeStatementRow[];
+  revenue_total: number;
+  cogs: IncomeStatementRow[];
+  cogs_total: number;
   gross_profit: number;
-  operating_expenses: IncomeStatementSection;
+  gross_margin_pct: number | null;
+  operating_expenses: IncomeStatementRow[];
+  operating_expenses_total: number;
   net_income: number;
-  comparison: {
-    period_start: string;
-    period_end: string;
-    revenue: number;
-    cogs: number;
-    operating_expenses: number;
-    net_income: number;
-  } | null;
 }
 
-// TODO: backend endpoint not built — POST /api/reports/income-statement
-export async function getIncomeStatement(_params: {
+export interface IncomeStatementReport extends IncomeStatementBody {
   entity_code: string;
-  period_start: string;
-  period_end: string;
-  compare_to?: 'prior_period' | 'prior_year' | null;
+  period: { from: string; to: string };
+  comparison: IncomeStatementBody | null;
+}
+
+export async function getIncomeStatement(params: {
+  entity_code: string;
+  date_from: string;
+  date_to: string;
+  compare_to?: 'prior_period' | 'prior_year';
 }): Promise<IncomeStatementReport> {
-  await new Promise((r) => setTimeout(r, 250)); // simulate latency
-  return {
-    entity_code: _params.entity_code,
-    period_start: _params.period_start,
-    period_end: _params.period_end,
-    revenue: {
-      label: 'Revenue',
-      rows: [
-        { account_code: '4010', account_name: 'Lumber Sales', amount: 248_120.55 },
-        { account_code: '4020', account_name: 'Hardware Sales', amount: 312_805.12 },
-        { account_code: '4030', account_name: 'Paint & Sundries', amount: 41_280.33 },
-        { account_code: '4040', account_name: 'Garden Centre', amount: 18_440.87 },
-      ],
-      subtotal: 620_646.87,
-    },
-    cogs: {
-      label: 'Cost of Goods Sold',
-      rows: [
-        { account_code: '5010', account_name: 'COGS — Lumber', amount: 184_220.0 },
-        { account_code: '5020', account_name: 'COGS — Hardware', amount: 226_780.0 },
-        { account_code: '5030', account_name: 'COGS — Paint', amount: 28_900.0 },
-      ],
-      subtotal: 439_900.0,
-    },
-    gross_profit: 180_746.87,
-    operating_expenses: {
-      label: 'Operating Expenses',
-      rows: [
-        { account_code: '6120', account_name: 'Wages & Benefits', amount: 64_220.5 },
-        { account_code: '6510', account_name: 'Rent', amount: 11_452.0 },
-        { account_code: '6550', account_name: 'Bad Debt', amount: 870.0 },
-        { account_code: '6610', account_name: 'Utilities', amount: 4_120.22 },
-        { account_code: '6710', account_name: 'Insurance', amount: 2_840.0 },
-      ],
-      subtotal: 83_502.72,
-    },
-    net_income: 97_244.15,
-    comparison: null,
-  };
+  const res = await api.get<IncomeStatementReport>(
+    '/api/reports/income-statement',
+    { params },
+  );
+  return res.data;
+}
+
+// --------------------------------------------------------------------------
+// Balance Sheet
+// --------------------------------------------------------------------------
+
+export interface BalanceSheetRow {
+  account_code: string;
+  account_name: string;
+  balance: number;
 }
 
 export interface BalanceSheetReport {
   entity_code: string;
   as_of_date: string;
   assets: {
-    current: Array<{ account_code: string; name: string; amount: number }>;
-    fixed: Array<{ account_code: string; name: string; amount: number }>;
+    current: BalanceSheetRow[];
+    current_total: number;
+    fixed: BalanceSheetRow[];
+    fixed_total: number;
     total: number;
   };
   liabilities: {
-    current: Array<{ account_code: string; name: string; amount: number }>;
-    long_term: Array<{ account_code: string; name: string; amount: number }>;
+    current: BalanceSheetRow[];
+    current_total: number;
+    long_term: BalanceSheetRow[];
+    long_term_total: number;
     total: number;
   };
   equity: {
-    rows: Array<{ account_code: string; name: string; amount: number }>;
+    accounts: BalanceSheetRow[];
     total: number;
   };
-  balances: boolean;
+  liabilities_and_equity_total: number;
+  balanced: boolean;
+  variance: number;
 }
 
-// TODO: backend endpoint not built — POST /api/reports/balance-sheet
-export async function getBalanceSheet(_params: {
+export async function getBalanceSheet(params: {
   entity_code: string;
   as_of_date: string;
 }): Promise<BalanceSheetReport> {
-  await new Promise((r) => setTimeout(r, 250));
-  return {
-    entity_code: _params.entity_code,
-    as_of_date: _params.as_of_date,
-    assets: {
-      current: [
-        { account_code: '1020', name: 'TD Operating', amount: 142_388.12 },
-        { account_code: '1085', name: 'Accounts Receivable', amount: 14_220.45 },
-        { account_code: '1120', name: 'Inventory', amount: 612_400.0 },
-      ],
-      fixed: [
-        { account_code: '1500', name: 'Buildings — Cost', amount: 480_000.0 },
-        { account_code: '1650', name: 'A/D Provision', amount: -120_000.0 },
-      ],
-      total: 1_129_008.57,
-    },
-    liabilities: {
-      current: [
-        { account_code: '2020', name: 'Accounts Payable', amount: 198_440.0 },
-        { account_code: '2030', name: 'HH AP Clearing', amount: 0.0 },
-        { account_code: '2300', name: 'HST Payable', amount: 8_220.4 },
-      ],
-      long_term: [
-        { account_code: '2700', name: 'Term Loan', amount: 220_000.0 },
-      ],
-      total: 426_660.4,
-    },
-    equity: {
-      rows: [
-        { account_code: '3010', name: 'Owner Capital', amount: 500_000.0 },
-        { account_code: '3020', name: 'Retained Earnings', amount: 202_348.17 },
-      ],
-      total: 702_348.17,
-    },
-    balances: true,
-  };
+  const res = await api.get<BalanceSheetReport>(
+    '/api/reports/balance-sheet',
+    { params },
+  );
+  return res.data;
 }
 
-export interface AsOfTrialBalanceRow {
+// --------------------------------------------------------------------------
+// Trial Balance
+// --------------------------------------------------------------------------
+
+export interface TrialBalanceRow {
   account_code: string;
   account_name: string;
-  debit: number;
-  credit: number;
-  expected_normal: 'debit' | 'credit';
+  account_type: string;
+  normal_balance: 'debit' | 'credit';
+  total_debits: number;
+  total_credits: number;
+  net_balance: number;
   unexpected_balance: boolean;
 }
 
-// TODO: backend endpoint not built — GET /api/reports/trial-balance-as-of
-// Until built, the Trial Balance page falls back to the run-based endpoint
-// in lib/api/gl.ts (getTrialBalance) for the most recent GL import run.
-export async function getAsOfTrialBalance(_params: {
+export interface TrialBalanceReport {
   entity_code: string;
   as_of_date: string;
-}): Promise<{
-  rows: AsOfTrialBalanceRow[];
-  total_debit: number;
-  total_credit: number;
-}> {
-  await new Promise((r) => setTimeout(r, 200));
-  const rows: AsOfTrialBalanceRow[] = [
-    {
-      account_code: '1020',
-      account_name: 'TD Operating',
-      debit: 142_388.12,
-      credit: 0,
-      expected_normal: 'debit',
-      unexpected_balance: false,
-    },
-    {
-      account_code: '1120',
-      account_name: 'Inventory',
-      debit: 612_400.0,
-      credit: 0,
-      expected_normal: 'debit',
-      unexpected_balance: false,
-    },
-    {
-      account_code: '2020',
-      account_name: 'Accounts Payable',
-      debit: 0,
-      credit: 198_440.0,
-      expected_normal: 'credit',
-      unexpected_balance: false,
-    },
-  ];
-  const total_debit = rows.reduce((s, r) => s + r.debit, 0);
-  const total_credit = rows.reduce((s, r) => s + r.credit, 0);
-  return { rows, total_debit, total_credit };
+  accounts: TrialBalanceRow[];
+  totals: {
+    total_debits: number;
+    total_credits: number;
+    difference: number;
+  };
+  balanced: boolean;
 }
 
-export interface ArAgingRow {
-  customer_name: string;
-  current: number;
-  over_30: number;
-  over_60: number;
-  over_90: number;
-  total: number;
+export async function getTrialBalance(params: {
+  entity_code: string;
+  as_of_date: string;
+}): Promise<TrialBalanceReport> {
+  const res = await api.get<TrialBalanceReport>(
+    '/api/reports/trial-balance',
+    { params },
+  );
+  return res.data;
 }
 
-// Uses real /api/pos-import/aged-ar/latest endpoint via lib/api/pos.ts.
-// Re-exported here for the reports page to import from one place.
+// Alias for the older import name used by the trial-balance page.
+export const getAsOfTrialBalance = getTrialBalance;
+
+// --------------------------------------------------------------------------
+// AR / AP aging — re-exported from per-module clients
+// --------------------------------------------------------------------------
+
 export { getLatestAgedAr as getArAging } from './pos';
-
-export interface ApAgingRow {
-  due_bucket: 'current' | 'over_30' | 'over_60' | 'over_90';
-  invoice_count: number;
-  amount: number;
-}
-
-// Uses real /api/hh-ap/summary aging buckets via lib/api/hh_ap.ts.
 export { getHHAPSummary as getApAging } from './hh_ap';
+
+// --------------------------------------------------------------------------
+// Plan-tier feature copy (used by the marketing pricing page + onboarding)
+// --------------------------------------------------------------------------
 
 export const PLAN_FEATURES: Record<PlanTier, string[]> = {
   starter: [

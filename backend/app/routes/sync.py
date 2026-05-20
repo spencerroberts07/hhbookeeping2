@@ -1,14 +1,21 @@
-from fastapi import APIRouter, HTTPException
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from ..db import db_session
 from ..schemas import SyncRequest, SyncResponse
 from ..services import import_chart_of_accounts, import_transactions_cdc
+from ..services_auth import enforce_entity_code, require_role
 
 router = APIRouter(prefix="/api/sync", tags=["quickbooks-sync"])
 
 
 @router.post("/chart-of-accounts", response_model=SyncResponse)
-async def sync_chart_of_accounts(request: SyncRequest) -> SyncResponse:
+async def sync_chart_of_accounts(
+    request: SyncRequest,
+    _user: Any = Depends(require_role("admin")),
+) -> SyncResponse:
+    enforce_entity_code(_user, request.entity_code)
     try:
         with db_session() as session:
             result = await import_chart_of_accounts(session, request.entity_code)
@@ -23,10 +30,16 @@ async def sync_chart_of_accounts(request: SyncRequest) -> SyncResponse:
 
 
 @router.post("/transactions", response_model=SyncResponse)
-async def sync_transactions(request: SyncRequest) -> SyncResponse:
+async def sync_transactions(
+    request: SyncRequest,
+    _user: Any = Depends(require_role("admin")),
+) -> SyncResponse:
+    enforce_entity_code(_user, request.entity_code)
     try:
         with db_session() as session:
-            result = await import_transactions_cdc(session, request.entity_code, request.date_from, request.date_to)
+            result = await import_transactions_cdc(
+                session, request.entity_code, request.date_from, request.date_to,
+            )
             return SyncResponse(
                 entity_code=request.entity_code,
                 sync_type="transactions_cdc",

@@ -280,14 +280,36 @@ function TransactionDetailDialog({
                     key={inv.id}
                     className="flex items-center justify-between gap-2 rounded-lg border border-border bg-white p-3 text-sm"
                   >
-                    <div className="min-w-0">
-                      <div className="font-semibold text-deep-navy truncate">
-                        {inv.vendor_name ?? 'Unknown vendor'}
-                      </div>
-                      <div className="text-xs text-slate">
-                        {inv.invoice_number ?? '—'} ·{' '}
-                        {inv.invoice_date ? formatDate(inv.invoice_date) : '—'}{' '}
-                        · {inv.amount ? formatMoney(inv.amount) : '—'}
+                    <div className="min-w-0 flex items-center gap-3">
+                      {inv.file_url ? (
+                        <a
+                          href={inv.file_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label="View PDF"
+                          title="View PDF"
+                          className="shrink-0 rounded-md p-1 text-slate hover:text-deep-navy hover:bg-cloud"
+                        >
+                          <FileText className="h-4 w-4" strokeWidth={1.5} />
+                        </a>
+                      ) : (
+                        <span
+                          aria-disabled
+                          title="PDF not available — file uploaded before storage was configured"
+                          className="shrink-0 rounded-md p-1 text-slate/40"
+                        >
+                          <FileText className="h-4 w-4" strokeWidth={1.5} />
+                        </span>
+                      )}
+                      <div className="min-w-0">
+                        <div className="font-semibold text-deep-navy truncate">
+                          {inv.vendor_name ?? 'Unknown vendor'}
+                        </div>
+                        <div className="text-xs text-slate">
+                          {inv.invoice_number ?? '—'} ·{' '}
+                          {inv.invoice_date ? formatDate(inv.invoice_date) : '—'}{' '}
+                          · {inv.amount ? formatMoney(inv.amount) : '—'}
+                        </div>
                       </div>
                     </div>
                     <Badge

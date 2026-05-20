@@ -45,6 +45,26 @@ export async function getCurrentPeriod(
   return res.data;
 }
 
+export interface CreatedPeriod {
+  id: string;
+  period_label: string;
+  period_start: string;
+  period_end: string;
+  status: PeriodStatus;
+}
+
+/** Create a new accounting period. 409 if another open period exists. */
+export async function createAccountingPeriod(input: {
+  entity_code: string;
+  period_start: string;
+  period_end: string;
+  period_label?: string;
+  actor_email: string;
+}): Promise<CreatedPeriod> {
+  const res = await api.post<CreatedPeriod>('/api/period-close/periods', input);
+  return res.data;
+}
+
 export async function getPeriodStatus(
   entityCode: string,
   periodEnd: string,
