@@ -6,6 +6,10 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
 import { listPosRuns, validatePosFinancial } from '@/lib/api/pos';
 import { listGlRuns, getTrialBalance } from '@/lib/api/gl';
+import {
+  getUnmatchedQueue,
+  listInvoiceDocuments,
+} from '@/lib/api/invoices';
 import { formatMoney, formatPercent } from '@/lib/utils';
 
 interface Props {
@@ -49,8 +53,28 @@ export function StepValidation({ entityCode, periodEnd }: Props) {
       getTrialBalance(entityCode, latestGlRun!.id, /* onlyVariance */ true),
   });
 
+  // Invoice match status — unmatched count is the main signal here.
+  const unmatched = useQuery({
+    queryKey: ['unmatched-queue', entityCode],
+    queryFn: () => getUnmatchedQueue({ entity_code: entityCode }),
+  });
+  const matched = useQuery({
+    queryKey: ['invoice-documents', entityCode, 'matched-or-posted'],
+    queryFn: () =>
+      listInvoiceDocuments({
+        entity_code: entityCode,
+        // Backend doesn't have a multi-status filter; we count manually
+        // from the unfiltered list.
+        limit: 500,
+      }),
+    select: (data) =>
+      data.invoices.filter((i) =>
+        ['matched', 'posted_to_ap'].includes(i.status),
+      ).length,
+  });
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       <div className="rounded-xl border border-border bg-white p-4">
         <div className="text-sm font-semibold text-deep-navy mb-2">
           POS validation
@@ -106,6 +130,40 @@ export function StepValidation({ entityCode, periodEnd }: Props) {
             </Link>
           </div>
         ) : null}
+      </div>
+
+      {/* Invoice matching — does not block period close per the spec, but
+          warns when invoices are uploaded without a link. */}
+      <div className="rounded-xl border border-border bg-white p-4">
+        <div className="text-sm font-semibold text-deep-navy mb-2">
+          Invoice matching
+        </div>
+        {unmatched.isLoading || matched.isLoading ? (
+          <Skeleton className="h-10" />
+        ) : (
+          <div className="text-sm">
+            <div className="flex items-center gap-2">
+              <Badge
+                variant={
+                  (unmatched.data?.total ?? 0) === 0 ? 'complete' : 'warning'
+                }
+              >
+                {matched.data ?? 0} matched · {unmatched.data?.total ?? 0} unmatched
+              </Badge>
+            </div>
+            {(unmatched.data?.total ?? 0) > 0 && (
+              <p className="text-xs text-slate mt-2">
+                Unmatched invoices won&apos;t block close, but should be resolved.
+              </p>
+            )}
+            <Link
+              href="/ap/unmatched"
+              className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
+            >
+              Open unmatched queue →
+            </Link>
+          </div>
+        )}
       </div>
     </div>
   );

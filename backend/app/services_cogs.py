@@ -27,12 +27,15 @@ submits and approves through the standard endpoints.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 from .services import (
     _has_table,
@@ -673,6 +676,26 @@ def build_cogs_journal(
                 ),
             },
         )
+
+        # Additive hook — try to link an uploaded outside-vendor invoice to
+        # this freshly-created credit-to-AP line. Failures must never block
+        # the COGS journal write.
+        try:
+            from . import services_invoice_matching as _svc_im
+
+            credit_amt = Decimal(str(l.get("credit_amount") or 0))
+            if credit_amt > 0:
+                _svc_im.auto_match_for_journal_line(
+                    session,
+                    entity_code=entity_code,
+                    line_amount=credit_amt,
+                    account_code=l["account_code"],
+                    journal_batch_id=journal_batch_id,
+                )
+        except Exception:
+            logger.exception(
+                "invoice-matching hook failed for COGS line — COGS write unaffected",
+            )
 
     # ------------------------------------------------------------------
     # Persist cogs_journal_inputs row (for carry-forward + audit)

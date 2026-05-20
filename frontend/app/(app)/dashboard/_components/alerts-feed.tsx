@@ -1,9 +1,11 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertCircle, FileWarning, Clock } from 'lucide-react';
+import { AlertCircle, FileWarning, Clock, Receipt } from 'lucide-react';
+import Link from 'next/link';
 import { useEntityStore } from '@/lib/store/entity';
 import { listSuggestions } from '@/lib/api/vendor_classification';
+import { getUnmatchedQueue } from '@/lib/api/invoices';
 import { Skeleton } from '@/components/ui/skeleton';
 
 export function AlertsFeed() {
@@ -16,6 +18,13 @@ export function AlertsFeed() {
       listSuggestions({ entity_code: entityCode!, status: 'pending', limit: 5 }),
   });
 
+  const unmatchedInvoices = useQuery({
+    queryKey: ['unmatched-queue', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getUnmatchedQueue({ entity_code: entityCode! }),
+    select: (data) => data.total,
+  });
+
   if (pending.isLoading) {
     return (
       <div className="space-y-2">
@@ -26,7 +35,22 @@ export function AlertsFeed() {
     );
   }
 
-  const items = [
+  const items: Array<{
+    icon: typeof AlertCircle;
+    label: string;
+    detail: string;
+    href?: string;
+  }> = [
+    ...((unmatchedInvoices.data ?? 0) > 0
+      ? [
+          {
+            icon: Receipt,
+            label: `${unmatchedInvoices.data} invoice${unmatchedInvoices.data === 1 ? '' : 's'} uploaded but unmatched`,
+            detail: 'Review before period close',
+            href: '/ap/unmatched',
+          },
+        ]
+      : []),
     ...(pending.data?.suggestions ?? []).map((s) => ({
       icon: AlertCircle,
       label: `Classification suggestion · ${s.vendor_key}`,
@@ -54,11 +78,8 @@ export function AlertsFeed() {
     <ul className="space-y-2">
       {items.map((item, idx) => {
         const Icon = item.icon;
-        return (
-          <li
-            key={idx}
-            className="flex items-start gap-3 rounded-lg border border-border bg-white p-3"
-          >
+        const body = (
+          <>
             <Icon
               className="h-5 w-5 text-amber-600 mt-0.5 shrink-0"
               strokeWidth={1.5}
@@ -69,6 +90,23 @@ export function AlertsFeed() {
               </div>
               <div className="text-xs text-slate truncate">{item.detail}</div>
             </div>
+          </>
+        );
+        return (
+          <li
+            key={idx}
+            className="flex items-start gap-3 rounded-lg border border-border bg-white p-3"
+          >
+            {item.href ? (
+              <Link
+                href={item.href}
+                className="flex items-start gap-3 flex-1 hover:bg-cloud rounded-md -m-1 p-1"
+              >
+                {body}
+              </Link>
+            ) : (
+              body
+            )}
           </li>
         );
       })}

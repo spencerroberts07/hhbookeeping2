@@ -139,6 +139,18 @@ const DOCS: DocConfig[] = [
     }),
     invalidate: ['gl-runs'],
   },
+  {
+    key: 'outside_vendor_invoices',
+    label: 'Outside-vendor invoices (optional)',
+    description:
+      'Any non-HH vendor invoices for the period. Auto-matched to bank transactions by amount + date.',
+    endpoint: '/api/invoice-documents/upload',
+    fileKey: 'files',
+    accept: '.pdf',
+    required: false,
+    buildExtra: () => ({ invoice_type: 'outside_vendor' }),
+    invalidate: ['unmatched-queue', 'invoice-documents'],
+  },
 ];
 
 export function StepDocuments({ entityCode, periodEnd }: Props) {

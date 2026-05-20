@@ -19,9 +19,10 @@ import { getHHAPSummary, listHHAPInvoices } from '@/lib/api/hh_ap';
 import { formatMoney, formatDate } from '@/lib/utils';
 import { MultiFileUpload } from '@/components/shared/multi-file-upload';
 import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
+import { listInvoiceDocuments, getUnmatchedQueue } from '@/lib/api/invoices';
 import Link from 'next/link';
 
-type Tab = 'hh' | 'vendor';
+type Tab = 'hh' | 'vendor' | 'unmatched';
 
 const HH_AP_DOCUMENT_TYPES = [
   { value: 'monthly_statement', label: 'Monthly statement' },
@@ -41,7 +42,29 @@ export default function ApPage() {
   const refreshAp = () => {
     qc.invalidateQueries({ queryKey: ['hh-ap-summary'] });
     qc.invalidateQueries({ queryKey: ['hh-ap-invoices'] });
+    qc.invalidateQueries({ queryKey: ['invoice-documents'] });
+    qc.invalidateQueries({ queryKey: ['unmatched-queue'] });
   };
+
+  // Count of unmatched invoices, used for the tab badge.
+  const unmatchedCount = useQuery({
+    queryKey: ['unmatched-queue', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getUnmatchedQueue({ entity_code: entityCode! }),
+    select: (data) => data.total,
+  });
+
+  // Outside-vendor invoices (status excludes 'deleted').
+  const outsideInvoices = useQuery({
+    queryKey: ['invoice-documents', entityCode, 'outside_vendor'],
+    enabled: !!entityCode && tab === 'vendor',
+    queryFn: () =>
+      listInvoiceDocuments({
+        entity_code: entityCode!,
+        invoice_type: 'outside_vendor',
+        limit: 200,
+      }),
+  });
 
   const summary = useQuery({
     queryKey: ['hh-ap-summary', entityCode],
@@ -80,6 +103,19 @@ export default function ApPage() {
               }`}
             >
               Other vendors
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === 'unmatched'}
+              onClick={() => setTab('unmatched')}
+              className={`rounded-lg px-3 py-1.5 text-sm font-semibold flex items-center gap-2 ${
+                tab === 'unmatched' ? 'bg-deep-navy text-white' : 'text-slate hover:bg-cloud'
+              }`}
+            >
+              Unmatched
+              {(unmatchedCount.data ?? 0) > 0 && (
+                <Badge variant="warning">{unmatchedCount.data}</Badge>
+              )}
             </button>
           </nav>
         </div>
@@ -170,6 +206,18 @@ export default function ApPage() {
                   description="Non-invoice HH AP paperwork. Pick a document type above before uploading."
                   onComplete={refreshAp}
                 />
+                <MultiFileUpload
+                  endpoint="/api/invoice-documents/upload"
+                  fileKey="files"
+                  accept=".pdf"
+                  extraFields={{
+                    entity_code: uploadDefaults.entity_code,
+                    invoice_type: 'hh_ap',
+                  }}
+                  label="HH invoice PDFs (per-PO archive)"
+                  description="Upload individual HH invoice PDFs — matched to statement rows by PO number for the audit trail."
+                  onComplete={refreshAp}
+                />
               </CardContent>
             </Card>
 
@@ -216,23 +264,98 @@ export default function ApPage() {
         )}
 
         {tab === 'vendor' && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Other vendors</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {/* TODO: backend endpoint not built — vendor-master list
-                   with balances. /api/direct-vendor-ap has cheque/transfer
-                   tracking but not a vendor master view. */}
-              <p className="text-sm text-slate">
-                Non-HH vendor balances and payment history will appear here
-                once the vendor-master endpoint lands. For now, see{' '}
-                <Link href="/bank" className="text-ledger-blue underline">
-                  Bank module
-                </Link>{' '}
-                for outstanding payments.
-              </p>
-            </CardContent>
+          <>
+            <Card>
+              <CardHeader>
+                <CardTitle>Upload outside-vendor invoices</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <MultiFileUpload
+                  endpoint="/api/invoice-documents/upload"
+                  fileKey="files"
+                  accept=".pdf"
+                  extraFields={{
+                    entity_code: uploadDefaults.entity_code,
+                    invoice_type: 'outside_vendor',
+                  }}
+                  label="Outside-vendor invoice PDFs"
+                  description="Auto-matched to bank transactions by amount + date (±30 days). Unmatched invoices land in the Unmatched tab."
+                  variant="prominent"
+                  onComplete={refreshAp}
+                />
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Outside-vendor invoices</CardTitle>
+              </CardHeader>
+              <CardContent className="p-0">
+                {outsideInvoices.isLoading ? (
+                  <Skeleton className="h-64 m-4" />
+                ) : !outsideInvoices.data?.invoices.length ? (
+                  <div className="p-8 text-center text-slate">
+                    No outside-vendor invoices uploaded yet.
+                  </div>
+                ) : (
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-cloud">
+                      <tr>
+                        <th className="text-left font-semibold text-deep-navy px-4 py-2">Vendor</th>
+                        <th className="text-left font-semibold text-deep-navy px-4 py-2">#</th>
+                        <th className="text-left font-semibold text-deep-navy px-4 py-2">Date</th>
+                        <th className="text-right font-semibold text-deep-navy px-4 py-2">Amount</th>
+                        <th className="px-4 py-2">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {outsideInvoices.data.invoices.map((i) => (
+                        <tr key={i.id} className="hover:bg-cloud">
+                          <td className="px-4 py-2 text-ink">{i.vendor_name ?? '—'}</td>
+                          <td className="px-4 py-2 text-slate font-mono text-xs">
+                            {i.invoice_number ?? '—'}
+                          </td>
+                          <td className="px-4 py-2 text-ink">
+                            {i.invoice_date ? formatDate(i.invoice_date) : '—'}
+                          </td>
+                          <td className="px-4 py-2 tabular-nums text-right text-ink">
+                            {i.amount ? formatMoney(i.amount) : '—'}
+                          </td>
+                          <td className="px-4 py-2">
+                            <Badge
+                              variant={
+                                i.status === 'posted_to_ap'
+                                  ? 'complete'
+                                  : i.status === 'matched'
+                                    ? 'pending'
+                                    : 'warning'
+                              }
+                            >
+                              {i.status.replace('_', ' ')}
+                            </Badge>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </CardContent>
+            </Card>
+          </>
+        )}
+
+        {tab === 'unmatched' && (
+          <Card className="p-6 text-center">
+            <p className="text-sm text-slate mb-3">
+              The full unmatched queue lives on its own page — better-suited
+              for the inline suggested-match / confirm-or-reject flow.
+            </p>
+            <Link
+              href="/ap/unmatched"
+              className="inline-block rounded-xl bg-bw-teal text-white font-semibold px-4 py-2"
+            >
+              Open the unmatched queue →
+            </Link>
           </Card>
         )}
       </main>

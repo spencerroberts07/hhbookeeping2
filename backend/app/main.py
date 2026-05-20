@@ -21,6 +21,7 @@ from .routes.entities import me_router as me_router, router as entities_router
 from .routes.gl_import import router as gl_import_router
 from .routes.hh_ap import router as hh_ap_router
 from .routes import hh_ap_overrides
+from .routes.invoice_documents import router as invoice_documents_router
 from .routes.hh_ap_remittance_bank_match import (
     clearing_router as hh_ap_remittance_clearing_router,
     router as hh_ap_remittance_bank_match_router,
@@ -114,6 +115,10 @@ app.include_router(vendor_classification_router)
 # v1.2 module: monthly COGS journal builder (POS COGS + HHSL dating
 # carry-forward).
 app.include_router(cogs_router)
+
+# Invoice audit trail: PDF upload, auto-matching to bank/HH-AP/journal,
+# unmatched queue, post-to-AP workflow.
+app.include_router(invoice_documents_router)
 
 
 @app.get("/health", response_model=HealthResponse)
