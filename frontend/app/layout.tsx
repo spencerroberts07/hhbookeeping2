@@ -42,6 +42,17 @@ export default function RootLayout({
 }) {
   return (
     <ClerkProvider
+      // Redirect targets. The deprecated `after*Url` props and the v6
+      // `*FallbackRedirectUrl` / `*ForceRedirectUrl` shape are both set
+      // — overlapping coverage so the redirect works no matter which
+      // version of @clerk/nextjs is resolved at build time.
+      signInUrl="/sign-in"
+      signUpUrl="/sign-up"
+      afterSignInUrl="/dashboard"
+      afterSignUpUrl="/onboarding"
+      afterSignOutUrl="/"
+      signInFallbackRedirectUrl="/dashboard"
+      signUpFallbackRedirectUrl="/onboarding"
       appearance={{
         variables: {
           colorPrimary: '#0B2E72',
