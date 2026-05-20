@@ -75,12 +75,23 @@ ROLE_HIERARCHY: dict[str, int] = {
 # define org:viewer / org:bookkeeper / org:approver / org:admin. 'org:owner'
 # is accepted as an alias for admin so an environment that only configured
 # the three roles in the original spec keeps working.
+#
+# Why both short and prefixed forms are listed: Clerk's webhook payloads
+# carry the full role key (e.g. 'org:admin'), but the default session token
+# template emits the short name only (e.g. 'admin') in the `org_role` claim.
+# Until a custom session-token template is configured in the dashboard, we
+# have to accept both shapes.
 ORG_ROLE_TO_APP_ROLE: dict[str, str] = {
     "org:viewer": ROLE_VIEWER,
+    "viewer": ROLE_VIEWER,
     "org:bookkeeper": ROLE_BOOKKEEPER,
+    "bookkeeper": ROLE_BOOKKEEPER,
     "org:approver": ROLE_APPROVER,
+    "approver": ROLE_APPROVER,
     "org:admin": ROLE_ADMIN,
+    "admin": ROLE_ADMIN,
     "org:owner": ROLE_ADMIN,
+    "owner": ROLE_ADMIN,
 }
 
 

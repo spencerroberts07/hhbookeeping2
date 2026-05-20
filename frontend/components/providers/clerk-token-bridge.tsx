@@ -74,15 +74,21 @@ function mapClerkRoleToAppRole(
   clerkRole: string | null,
 ): 'viewer' | 'bookkeeper' | 'approver' | 'admin' | null {
   if (!clerkRole) return null;
-  switch (clerkRole) {
-    case 'org:viewer':
+  // Clerk's session-token `org_role` claim ships the short form ('admin')
+  // by default; only a customized session-token template emits the full
+  // 'org:admin' key. Strip any 'org:' prefix before matching.
+  const normalized = clerkRole.startsWith('org:')
+    ? clerkRole.slice(4)
+    : clerkRole;
+  switch (normalized) {
+    case 'viewer':
       return 'viewer';
-    case 'org:bookkeeper':
+    case 'bookkeeper':
       return 'bookkeeper';
-    case 'org:approver':
+    case 'approver':
       return 'approver';
-    case 'org:admin':
-    case 'org:owner':
+    case 'admin':
+    case 'owner':
       return 'admin';
     default:
       return null;
