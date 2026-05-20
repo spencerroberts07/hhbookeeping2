@@ -128,6 +128,55 @@ def post_reopen(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/current")
+def get_current_period(
+    entity_code: str = Query(...),
+) -> dict[str, Any]:
+    """
+    Return the period the dashboard should land on:
+      1. The most recent period whose status != 'closed' (typically 'open' or
+         'submitted_for_close') — that's the "active" period the dealer is
+         working in.
+      2. If every period is closed, the most recent closed period — gives the
+         dealer a view of their last closed books rather than a blank state.
+      3. 404 if no accounting_periods rows exist for this entity at all.
+
+    Returns: {period_end: 'YYYY-MM-DD', period_label, status}.
+    The frontend feeds period_end into /api/period-close/status for the full
+    payload.
+    """
+    from sqlalchemy import text as _text
+
+    with db_session() as session:
+        row = session.execute(
+            _text(
+                """
+                SELECT ap.period_end, ap.period_label, ap.status
+                  FROM accounting_periods ap
+                  JOIN entities e ON e.id = ap.entity_id
+                 WHERE e.entity_code = :entity_code
+                 ORDER BY
+                   CASE WHEN ap.status <> 'closed' THEN 0 ELSE 1 END,
+                   ap.period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"entity_code": entity_code},
+        ).mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No accounting periods exist for entity {entity_code!r}",
+        )
+    return {
+        "period_end": row["period_end"].isoformat()
+        if hasattr(row["period_end"], "isoformat")
+        else str(row["period_end"]),
+        "period_label": row["period_label"],
+        "status": row["status"],
+    }
+
+
 @router.get("/status")
 def get_status(
     entity_code: str = Query(...),

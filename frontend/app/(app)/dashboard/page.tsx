@@ -1,6 +1,5 @@
 'use client';
 
-import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Topbar } from '@/components/layout/topbar';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -11,22 +10,34 @@ import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
 import { getQuickbooksStatus } from '@/lib/api/dashboard';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
-import { getPeriodStatus } from '@/lib/api/month_end';
+import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestPosFinancial } from '@/lib/api/pos';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
 import { QuickActions } from './_components/quick-actions';
 import { AlertsFeed } from './_components/alerts-feed';
+import { CalendarPlus } from 'lucide-react';
+import type { AxiosError } from 'axios';
 import Link from 'next/link';
 
 export default function DashboardPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
 
-  // Default period (q10) = current calendar month, period_end = today.
-  const today = useMemo(() => new Date(), []);
-  const periodEnd = today.toISOString().slice(0, 10);
-  const periodLabel = formatMonthLabel(today);
+  // Find the period the dashboard should land on by querying the backend
+  // for the most recent open-or-closed period. A 404 means no periods
+  // exist yet — the dashboard renders an empty state with a link to
+  // /month-end. This replaces the previous "default to today" behaviour
+  // which 500'd on any entity without a same-day accounting_periods row.
+  const currentPeriod = useQuery({
+    queryKey: ['current-period', entityCode],
+    enabled: !!entityCode,
+    retry: false,
+    queryFn: () => getCurrentPeriod(entityCode!),
+  });
+
+  const periodEnd = currentPeriod.data?.period_end ?? null;
+  const periodLabel = periodEnd ? formatMonthLabel(periodEnd) : undefined;
 
   const qbo = useQuery({
     queryKey: ['qbo-status', entityCode],
@@ -40,8 +51,8 @@ export default function DashboardPage() {
   });
   const periodStatus = useQuery({
     queryKey: ['period-status', entityCode, periodEnd],
-    enabled: !!entityCode,
-    queryFn: () => getPeriodStatus(entityCode!, periodEnd),
+    enabled: !!entityCode && !!periodEnd,
+    queryFn: () => getPeriodStatus(entityCode!, periodEnd!),
   });
   const posLatest = useQuery({
     queryKey: ['pos-latest', entityCode],
@@ -59,6 +70,42 @@ export default function DashboardPage() {
               No entity selected. Pick one from the switcher to load your
               dashboard.
             </p>
+          </Card>
+        </main>
+      </>
+    );
+  }
+
+  // No periods exist yet — first-run empty state. We render this BEFORE the
+  // main dashboard so the user isn't shown half-loaded cards next to a
+  // "start your first month-end" prompt.
+  const noPeriods =
+    !currentPeriod.isLoading &&
+    !currentPeriod.data &&
+    (currentPeriod.error as AxiosError | undefined)?.response?.status === 404;
+
+  if (noPeriods) {
+    return (
+      <>
+        <Topbar title="Dashboard" />
+        <main className="p-6">
+          <Card className="p-10 text-center max-w-xl mx-auto">
+            <div className="grid h-12 w-12 place-items-center rounded-full bg-cloud text-ledger-blue mx-auto mb-4">
+              <CalendarPlus className="h-6 w-6" strokeWidth={1.5} />
+            </div>
+            <h2 className="text-h2 text-deep-navy mb-2">
+              No periods found
+            </h2>
+            <p className="text-slate mb-6">
+              Get started by running your first month-end close. BookWize will
+              walk you through document uploads, classification, journals,
+              validation, and closing the period.
+            </p>
+            <Link href="/month-end">
+              <Button variant="accent" size="lg">
+                Start your first month-end →
+              </Button>
+            </Link>
           </Card>
         </main>
       </>
@@ -159,7 +206,7 @@ export default function DashboardPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {periodStatus.isLoading ? (
+              {currentPeriod.isLoading || periodStatus.isLoading ? (
                 <Skeleton className="h-9 w-32" />
               ) : (
                 <>
@@ -175,6 +222,9 @@ export default function DashboardPage() {
                     >
                       {periodStatus.data?.status ?? 'open'}
                     </Badge>
+                    {periodLabel && (
+                      <span className="text-xs text-slate">{periodLabel}</span>
+                    )}
                   </div>
                   <Link
                     href="/month-end"

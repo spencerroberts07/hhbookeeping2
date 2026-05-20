@@ -23,7 +23,27 @@ export interface BatchSummary {
   line_count: number;
 }
 
+export interface CurrentPeriod {
+  period_end: string;
+  period_label: string;
+  status: PeriodStatus;
+}
+
 // --- period_close ---
+
+/**
+ * Returns the period the dashboard should land on. 404 means no
+ * accounting_periods rows exist for the entity yet — the caller should
+ * render an "Start your first month-end" empty state.
+ */
+export async function getCurrentPeriod(
+  entityCode: string,
+): Promise<CurrentPeriod> {
+  const res = await api.get<CurrentPeriod>('/api/period-close/current', {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}
 
 export async function getPeriodStatus(
   entityCode: string,
