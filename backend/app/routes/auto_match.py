@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_auto_match import (
     TRIGGER_MANUAL,
     get_auto_match_run_detail,
@@ -48,6 +48,7 @@ def post_run(
     body: RunRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return run_auto_match(

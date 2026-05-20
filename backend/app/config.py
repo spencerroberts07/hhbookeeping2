@@ -46,6 +46,20 @@ class Settings(BaseSettings):
     # fallback — Layers 1 (rules) and 2 (vendor memory) still run.
     anthropic_api_key: str | None = None
 
+    # Clerk integration. All optional so the legacy JWT path still boots
+    # cleanly when Clerk is not configured. The dispatcher in
+    # services_auth.require_role only consults these when use_clerk_auth
+    # is True; if it is and any of these are unset, the request fails 500
+    # with an explicit message rather than silently falling back.
+    clerk_secret_key: str | None = None
+    clerk_publishable_key: str | None = None
+    clerk_webhook_secret: str | None = None
+    # Optional override. When unset, services_auth_clerk derives the JWKS URL
+    # from CLERK_PUBLISHABLE_KEY (Clerk publishable keys encode the instance
+    # host in base64 after the pk_test_/pk_live_ prefix).
+    clerk_jwks_url: str | None = None
+    use_clerk_auth: bool = False
+
     @field_validator("jwt_secret")
     @classmethod
     def _validate_jwt_secret(cls, value: str) -> str:

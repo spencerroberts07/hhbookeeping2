@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_bank_csv import (
     get_bank_csv_import_run_detail,
     list_bank_csv_import_runs,
@@ -78,6 +78,7 @@ async def bank_csv_preview(
     Parse the uploaded CSV and report what WOULD happen on import,
     without inserting anything. Use this before /upload.
     """
+    enforce_entity_code(_user, entity_code)
     try:
         file_bytes = await file.read()
         column_map_override = _parse_column_map_json(column_map_json)
@@ -116,6 +117,7 @@ async def bank_csv_upload(
     Idempotent: re-uploading the same file results in 0 inserts and
     counts the rows as duplicates instead.
     """
+    enforce_entity_code(_user, entity_code)
     try:
         file_bytes = await file.read()
         column_map_override = _parse_column_map_json(column_map_json)

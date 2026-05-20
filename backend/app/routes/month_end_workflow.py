@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..journal_batch_workflow import (
     get_journal_batch,
     get_workflow_events,
@@ -145,6 +145,7 @@ def submit_month_end_batch_for_review(
     payload: JournalBatchWorkflowActionRequest,
     _user: dict = Depends(require_role("approver")),
 ):
+    enforce_entity_code(_user, payload.entity_code)
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         period = get_accounting_period(session, entity["id"], payload.period_end)
@@ -175,6 +176,7 @@ def approve_month_end_batch(
     payload: JournalBatchWorkflowActionRequest,
     _user: dict = Depends(require_role("approver")),
 ):
+    enforce_entity_code(_user, payload.entity_code)
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         period = get_accounting_period(session, entity["id"], payload.period_end)
@@ -205,6 +207,7 @@ def reject_month_end_batch(
     payload: JournalBatchWorkflowActionRequest,
     _user: dict = Depends(require_role("approver")),
 ):
+    enforce_entity_code(_user, payload.entity_code)
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         period = get_accounting_period(session, entity["id"], payload.period_end)
@@ -235,6 +238,7 @@ def reopen_month_end_batch(
     payload: JournalBatchWorkflowActionRequest,
     _user: dict = Depends(require_role("approver")),
 ):
+    enforce_entity_code(_user, payload.entity_code)
     with db_session() as session:
         entity = get_entity(session, payload.entity_code)
         period = get_accounting_period(session, entity["id"], payload.period_end)

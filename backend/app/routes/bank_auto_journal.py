@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_bank_auto_journal import (
     get_auto_journal_run_detail,
     list_auto_journal_runs,
@@ -52,6 +52,7 @@ def post_seed_rules(
     body: SeedRulesRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return seed_rules(
@@ -84,6 +85,7 @@ def post_run(
     body: RunRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     period_start = _parse_date("period_start", body.period_start)
     period_end = _parse_date("period_end", body.period_end)
     try:

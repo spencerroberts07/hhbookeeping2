@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from .config import settings
@@ -10,6 +11,7 @@ from .routes.bank_csv import router as bank_csv_router
 from .routes.bank_pdf import router as bank_pdf_router
 from .routes.card_settlement import router as card_settlement_router
 from .routes.cash_balancing import router as cash_balancing_router
+from .routes.clerk_webhook import router as clerk_webhook_router
 from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
 from .routes.depreciation import router as depreciation_router
@@ -35,6 +37,27 @@ from .routes.vendor_classification import router as vendor_classification_router
 from .schemas import HealthResponse
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.7.0")
+
+# --------------------------------------------------------------------------
+# CORS — Clerk-issued session tokens come from a browser. The frontend
+# domains in this list are the only ones allowed to call the API with
+# credentials.
+# --------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://bookwize.ca",
+        "https://bookwize.onrender.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Clerk webhook receiver — must be reachable without an auth header.
+# Registered first so it appears at the top of /docs.
+app.include_router(clerk_webhook_router)
 
 # Auth (user) and QBO OAuth (formerly the only auth router)
 app.include_router(auth_router)

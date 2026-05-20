@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, 
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_payroll import (
     approve_payroll_run,
     build_payroll_journal,
@@ -62,6 +62,7 @@ def post_seed_employees(
     body: SeedEmployeesRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return seed_employees(
@@ -107,6 +108,7 @@ def post_upsert_employee(
     body: UpsertEmployeeRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return upsert_employee(
@@ -141,6 +143,7 @@ async def post_upload_hours(
     vacation_paid_overrides: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     period_start_d = _parse_date("period_start", period_start)
     period_end_d = _parse_date("period_end", period_end)
     pay_date_d = _parse_date("pay_date", pay_date)
@@ -207,6 +210,7 @@ def post_manual_hours(
     body: ManualHoursRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     period_start_d = _parse_date("period_start", body.period_start)
     period_end_d = _parse_date("period_end", body.period_end)
     pay_date_d = _parse_date("pay_date", body.pay_date)
@@ -250,6 +254,7 @@ async def post_upload_register(
     payroll_run + payroll_run_lines at status='draft_confirmed'. Use
     this in place of upload-hours for any run that will hit the GL.
     """
+    enforce_entity_code(_user, entity_code)
     pay_date_d = _parse_date("pay_date", pay_date) if pay_date else None
     file_bytes = await file.read()
     try:
@@ -279,6 +284,7 @@ def post_build_journal(
     payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return build_payroll_journal(
@@ -347,6 +353,7 @@ def post_submit(
     payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return submit_payroll_run(
@@ -365,6 +372,7 @@ def post_approve(
     payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return approve_payroll_run(
@@ -383,6 +391,7 @@ def post_schedule_withdrawals(
     payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return schedule_withdrawals(

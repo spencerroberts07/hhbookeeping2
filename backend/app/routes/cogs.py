@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_cogs import (
     build_cogs_journal,
     get_cogs_status,
@@ -48,6 +48,7 @@ def post_build_journal(
     body: BuildCogsJournalRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     period_end = _parse_date("period_end", body.period_end)
     try:
         with db_session() as session:

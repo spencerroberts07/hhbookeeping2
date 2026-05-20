@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_period_close import (
     BlockingItemsError,
     PeriodLockedError,
@@ -68,6 +68,7 @@ def post_submit(
     body: SubmitRequest,
     _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return submit_period_for_close(
@@ -90,6 +91,7 @@ def post_approve(
     body: ApproveRequest,
     _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return approve_period_close(
@@ -112,6 +114,7 @@ def post_reopen(
     body: ReopenRequest,
     _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return reopen_period(

@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_period_close import (
     PeriodLockedError,
     is_date_in_locked_period,
@@ -2262,6 +2262,7 @@ async def hh_ap_upload_documents(
     files: list[UploadFile] = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ):
+    enforce_entity_code(_user, entity_code)
     with db_session() as session:
         entity = get_entity(session, entity_code)
         normalized_document_date = normalize_optional_date_input(document_date)
@@ -2434,6 +2435,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
     files: list[UploadFile] = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ):
+    enforce_entity_code(_user, entity_code)
     normalized_document_date = normalize_optional_date_input(document_date)
 
     with db_session() as session:

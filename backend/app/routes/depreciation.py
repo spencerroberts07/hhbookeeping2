@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_depreciation import (
     build_depreciation_journal,
     generate_depreciation_schedule,
@@ -44,6 +44,7 @@ def post_seed_assets(
     body: SeedAssetsRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return seed_fixed_assets(
@@ -78,6 +79,7 @@ def post_generate_schedule(
     body: GenerateScheduleRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return generate_depreciation_schedule(
@@ -118,6 +120,7 @@ def post_build_journal(
     body: BuildJournalRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     period_end = _parse_date("period_end", body.period_end)
     try:
         with db_session() as session:

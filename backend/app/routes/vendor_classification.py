@@ -32,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_vendor_classification import (
     learn_from_gl_history,
     list_pending_suggestions,
@@ -58,6 +58,7 @@ def post_learn_from_gl(
     body: LearnFromGLRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return learn_from_gl_history(
@@ -102,6 +103,7 @@ def post_upsert_memory(
     body: UpsertMemoryRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return upsert_vendor_memory(
@@ -153,6 +155,7 @@ def post_accept_suggestion(
     model's suggested_account_code; explicitly provide it only when
     you want to confirm a different choice.
     """
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             # If caller didn't supply final_account_code, look up the
@@ -209,6 +212,7 @@ def post_override_suggestion(
     body: FeedbackRequest = ...,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     if not body.final_account_code:
         raise HTTPException(
             status_code=400,

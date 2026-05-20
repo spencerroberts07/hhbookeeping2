@@ -661,25 +661,54 @@ def require_role(min_role: str):
     FastAPI dependency: enforces that the caller has at least `min_role`
     on the entity referenced by the request.
 
-    Looks for entity_code in:
-      1. Query string (?entity_code=...)
-      2. Path/state attribute set by the route (request.state.entity_code)
+    Dispatches between two implementations based on settings.use_clerk_auth.
+    When the flag is on, the returned dependency verifies a Clerk session
+    token and maps the user's active org -> entity_code. When off, it
+    follows the legacy JWT path (described below).
 
-    For endpoints that take entity_code only in a JSON body, the route
-    must set request.state.entity_code = body.entity_code BEFORE calling
-    Depends(require_role(...)) — or use the explicit
-    enforce_role(session, user, entity_code, min_role) function from a
-    body-aware handler.
+    Legacy JWT path:
+        Looks for entity_code in:
+          1. Query string (?entity_code=...)
+          2. Path/state attribute set by the route (request.state.entity_code)
 
-    Returns the authenticated user dict.
+        For endpoints that take entity_code only in a JSON body, the route
+        must set request.state.entity_code = body.entity_code BEFORE calling
+        Depends(require_role(...)) — or use the explicit
+        enforce_role(session, user, entity_code, min_role) function from a
+        body-aware handler.
+
+    Both paths return a mapping-like object with at least:
+        ["id"]            user identifier (legacy: UUID; Clerk: 'user_...')
+        ["email"]         email address
+        ["is_superadmin"] True only on the legacy path
+    plus, under Clerk, .entity_code / .role / .clerk_org_id attributes.
     """
     if min_role not in ROLE_HIERARCHY:
         raise ValueError(f"Unknown min_role: {min_role}")
+
+    # The flag is read on every request (not at module-import time) so it
+    # can be flipped in-process for testing without rebuilding all the route
+    # dependencies. We cache the Clerk dependency the first time we see
+    # use_clerk_auth=True so we don't rebuild it per request.
+    _clerk_dep_cache: dict[str, Any] = {}
+
+    def _clerk_dep_for(role: str):
+        if role not in _clerk_dep_cache:
+            from . import services_auth_clerk
+
+            _clerk_dep_cache[role] = services_auth_clerk._require_min_role(role)
+        return _clerk_dep_cache[role]
 
     def dependency(
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     ) -> dict[str, Any]:
+        if settings.use_clerk_auth:
+            # Delegate the entire request to the Clerk dependency. Re-resolving
+            # creds here would double-prompt Swagger for the bearer; we let
+            # the Clerk dep read it from the request directly.
+            return _clerk_dep_for(min_role)(request, creds)
+
         if creds is None or creds.scheme.lower() != "bearer" or not creds.credentials:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -782,6 +811,27 @@ def enforce_role(
             ),
         )
     return dict(entity)
+
+
+def enforce_entity_code(user: Any, entity_code: str | None) -> None:
+    """
+    Flag-aware: when running under Clerk, verifies the request's
+    entity_code matches the caller's Clerk-org-mapped entity_code.
+
+    Under the legacy JWT path this is a no-op — entity-scoped authz already
+    happened in require_role / enforce_role for the same entity_code, so
+    re-validating it here would just duplicate the check.
+
+    Call this from any handler that reads entity_code from the request body
+    (or any param require_role does not natively inspect), so that an
+    authenticated user from org A cannot post payloads scoped to org B.
+    """
+    if not settings.use_clerk_auth:
+        return
+    # Lazy import to keep the legacy module independent of the Clerk stack.
+    from . import services_auth_clerk
+
+    services_auth_clerk.enforce_entity_code(user, entity_code)
 
 
 def get_current_user(

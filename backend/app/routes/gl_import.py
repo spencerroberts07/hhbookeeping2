@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, 
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_gl_import import (
     build_trial_balance_comparison,
     get_gl_account_transactions,
@@ -53,6 +53,7 @@ async def post_gl_upload(
     period_end: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
     try:
         with db_session() as session:
@@ -82,6 +83,7 @@ def post_build_comparison(
     body: BuildComparisonRequest = ...,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return build_trial_balance_comparison(

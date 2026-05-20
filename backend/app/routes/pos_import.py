@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, 
 from pydantic import BaseModel, Field
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_pos_import import (
     build_ar_adjustment_journal,
     build_donation_journal,
@@ -126,6 +126,7 @@ async def post_import_inventory_adjustment(
     file: UploadFile = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
@@ -149,6 +150,7 @@ async def post_import_pos_financial(
     file: UploadFile = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
@@ -173,6 +175,7 @@ async def post_import_inventory_value(
     snapshot_date: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_text, source = await _read_file_text(file)
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
@@ -199,6 +202,7 @@ async def post_import_aged_ar(
     snapshot_date: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_text, source = await _read_file_text(file)
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
@@ -224,6 +228,7 @@ async def post_import_ar_adjustment(
     file: UploadFile = File(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
@@ -250,6 +255,7 @@ def post_build_store_use_journal(
     body: BuildJournalRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             kwargs: dict[str, Any] = {
@@ -274,6 +280,7 @@ def post_build_donation_journal(
     body: BuildJournalRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             kwargs: dict[str, Any] = {
@@ -314,6 +321,7 @@ def post_build_ar_adjustment_journal(
     body: BuildArAdjustmentJournalRequest,
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             kwargs: dict[str, Any] = {
@@ -351,6 +359,7 @@ def post_validate_pos_financial(
     Replaces the deprecated POST /api/pos-import/build-pos-financial-journal,
     which double-counted daily entries.
     """
+    enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
             return validate_pos_financial(

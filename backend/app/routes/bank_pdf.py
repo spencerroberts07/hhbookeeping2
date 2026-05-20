@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from ..db import db_session
-from ..services_auth import require_role
+from ..services_auth import enforce_entity_code, require_role
 from ..services_bank_pdf import (
     preview_bank_pdf_import,
     run_bank_pdf_import,
@@ -32,6 +32,7 @@ async def post_preview(
     sample_limit: int = Form(default=25),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
     try:
         with db_session() as session:
@@ -60,6 +61,7 @@ async def post_upload(
     note: str | None = Form(default=None),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
     try:
         with db_session() as session:
