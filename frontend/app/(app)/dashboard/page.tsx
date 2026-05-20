@@ -13,6 +13,7 @@ import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestPosFinancial } from '@/lib/api/pos';
 import { getLatestCashBalancing } from '@/lib/api/cash_balancing';
+import { AssistantWidget } from '@/components/assistant/assistant-widget';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
@@ -317,6 +318,7 @@ export default function DashboardPage() {
           </Card>
         </section>
       </main>
+      <AssistantWidget />
     </>
   );
 }

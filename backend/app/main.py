@@ -4,6 +4,7 @@ from fastapi.openapi.utils import get_openapi
 
 from .config import settings
 from .routes.accruals import router as accruals_router
+from .routes.assistant import router as assistant_router
 from .routes.auth import router as auth_router
 from .routes.auto_match import router as auto_match_router
 from .routes.bank_auto_journal import router as bank_auto_journal_router
@@ -123,6 +124,9 @@ app.include_router(invoice_documents_router)
 
 # Live financial reports (Income Statement, Balance Sheet, Trial Balance).
 app.include_router(reports_router)
+
+# BookWize AI assistant — conversational classifier + entity memory.
+app.include_router(assistant_router)
 
 
 @app.get("/health", response_model=HealthResponse)
