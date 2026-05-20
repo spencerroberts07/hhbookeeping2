@@ -51,6 +51,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://bookwize.ca",
         "https://bookwize.onrender.com",
+        "https://bookwize-frontend.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
