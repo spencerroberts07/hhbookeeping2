@@ -60,9 +60,22 @@ export function StepChart() {
   };
   useEffect(() => () => stopPolling(), []);
 
+  const CLIENT_TIMEOUT_MS = 3 * 60 * 1000;
+
   const startPolling = (jobId: string) => {
     stopPolling();
+    const startedAt = Date.now();
     pollRef.current = setInterval(async () => {
+      if (Date.now() - startedAt > CLIENT_TIMEOUT_MS) {
+        stopPolling();
+        setParseJobId(null);
+        setParseError(
+          'Parsing is taking longer than expected. Try a simpler file ' +
+            'format (CSV with columns: Code, Name, Type).',
+        );
+        toast.error('Parse timed out — try a different file format');
+        return;
+      }
       try {
         const p = await getChartParseProgress(jobId);
         setParseStep(p.current_step);

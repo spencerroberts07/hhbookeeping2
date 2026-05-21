@@ -49,6 +49,7 @@ from ..services_onboarding import (
     parse_trial_balance,
     save_chart_of_accounts,
 )
+from ..services_storage import storage_service
 
 # Tokens-per-minute on the Claude API are generous but a TB with
 # thousands of rows can still push the parse request past the 30s
@@ -774,8 +775,17 @@ def _run_parse_chart(
     entity_code: str,
 ) -> None:
     """Background worker for chart-of-accounts file parsing."""
-    _update_job(job_id, status="running", started=True, pct=10,
-                current_step="Parsing chart of accounts")
+    _update_job(job_id, status="running", started=True, pct=5,
+                current_step="Archiving source file")
+    # Best-effort R2 archive — failures here don't block the parse.
+    object_key = storage_service.upload_file(
+        file_bytes=file_bytes,
+        original_filename=filename,
+        entity_code=entity_code,
+        document_type="onboarding-chart",
+        content_type=_content_type_for(filename),
+    )
+    _update_job(job_id, pct=10, current_step="Parsing chart of accounts")
     try:
         preview = parse_chart_of_accounts(file_bytes, filename)
         _update_job(
@@ -787,6 +797,7 @@ def _run_parse_chart(
                 "preview": preview,
                 "filename": filename,
                 "entity_code": entity_code,
+                "file_path": object_key,
             },
             completed=True,
         )
@@ -811,8 +822,16 @@ def _run_parse_tb(
     as_of_date: str,
 ) -> None:
     """Background worker for trial-balance file parsing."""
-    _update_job(job_id, status="running", started=True, pct=10,
-                current_step="Parsing trial balance")
+    _update_job(job_id, status="running", started=True, pct=5,
+                current_step="Archiving source file")
+    object_key = storage_service.upload_file(
+        file_bytes=file_bytes,
+        original_filename=filename,
+        entity_code=entity_code,
+        document_type="onboarding-opening-balance",
+        content_type=_content_type_for(filename),
+    )
+    _update_job(job_id, pct=10, current_step="Parsing trial balance")
     try:
         preview = parse_trial_balance(file_bytes, filename)
         _update_job(
@@ -829,6 +848,7 @@ def _run_parse_tb(
                 "filename": filename,
                 "entity_code": entity_code,
                 "as_of_date": as_of_date,
+                "file_path": object_key,
             },
             completed=True,
         )
@@ -844,6 +864,21 @@ def _run_parse_tb(
         )
 
 
+def _content_type_for(filename: str) -> str:
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        return "text/csv"
+    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if name.endswith(".ods"):
+        return "application/vnd.oasis.opendocument.spreadsheet"
+    if name.endswith(".pdf"):
+        return "application/pdf"
+    if name.endswith(".txt"):
+        return "text/plain"
+    return "application/octet-stream"
+
+
 def _run_file_gl_import(
     *,
     job_id: str,
@@ -855,7 +890,15 @@ def _run_file_gl_import(
 ) -> None:
     """Background worker for file-upload GL imports."""
     _update_job(job_id, status="running", started=True, pct=0,
-                current_step="Parsing file with Claude")
+                current_step="Archiving source file")
+    object_key = storage_service.upload_file(
+        file_bytes=file_bytes,
+        original_filename=filename,
+        entity_code=entity_code,
+        document_type="onboarding-gl",
+        content_type=_content_type_for(filename),
+    )
+    _update_job(job_id, pct=5, current_step="Parsing file with Claude")
 
     def progress(label: str, pct: int) -> None:
         _update_job(job_id, current_step=label, pct=pct)
@@ -872,6 +915,7 @@ def _run_file_gl_import(
                 actor_email=actor_email,
                 progress_callback=lambda label, pct: progress(label, 40 + int(pct * 0.6)),
             )
+        result["file_path"] = object_key
         _update_job(
             job_id,
             status="complete",

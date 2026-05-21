@@ -80,8 +80,12 @@ logger = logging.getLogger(__name__)
 
 
 CLAUDE_MODEL_ID = "claude-sonnet-4-6"
-CLAUDE_PARSE_MAX_TOKENS = 8000
-CLAUDE_CALL_TIMEOUT_SECONDS = 60
+# 4096 tokens is enough for ~150-200 TB/CoA rows in JSON form. Bigger
+# files should already be hitting the regex fallback path.
+CLAUDE_PARSE_MAX_TOKENS = 4096
+# 90s per attempt × 2 attempts = 3 minutes worst-case — matches the
+# frontend's 3-minute polling cap.
+CLAUDE_CALL_TIMEOUT_SECONDS = 90
 
 
 # --------------------------------------------------------------------------

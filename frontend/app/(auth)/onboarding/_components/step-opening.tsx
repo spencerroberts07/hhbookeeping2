@@ -58,9 +58,26 @@ export function StepOpening() {
   };
   useEffect(() => () => stopPolling(), []);
 
+  // Hard 3-minute cap. If we're still polling past the cap, the worker
+  // is either stuck or the file shape is genuinely unparseable; surface
+  // a clear error so the dealer can try a different file rather than
+  // waiting forever.
+  const CLIENT_TIMEOUT_MS = 3 * 60 * 1000;
+
   const startPolling = (jobId: string) => {
     stopPolling();
+    const startedAt = Date.now();
     pollRef.current = setInterval(async () => {
+      if (Date.now() - startedAt > CLIENT_TIMEOUT_MS) {
+        stopPolling();
+        setParseJobId(null);
+        setParseError(
+          'Parsing is taking longer than expected. Try a simpler file ' +
+            'format (CSV with columns: Account Code, Account Name, Debit, Credit).',
+        );
+        toast.error('Parse timed out — try a different file format');
+        return;
+      }
       try {
         const p = await getOpeningBalancesParseProgress(jobId);
         setParseStep(p.current_step);
