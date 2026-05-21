@@ -480,3 +480,135 @@ def get_trial_balance(
         },
         "balanced": balanced,
     }
+
+
+# --------------------------------------------------------------------------
+# Live General Ledger (G1)
+#
+# Replaces the gl-import-runs fallback the frontend used to call. Queries
+# journal_lines directly, scoped by account_code + date range, and emits
+# a running balance per row.
+#
+# Same posted-only filter as the other reports — only non-draft batches
+# count.
+# --------------------------------------------------------------------------
+
+
+@router.get("/general-ledger")
+def get_general_ledger_report(
+    entity_code: str = Query(...),
+    account_code: str = Query(...),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    df = _parse_date("date_from", date_from) if date_from else None
+    dt = _parse_date("date_to", date_to) if date_to else None
+
+    with db_session() as session:
+        entity = _resolve_entity(session, entity_code)
+
+        # Opening balance = net of all lines on this account in periods
+        # whose period_end is strictly before date_from. None when no
+        # date_from supplied — opening is just 0.
+        opening = Decimal("0")
+        if df is not None:
+            row = session.execute(
+                text(
+                    """
+                    SELECT COALESCE(
+                        SUM(jl.debit_amount - jl.credit_amount), 0
+                    ) AS net
+                      FROM journal_lines jl
+                      JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                      JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                     WHERE jb.entity_id = :eid
+                       AND jl.account_code = :code
+                       AND jb.status NOT IN ('draft', 'voided', 'rejected')
+                       AND ap.period_end < :df
+                    """
+                ),
+                {"eid": entity["id"], "code": account_code, "df": df},
+            ).mappings().first()
+            opening = Decimal(str((row or {}).get("net") or 0))
+
+        # Pull transactions within the window, ordered by period_end +
+        # batch + line_number for a stable running-balance walk.
+        rows = session.execute(
+            text(
+                """
+                SELECT jl.id,
+                       ap.period_end       AS posting_date,
+                       jb.source_module,
+                       jb.batch_label,
+                       jl.line_number,
+                       jl.memo,
+                       jl.debit_amount,
+                       jl.credit_amount,
+                       jl.source_json
+                  FROM journal_lines jl
+                  JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                  JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                 WHERE jb.entity_id = :eid
+                   AND jl.account_code = :code
+                   AND jb.status NOT IN ('draft', 'voided', 'rejected')
+                   AND (:df IS NULL OR ap.period_end >= :df)
+                   AND (:dt IS NULL OR ap.period_end <= :dt)
+                 ORDER BY ap.period_end, jb.batch_label, jl.line_number
+                """
+            ),
+            {
+                "eid": entity["id"],
+                "code": account_code,
+                "df": df,
+                "dt": dt,
+            },
+        ).mappings().all()
+
+        # Resolve a friendly account name (gl_account_balances if seen).
+        name_row = session.execute(
+            text(
+                """
+                SELECT account_name FROM gl_account_balances
+                 WHERE entity_id = :eid AND account_code = :code
+                 ORDER BY created_at DESC LIMIT 1
+                """
+            ),
+            {"eid": entity["id"], "code": account_code},
+        ).mappings().first()
+        account_name = (name_row or {}).get("account_name") or account_code
+
+    running = opening
+    transactions: list[dict[str, Any]] = []
+    for r in rows:
+        dr = Decimal(str(r["debit_amount"] or 0))
+        cr = Decimal(str(r["credit_amount"] or 0))
+        running += dr - cr
+        sj = r.get("source_json") or {}
+        reference = (
+            (sj.get("reference_number") if isinstance(sj, dict) else None)
+            or r["batch_label"]
+        )
+        description = r["memo"] or r["source_module"]
+        transactions.append({
+            "id": str(r["id"]),
+            "posting_date": r["posting_date"].isoformat(),
+            "description": description,
+            "reference": reference,
+            "debit": float(dr),
+            "credit": float(cr),
+            "balance": float(running),
+            "source_module": r["source_module"],
+        })
+
+    return {
+        "entity_code": entity_code,
+        "account_code": account_code,
+        "account_name": account_name,
+        "date_from": df.isoformat() if df else None,
+        "date_to": dt.isoformat() if dt else None,
+        "opening_balance": float(opening),
+        "closing_balance": float(running),
+        "transactions": transactions,
+        "transaction_count": len(transactions),
+    }

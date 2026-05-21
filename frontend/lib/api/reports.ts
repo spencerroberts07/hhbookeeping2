@@ -192,3 +192,49 @@ export const PLAN_FEATURES: Record<PlanTier, string[]> = {
     'Priority support',
   ],
 };
+
+// --------------------------------------------------------------------------
+// Live General Ledger
+// --------------------------------------------------------------------------
+
+export interface GLTransaction {
+  id: string;
+  posting_date: string;
+  description: string;
+  reference: string;
+  debit: number;
+  credit: number;
+  balance: number;
+  source_module: string;
+}
+
+export interface GeneralLedgerResponse {
+  entity_code: string;
+  account_code: string;
+  account_name: string;
+  date_from: string | null;
+  date_to: string | null;
+  opening_balance: number;
+  closing_balance: number;
+  transactions: GLTransaction[];
+  transaction_count: number;
+}
+
+export async function getGeneralLedgerReport(input: {
+  entity_code: string;
+  account_code: string;
+  date_from?: string;
+  date_to?: string;
+}): Promise<GeneralLedgerResponse> {
+  const params: Record<string, string> = {
+    entity_code: input.entity_code,
+    account_code: input.account_code,
+  };
+  if (input.date_from) params.date_from = input.date_from;
+  if (input.date_to) params.date_to = input.date_to;
+  const res = await api.get<GeneralLedgerResponse>(
+    '/api/reports/general-ledger',
+    { params },
+  );
+  return res.data;
+}
