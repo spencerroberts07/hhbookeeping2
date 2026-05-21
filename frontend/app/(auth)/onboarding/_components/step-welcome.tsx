@@ -12,9 +12,8 @@ import { useEntityStore } from '@/lib/store/entity';
 export function StepWelcome() {
   const { user } = useUser();
   const next = useOnboardingStore((s) => s.next);
-  const entities = useEntityStore((s) => s.entities);
   const activeCode = useEntityStore((s) => s.activeEntityCode);
-  const entity = entities.find((e) => e.entity_code === activeCode);
+  const activeName = useEntityStore((s) => s.activeEntityName);
 
   return (
     <div className="space-y-6">
@@ -23,8 +22,8 @@ export function StepWelcome() {
           Welcome to BookWize{user?.firstName ? `, ${user.firstName}` : ''}
         </h1>
         <p className="text-slate mt-1">
-          {entity?.entity_name
-            ? `Let's set up ${entity.entity_name}.`
+          {activeName
+            ? `Let's set up ${activeName}.`
             : "Let's get your books wired up."}
         </p>
       </div>
@@ -33,7 +32,7 @@ export function StepWelcome() {
         <div className="flex justify-between text-sm">
           <span className="text-slate">Store name</span>
           <span className="font-semibold text-deep-navy">
-            {entity?.entity_name ?? '—'}
+            {activeName ?? '—'}
           </span>
         </div>
         <div className="flex justify-between text-sm">
