@@ -30,6 +30,7 @@ from ..services_auth_clerk import (
     _extract_org_id,
     _extract_org_role,
 )
+from ..services_billing import ensure_internal_subscription
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,10 @@ class CreateEntityRequest(BaseModel):
     province: str = Field(min_length=2, max_length=4)
     base_currency: str = Field(default="CAD", max_length=3)
     clerk_org_id: str | None = None
+    # When true, the new entity is auto-seeded with an internal-tier
+    # billing_subscriptions row (no Stripe). Set this for owner stores.
+    # 'DEMO-*' prefixed entity_codes auto-enable internal regardless.
+    internal: bool = False
 
 
 @router.post("", status_code=201)
@@ -129,6 +134,23 @@ def create_entity(
                 "created_by_clerk_user_id": creator_id,
             },
         ).mappings().first()
+
+        # DEMO-* entities and any caller that explicitly asks for it
+        # get an internal-tier subscription seeded immediately. This
+        # keeps demo stores out of Stripe and the billing UI.
+        # TODO: Replace with real Stripe subscription when an internal
+        # entity is ready to be billed. Delete its billing_subscriptions
+        # row with plan_tier='internal' and run through
+        # /settings/billing checkout flow.
+        if body.internal or body.entity_code.upper().startswith("DEMO-"):
+            try:
+                ensure_internal_subscription(session, entity_code=body.entity_code)
+            except Exception:
+                logger.exception(
+                    "ensure_internal_subscription failed for %s — non-fatal",
+                    body.entity_code,
+                )
+
         return _entity_to_dict(row)
 
 

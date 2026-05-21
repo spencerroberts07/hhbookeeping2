@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 
 export type AppRole = 'viewer' | 'bookkeeper' | 'approver' | 'admin';
-export type PlanTier = 'starter' | 'professional' | null;
+// 'internal' = owner/demo accounts. Same features as Professional, but
+// no Stripe relationship — see lib/api/billing.ts.
+export type PlanTier = 'starter' | 'professional' | 'internal' | null;
 
 interface UserState {
   clerkUserId: string | null;
@@ -63,7 +65,14 @@ export function useHasRole(min: AppRole): boolean {
 }
 
 export function useIsProfessional(): boolean {
-  return useUserStore((s) => s.planTier) === 'professional';
+  // Internal accounts (owner/demo) get every Professional feature for
+  // free — treat them as Professional for entitlement gates.
+  const tier = useUserStore((s) => s.planTier);
+  return tier === 'professional' || tier === 'internal';
+}
+
+export function useIsInternal(): boolean {
+  return useUserStore((s) => s.planTier) === 'internal';
 }
 
 export function useIsAdmin(): boolean {

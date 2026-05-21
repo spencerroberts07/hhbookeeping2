@@ -40,6 +40,37 @@ export default function BillingSettingsPage() {
     }
   };
 
+  // Owner / demo accounts — hide every Stripe surface.
+  // TODO: Replace with real Stripe subscription when this internal
+  // account is ready to be billed. Delete the billing_subscriptions
+  // row with plan_tier='internal' and run through this same checkout
+  // flow.
+  if (sub.data?.plan_tier === 'internal') {
+    return (
+      <div className="space-y-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Subscription</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2 mb-3">
+              <Badge
+                variant="locked"
+                className="bg-deep-navy text-white border-white/20 uppercase"
+              >
+                Owner
+              </Badge>
+              <Badge variant="complete">active</Badge>
+            </div>
+            <p className="text-sm text-slate">
+              This is an owner account. Billing is managed internally.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <Card>

@@ -3,7 +3,7 @@
 import { useClerk, useUser } from '@clerk/nextjs';
 import { LogOut } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
-import { useUserStore, useIsProfessional } from '@/lib/store/user';
+import { useUserStore, useIsInternal, useIsProfessional } from '@/lib/store/user';
 
 /**
  * Bottom of the sidebar — current user identity, plan tier badge, sign-out.
@@ -13,6 +13,21 @@ export function UserProfile() {
   const { signOut } = useClerk();
   const role = useUserStore((s) => s.role);
   const isProfessional = useIsProfessional();
+  const isInternal = useIsInternal();
+
+  // Plan badge:
+  //   internal  → "Owner"  (deep-navy chip; never prompts upgrade)
+  //   pro       → "Pro"    (teal)
+  //   else      → "Starter" (slate)
+  // TODO: Replace with real Stripe subscription when an internal account
+  // is ready to be billed. Delete the billing_subscriptions row with
+  // plan_tier='internal' and run through /settings/billing checkout flow.
+  const planLabel = isInternal ? 'Owner' : isProfessional ? 'Pro' : 'Starter';
+  const planVariant: 'complete' | 'secondary' | 'locked' = isInternal
+    ? 'locked'
+    : isProfessional
+      ? 'complete'
+      : 'secondary';
 
   if (!user) return null;
 
@@ -41,10 +56,13 @@ export function UserProfile() {
             <span className="truncate capitalize">{role ?? '—'}</span>
             <span>·</span>
             <Badge
-              variant={isProfessional ? 'complete' : 'secondary'}
-              className="text-[10px] uppercase tracking-wide"
+              variant={planVariant}
+              className={
+                'text-[10px] uppercase tracking-wide' +
+                (isInternal ? ' bg-deep-navy text-white border-white/20' : '')
+              }
             >
-              {isProfessional ? 'Pro' : 'Starter'}
+              {planLabel}
             </Badge>
           </div>
         </div>

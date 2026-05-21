@@ -5,8 +5,9 @@ import { useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { setTokenResolver } from '@/lib/api/client';
 import { useEntityStore } from '@/lib/store/entity';
-import { useUserStore } from '@/lib/store/user';
+import { useUserStore, type PlanTier } from '@/lib/store/user';
 import { getMyEntities } from '@/lib/api/me';
+import { getSubscription } from '@/lib/api/billing';
 
 /**
  * Wires the Clerk session into the Axios client and Zustand stores. Mount
@@ -65,6 +66,23 @@ export function ClerkTokenBridge({ children }: { children: React.ReactNode }) {
       useEntityStore.getState().setMemberships(memberships);
       return memberships;
     },
+  });
+
+  // Hydrate plan tier from the active entity's billing subscription.
+  // Internal-tier entities short-circuit Stripe in the backend, so this
+  // call is safe for owner/demo accounts too.
+  const activeEntityCode = useEntityStore((s) => s.activeEntityCode);
+  useQuery({
+    queryKey: ['me', 'subscription', activeEntityCode],
+    enabled: Boolean(authLoaded && isSignedIn && activeEntityCode),
+    queryFn: async () => {
+      const sub = await getSubscription(activeEntityCode!);
+      const tier = (sub.plan_tier as PlanTier) ?? null;
+      useUserStore.getState().setPlanTier(tier);
+      return sub;
+    },
+    // Cache for a couple minutes — plan tier doesn't change often.
+    staleTime: 2 * 60 * 1000,
   });
 
   return <>{children}</>;

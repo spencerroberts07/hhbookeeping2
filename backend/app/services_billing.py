@@ -49,6 +49,63 @@ def _stripe():
 
 
 # --------------------------------------------------------------------------
+# Plan-tier predicates + internal-account helpers
+# --------------------------------------------------------------------------
+
+
+def is_internal(plan_tier: str | None) -> bool:
+    return plan_tier == "internal"
+
+
+def is_starter(plan_tier: str | None) -> bool:
+    # Internal accounts get Professional feature parity, so they are
+    # NOT starter — every starter-only feature gate should fail for them.
+    return plan_tier == "starter"
+
+
+def is_professional(plan_tier: str | None) -> bool:
+    # Internal accounts get every Professional feature — treat them as
+    # professional for every entitlement check.
+    return plan_tier in {"professional", "internal"}
+
+
+def _is_internal_by_code(entity_code: str | None) -> bool:
+    """Safety-net check against the INTERNAL_ENTITY_CODES list and the
+    DEMO-* prefix. Lets an entity be treated as internal even when no
+    billing_subscriptions row has been seeded yet.
+    """
+    if not entity_code:
+        return False
+    if entity_code in (settings.internal_entity_codes or []):
+        return True
+    if entity_code.upper().startswith("DEMO-"):
+        return True
+    return False
+
+
+def _internal_subscription_payload(entity_code: str) -> dict[str, Any]:
+    """Shape returned to callers when an entity is internal-tier.
+    Mirrors get_subscription_for_entity's fields so frontend code never
+    has to special-case missing values.
+
+    TODO: Replace with real Stripe subscription when owner is ready to
+    be billed. Simply delete the billing_subscriptions row with
+    plan_tier='internal' and run through /settings/billing checkout
+    flow.
+    """
+    return {
+        "status": "active",
+        "plan_tier": "internal",
+        "current_period_end": None,
+        "trial_end": None,
+        "cancel_at_period_end": False,
+        "store_count": 1,
+        "customer_id": None,
+        "message": "Owner account — no billing required",
+    }
+
+
+# --------------------------------------------------------------------------
 # Customer lookup / create
 # --------------------------------------------------------------------------
 
@@ -218,7 +275,18 @@ def get_subscription_for_entity(
     """
     Returns the subscription row for an entity. Empty values when the entity
     has no subscription yet (e.g. mid-trial-signup or post-cancel).
+
+    Internal-tier entities short-circuit before any Stripe state is
+    consulted: any entity in settings.internal_entity_codes (or with a
+    'DEMO-' prefix) gets a synthetic internal payload even if no
+    billing_subscriptions row exists. This is the safety net for owner
+    + demo stores that should never hit Stripe.
     """
+    # Safety-net fallback — checked first so configuration drift can't
+    # accidentally bill an owner/demo entity.
+    if _is_internal_by_code(entity_code):
+        return _internal_subscription_payload(entity_code)
+
     entity = session.execute(
         text("SELECT id FROM entities WHERE entity_code = :code"),
         {"code": entity_code},
@@ -253,6 +321,12 @@ def get_subscription_for_entity(
             "customer_id": None,
         }
 
+    # Explicit internal subscription in the DB — short-circuit Stripe
+    # values too (current_period_end is set to 100yrs out by migration
+    # 031; we hide it to avoid confusion).
+    if is_internal(row["plan_tier"]):
+        return _internal_subscription_payload(entity_code)
+
     return {
         "status": row["status"],
         "plan_tier": row["plan_tier"],
@@ -266,6 +340,69 @@ def get_subscription_for_entity(
         "store_count": int(row["store_count"]),
         "customer_id": row["stripe_customer_id"],
     }
+
+
+def ensure_internal_subscription(
+    session, *, entity_code: str
+) -> None:
+    """Create a billing_subscriptions row at plan_tier='internal' for
+    the given entity if one doesn't already exist. Used when POST
+    /api/entities receives a DEMO-* code or an explicit internal flag.
+
+    Idempotent. No-op when the entity already has any subscription row.
+    """
+    entity = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :code"),
+        {"code": entity_code},
+    ).mappings().first()
+    if not entity:
+        return
+
+    existing = session.execute(
+        text(
+            "SELECT 1 FROM billing_subscriptions WHERE entity_id = :eid LIMIT 1"
+        ),
+        {"eid": entity["id"]},
+    ).first()
+    if existing:
+        return
+
+    # Re-use the singleton internal billing_customers row created by
+    # migration 031. Create-if-missing keeps this resilient.
+    customer = session.execute(
+        text(
+            """
+            INSERT INTO billing_customers (clerk_user_id, stripe_customer_id, name)
+            VALUES ('internal_owner', 'internal_owner',
+                    'BookWize Internal — Owner & Demo Accounts')
+            ON CONFLICT (clerk_user_id) DO UPDATE
+               SET updated_at = NOW()
+            RETURNING id
+            """
+        )
+    ).mappings().first()
+    if not customer:
+        return
+
+    session.execute(
+        text(
+            """
+            INSERT INTO billing_subscriptions (
+                entity_id, billing_customer_id, stripe_subscription_id,
+                plan_tier, status, current_period_end, cancel_at_period_end
+            ) VALUES (
+                :eid, :cid, :sid, 'internal', 'active',
+                NOW() + INTERVAL '100 years', FALSE
+            )
+            ON CONFLICT (entity_id) DO NOTHING
+            """
+        ),
+        {
+            "eid": entity["id"],
+            "cid": customer["id"],
+            "sid": f"internal_owner:{entity_code}",
+        },
+    )
 
 
 def upsert_subscription_from_webhook(

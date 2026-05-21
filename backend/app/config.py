@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_endpoint_url: str = ""
 
+    # Internal-tier entities. Any entity in this list is treated as
+    # plan_tier='internal' (all Professional features, no Stripe) even
+    # if no billing_subscriptions row exists — fallback safety net.
+    #
+    # Add new owner/demo entity codes here. The DB seed in migration 031
+    # also marks the explicit billing_subscriptions row for Bridlewood
+    # as 'internal'; this list is the second line of defence.
+    #
+    # TODO: Replace with real Stripe subscription when an entity in this
+    # list is ready to be billed. Remove the code from this list AND
+    # delete its billing_subscriptions row with plan_tier='internal',
+    # then run the dealer through /settings/billing checkout flow.
+    internal_entity_codes: list[str] = ["1877-8"]
+
     @property
     def r2_enabled(self) -> bool:
         return bool(
