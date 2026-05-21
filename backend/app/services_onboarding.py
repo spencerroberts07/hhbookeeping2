@@ -130,7 +130,14 @@ def detect_existing_data(session, entity_id: str) -> dict[str, Any]:
     hh_ap = session.execute(
         text(
             """
-            SELECT COUNT(DISTINCT date_trunc('month', s.period_start)) AS months
+            -- hh_ap_statements has no period_start column. statement_month_end
+            -- is the canonical "which month does this statement cover"
+            -- column; statement_date is the issue date and is the
+            -- fallback for older rows that pre-date statement_month_end.
+            SELECT COUNT(DISTINCT date_trunc(
+                'month',
+                COALESCE(s.statement_month_end, s.statement_date)
+            )) AS months
               FROM hh_ap_statements s
              WHERE s.entity_id = :eid
             """
@@ -1191,22 +1198,35 @@ def learn_from_gl_history(
         session.execute(
             text(
                 """
+                -- vendor_classification_memory schema notes:
+                --   * confidence_score is numeric(4,3) — 0.000 to ~9.999.
+                --     Production data uses a 0-1 scale (default 0.500).
+                --   * source is CHECK-constrained to
+                --     ('gl_history','user_confirmed','ai_seeded').
+                --   * Unique constraint is (entity_id, normalized_vendor_key,
+                --     account_code) — three columns, not two.
+                --   * No `created_at` column — `first_seen_at` is auto-set
+                --     to NOW() by the column default.
                 INSERT INTO vendor_classification_memory (
                     entity_id, normalized_vendor_key, account_code,
                     debit_or_credit, occurrences_count, confidence_score,
-                    source, last_seen_at, created_at
+                    source, last_seen_at
                 ) VALUES (
-                    :eid, :key, :acct, :dr_cr, :n, 85,
-                    'gl_history_bootstrap', NOW(), NOW()
+                    :eid, :key, :acct, :dr_cr, :n, 0.85,
+                    'gl_history', NOW()
                 )
-                ON CONFLICT (entity_id, normalized_vendor_key) DO UPDATE
-                   SET account_code = EXCLUDED.account_code,
-                       debit_or_credit = EXCLUDED.debit_or_credit,
+                ON CONFLICT (entity_id, normalized_vendor_key, account_code) DO UPDATE
+                   SET debit_or_credit = EXCLUDED.debit_or_credit,
                        occurrences_count = vendor_classification_memory.occurrences_count
                            + EXCLUDED.occurrences_count,
-                       confidence_score = LEAST(100, GREATEST(
-                           vendor_classification_memory.confidence_score, 85
-                       )),
+                       confidence_score = LEAST(
+                           1,
+                           GREATEST(
+                               vendor_classification_memory.confidence_score,
+                               0.85
+                           )
+                       ),
+                       source = 'gl_history',
                        last_seen_at = NOW()
                 """
             ),
