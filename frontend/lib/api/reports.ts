@@ -171,4 +171,24 @@ export const PLAN_FEATURES: Record<PlanTier, string[]> = {
     'CSV exports',
     'Up to 5 team members',
   ],
+  // Owner / demo accounts — same feature surface as Professional with
+  // no billing relationship. The pricing page hides this tier; the
+  // entry exists so Record<PlanTier, ...> stays exhaustive.
+  // TODO: Replace with real Stripe subscription when owner is ready to
+  // be billed. Delete the billing_subscriptions row with
+  // plan_tier='internal' and run through /settings/billing checkout flow.
+  internal: [
+    'Dashboard',
+    'Transactions',
+    'Reports',
+    'Month-end workflow',
+    'AI Assistant',
+    'Payroll',
+    'AP module',
+    'Bank module',
+    'Multi-entity',
+    'Audit trail',
+    'Document storage',
+    'Priority support',
+  ],
 };
