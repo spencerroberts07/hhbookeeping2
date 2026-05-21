@@ -91,10 +91,12 @@ def post_approve(
     body: ApproveRequest,
     _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
-            return approve_period_close(
+            result = approve_period_close(
                 session,
                 entity_code=body.entity_code,
                 period_end=body.period_end,
@@ -107,6 +109,21 @@ def post_approve(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Period-close learning hook (D1). Runs OUTSIDE the close transaction
+    # — failure here writes a log line and is never allowed to roll
+    # back the period close itself.
+    try:
+        from ..services_assistant import learn_from_period_close as _learn
+        with db_session() as session:
+            _learn(session, entity_code=body.entity_code, period_end=body.period_end)
+    except Exception:
+        _log.exception(
+            "learn_from_period_close failed for %s/%s — non-fatal",
+            body.entity_code, body.period_end,
+        )
+
+    return result
 
 
 @router.post("/reopen")

@@ -33,6 +33,7 @@ from ..services_assistant import (
     AssistantReply,
     IntentResult,
     ProposedAction,
+    generate_app_improvement_insights,
     build_entity_context,
     execute_action,
     find_matching_transaction,
@@ -465,6 +466,25 @@ def delete_memory(
             {"id": memory_id, "ec": entity_code},
         )
     return {"ok": True, "deleted": res.rowcount}
+
+
+# --------------------------------------------------------------------------
+# App-improvement insights — surfaced on the dashboard.
+# --------------------------------------------------------------------------
+
+
+@router.get("/insights")
+def get_insights(
+    entity_code: str = Query(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    with db_session() as session:
+        try:
+            insights = generate_app_improvement_insights(session, entity_code)
+        except Exception:
+            logger.exception("generate_app_improvement_insights failed")
+            insights = []
+    return {"entity_code": entity_code, "insights": insights, "count": len(insights)}
 
 
 # --------------------------------------------------------------------------

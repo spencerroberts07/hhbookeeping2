@@ -65,7 +65,7 @@ async def post_upload(
     file_bytes = await file.read()
     try:
         with db_session() as session:
-            return run_bank_pdf_import(
+            result = run_bank_pdf_import(
                 session=session,
                 entity_code=entity_code,
                 file_bytes=file_bytes,
@@ -75,6 +75,17 @@ async def post_upload(
                 actor_email=actor_email,
                 note=note,
             )
+            # Pending-intent matcher (D2) — see bank_csv.py for context.
+            try:
+                from ..services_assistant import check_pending_intents as _cpi
+                _cpi(session, entity_code)
+            except Exception:
+                import logging as _l
+                _l.getLogger(__name__).exception(
+                    "check_pending_intents failed for %s — non-fatal",
+                    entity_code,
+                )
+            return result
     except HTTPException:
         raise
     except PeriodLockedError as exc:

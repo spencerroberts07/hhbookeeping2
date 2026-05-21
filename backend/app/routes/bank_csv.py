@@ -153,6 +153,20 @@ async def bank_csv_upload(
                     ),
                     {"p": object_key, "id": run_id},
                 )
+
+            # Pending-intent matcher (D2). Tries to reconcile any
+            # assistant notes ("I paid $X for Y on date Z") against the
+            # bank transactions we just imported. Non-fatal on failure.
+            try:
+                from ..services_assistant import check_pending_intents as _cpi
+                _cpi(session, entity_code)
+            except Exception:
+                import logging as _l
+                _l.getLogger(__name__).exception(
+                    "check_pending_intents failed for %s — non-fatal",
+                    entity_code,
+                )
+
             return result
     except HTTPException:
         raise

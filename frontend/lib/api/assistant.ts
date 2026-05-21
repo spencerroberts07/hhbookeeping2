@@ -127,3 +127,27 @@ export async function getAssistantMemory(
   });
   return res.data;
 }
+
+export interface AssistantInsight {
+  type: string;
+  description: string;
+  severity: 'info' | 'warning' | 'action';
+  action?: string;
+  action_url?: string;
+}
+
+export interface AssistantInsightsResponse {
+  entity_code: string;
+  insights: AssistantInsight[];
+  count: number;
+}
+
+export async function getAssistantInsights(
+  entityCode: string,
+): Promise<AssistantInsightsResponse> {
+  const res = await api.get<AssistantInsightsResponse>(
+    '/api/assistant/insights',
+    { params: { entity_code: entityCode } },
+  );
+  return res.data;
+}

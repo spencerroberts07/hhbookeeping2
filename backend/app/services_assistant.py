@@ -1357,6 +1357,389 @@ def _upsert_memory(
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# 2G. Period-close learning hook
+# --------------------------------------------------------------------------
+
+
+def learn_from_period_close(
+    session, *, entity_code: str, period_end: str | DateType
+) -> dict[str, Any]:
+    """Called from POST /api/period-close/approve right after a period
+    flips to closed. Writes a clutch of `assistant_period_observations`
+    rows so the conversational assistant can reason about close cadence,
+    variances, and recurring journals.
+
+    Failure-isolated: caller wraps in try/except + logger.error so a
+    learning hiccup never rolls back the period close.
+    """
+    if isinstance(period_end, str):
+        try:
+            period_end_d = datetime.strptime(period_end, "%Y-%m-%d").date()
+        except ValueError:
+            return {"observations_created": 0, "skipped": "bad date"}
+    else:
+        period_end_d = period_end
+
+    entity = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :ec"),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not entity:
+        return {"observations_created": 0, "skipped": "unknown entity"}
+
+    period = session.execute(
+        text(
+            """
+            SELECT id, period_label, period_start, closed_at
+              FROM accounting_periods
+             WHERE entity_id = :eid AND period_end = :pe
+             LIMIT 1
+            """
+        ),
+        {"eid": entity["id"], "pe": period_end_d},
+    ).mappings().first()
+    if not period:
+        return {"observations_created": 0, "skipped": "period not found"}
+
+    observations_created = 0
+
+    def _obs(observation_type: str, observation: str, severity: str = "info",
+             account_code: str | None = None, amount: Decimal | None = None) -> None:
+        nonlocal observations_created
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO assistant_period_observations (
+                        entity_code, period_end, observation_type,
+                        observation, account_code, amount, severity
+                    ) VALUES (
+                        :ec, :pe, :ot, :ob, :ac, :am, :sv
+                    )
+                    """
+                ),
+                {
+                    "ec": entity_code,
+                    "pe": period_end_d,
+                    "ot": observation_type,
+                    "ob": observation[:1000],
+                    "ac": account_code,
+                    "am": amount,
+                    "sv": severity,
+                },
+            )
+            observations_created += 1
+        except Exception:
+            logger.exception("learn_from_period_close obs insert failed")
+
+    # 1. Close duration — how many days from period_end to closed_at.
+    if period["closed_at"]:
+        try:
+            duration_days = (period["closed_at"].date() - period_end_d).days
+            _obs(
+                "close_duration_days",
+                f"Closed {period['period_label']} {duration_days} days after period end",
+                severity="info",
+                amount=Decimal(str(duration_days)),
+            )
+        except Exception:
+            pass
+
+    # 2. Journal counts by source_module.
+    counts = session.execute(
+        text(
+            """
+            SELECT source_module, COUNT(*) AS c,
+                   COALESCE(SUM(total_debits), 0) AS total_dr
+              FROM journal_batches
+             WHERE entity_id = :eid
+               AND accounting_period_id = :pid
+               AND status NOT IN ('voided', 'rejected')
+             GROUP BY source_module
+             ORDER BY c DESC
+            """
+        ),
+        {"eid": entity["id"], "pid": period["id"]},
+    ).mappings().all()
+    for row in counts:
+        _obs(
+            "journal_created",
+            f"{row['c']} {row['source_module']} journal{'s' if row['c'] != 1 else ''}",
+            account_code=None,
+            amount=Decimal(str(row["total_dr"])),
+        )
+
+    # 3. Unusual amounts — any single batch over $500k stands out.
+    big = session.execute(
+        text(
+            """
+            SELECT source_module, batch_label, total_debits
+              FROM journal_batches
+             WHERE entity_id = :eid
+               AND accounting_period_id = :pid
+               AND total_debits > 500000
+             ORDER BY total_debits DESC LIMIT 5
+            """
+        ),
+        {"eid": entity["id"], "pid": period["id"]},
+    ).mappings().all()
+    for row in big:
+        _obs(
+            "unusual_amount",
+            f"{row['source_module']} batch {row['batch_label']!r} "
+            f"= ${float(row['total_debits']):,.0f}",
+            severity="anomaly",
+            amount=Decimal(str(row["total_debits"])),
+        )
+
+    # 4. New vendors — vendor_classification_memory rows last_seen during
+    #    this period (heuristic: created_at within period_start..period_end).
+    new_vendors = session.execute(
+        text(
+            """
+            SELECT normalized_vendor_key, account_code
+              FROM vendor_classification_memory
+             WHERE entity_id = :eid
+               AND first_seen_at >= :ps
+               AND first_seen_at <= :pe::date + INTERVAL '1 day'
+             ORDER BY first_seen_at DESC LIMIT 5
+            """
+        ),
+        {"eid": entity["id"], "ps": period["period_start"], "pe": period_end_d},
+    ).mappings().all()
+    if new_vendors:
+        _obs(
+            "new_vendor",
+            f"{len(new_vendors)} new vendor pattern{'s' if len(new_vendors) != 1 else ''} learned this period",
+        )
+
+    return {
+        "observations_created": observations_created,
+        "period_label": period["period_label"],
+    }
+
+
+# --------------------------------------------------------------------------
+# 2H. Pending-intent matcher (runs after bank-statement upload)
+# --------------------------------------------------------------------------
+
+
+def check_pending_intents(session, entity_code: str) -> dict[str, Any]:
+    """Iterate over `pending` assistant_pending_intents and try to match
+    each against bank_transactions that have arrived since the intent
+    was recorded. On a confident match, flip the intent status to
+    'matched' and stamp the matched_transaction_id.
+
+    Heuristic: same amount ± $0.50, transaction_date within ±5 days of
+    parsed_date. The assistant later picks up these matched intents
+    and finishes the classification.
+    """
+    pending = session.execute(
+        text(
+            """
+            SELECT id, parsed_amount, parsed_date, parsed_description
+              FROM assistant_pending_intents
+             WHERE entity_code = :ec
+               AND status = 'pending'
+               AND expires_at > NOW()
+               AND parsed_amount IS NOT NULL
+             ORDER BY created_at DESC
+             LIMIT 50
+            """
+        ),
+        {"ec": entity_code},
+    ).mappings().all()
+    if not pending:
+        return {"checked": 0, "matched": 0}
+
+    entity = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :ec"),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not entity:
+        return {"checked": 0, "matched": 0}
+
+    matched = 0
+    for intent in pending:
+        amt = abs(Decimal(str(intent["parsed_amount"] or 0)))
+        if amt <= 0:
+            continue
+        params: dict[str, Any] = {
+            "eid": entity["id"],
+            "lo": amt - Decimal("0.50"),
+            "hi": amt + Decimal("0.50"),
+        }
+        where_date = ""
+        if intent["parsed_date"]:
+            params["d_lo"] = intent["parsed_date"] - timedelta(days=5)
+            params["d_hi"] = intent["parsed_date"] + timedelta(days=5)
+            where_date = "AND transaction_date BETWEEN :d_lo AND :d_hi"
+        candidate = session.execute(
+            text(
+                f"""
+                SELECT id FROM bank_transactions
+                 WHERE entity_id = :eid
+                   AND ABS(amount) BETWEEN :lo AND :hi
+                   AND review_status IN ('new', 'needs_review')
+                   {where_date}
+                 ORDER BY transaction_date DESC
+                 LIMIT 1
+                """
+            ),
+            params,
+        ).mappings().first()
+        if not candidate:
+            continue
+        session.execute(
+            text(
+                """
+                UPDATE assistant_pending_intents
+                   SET status = 'matched',
+                       matched_transaction_id = :tid
+                 WHERE id = :id
+                """
+            ),
+            {"id": intent["id"], "tid": candidate["id"]},
+        )
+        matched += 1
+
+    return {"checked": len(pending), "matched": matched}
+
+
+# --------------------------------------------------------------------------
+# 2I. App-improvement insights
+# --------------------------------------------------------------------------
+
+
+def generate_app_improvement_insights(
+    session, entity_code: str
+) -> list[dict[str, Any]]:
+    """Aggregate signals from observations + memory + classification
+    quality and surface the top 3-10 things the dealer can act on.
+    Each insight has a type, description, severity, optional action.
+    """
+    entity = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :ec"),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not entity:
+        return []
+
+    out: list[dict[str, Any]] = []
+
+    # 1. Periods overdue.
+    overdue = session.execute(
+        text(
+            """
+            SELECT period_label, period_end FROM accounting_periods
+             WHERE entity_id = :eid
+               AND period_end < CURRENT_DATE - INTERVAL '14 days'
+               AND status NOT IN ('closed')
+             ORDER BY period_end DESC LIMIT 1
+            """
+        ),
+        {"eid": entity["id"]},
+    ).mappings().first()
+    if overdue:
+        out.append({
+            "type": "period_overdue",
+            "description": (
+                f"{overdue['period_label']} is more than 2 weeks past "
+                f"month-end — close it to keep reporting current"
+            ),
+            "severity": "action",
+            "action": "Open month-end",
+            "action_url": "/month-end",
+        })
+
+    # 2. Unclassified bank transactions ramp.
+    unc = session.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c FROM bank_transactions
+             WHERE entity_id = :eid
+               AND review_status IN ('new', 'needs_review')
+            """
+        ),
+        {"eid": entity["id"]},
+    ).mappings().first()
+    if int(unc["c"]) > 50:
+        out.append({
+            "type": "unclassified_backlog",
+            "description": (
+                f"{unc['c']} bank transactions unclassified — run the "
+                f"auto-classifier or review them in /bank"
+            ),
+            "severity": "warning",
+            "action": "Review bank",
+            "action_url": "/bank",
+        })
+
+    # 3. Vendor memory size — proxy for "assistant is getting smarter".
+    vendors = session.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c FROM vendor_classification_memory
+             WHERE entity_id = :eid
+            """
+        ),
+        {"eid": entity["id"]},
+    ).mappings().first()
+    if int(vendors["c"]) > 0:
+        out.append({
+            "type": "vendor_memory_size",
+            "description": (
+                f"AI assistant has learned {vendors['c']} vendor pattern"
+                f"{'s' if int(vendors['c']) != 1 else ''} for this store"
+            ),
+            "severity": "info",
+        })
+
+    # 4. Pending intents waiting for a bank match.
+    pending = session.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c FROM assistant_pending_intents
+             WHERE entity_code = :ec AND status = 'pending'
+               AND expires_at > NOW()
+            """
+        ),
+        {"ec": entity_code},
+    ).mappings().first()
+    if int(pending["c"]) > 0:
+        out.append({
+            "type": "pending_intents",
+            "description": (
+                f"{pending['c']} note{'s' if int(pending['c']) != 1 else ''} from "
+                f"chat waiting for a matching bank transaction"
+            ),
+            "severity": "info",
+            "action": "View chat",
+            "action_url": "/dashboard",
+        })
+
+    # 5. Recent anomalies from period observations.
+    recent_anomalies = session.execute(
+        text(
+            """
+            SELECT observation, period_end FROM assistant_period_observations
+             WHERE entity_code = :ec AND severity = 'anomaly'
+             ORDER BY period_end DESC, created_at DESC LIMIT 2
+            """
+        ),
+        {"ec": entity_code},
+    ).mappings().all()
+    for r in recent_anomalies:
+        out.append({
+            "type": "anomaly",
+            "description": f"{r['observation']} (in {r['period_end']})",
+            "severity": "warning",
+        })
+
+    return out
+
+
 def get_balance_summary(session, entity_code: str) -> str | None:
     """Used by /api/assistant/message when intent is query_balance — pulls
     the most recent cash_balancing_days row and renders a one-liner.

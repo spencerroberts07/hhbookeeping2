@@ -22,6 +22,7 @@ import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
 import { QuickActions } from './_components/quick-actions';
 import { AlertsFeed } from './_components/alerts-feed';
+import { InsightsCard } from './_components/insights-card';
 import { CalendarPlus, Sparkles } from 'lucide-react';
 import type { AxiosError } from 'axios';
 import Link from 'next/link';
@@ -364,6 +365,10 @@ export default function DashboardPage() {
               <QuickActions />
             </CardContent>
           </Card>
+        </section>
+
+        <section>
+          <InsightsCard />
         </section>
       </main>
       <AssistantWidget />

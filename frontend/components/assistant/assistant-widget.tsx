@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles, X, Send, Minus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
@@ -9,6 +9,7 @@ import { useUserStore } from '@/lib/store/user';
 import {
   sendAssistantMessage,
   confirmAssistantAction,
+  getAssistantInsights,
   type MessageResponse,
 } from '@/lib/api/assistant';
 import { AssistantMessage, type AssistantMessageItem } from './assistant-message';
@@ -252,6 +253,10 @@ export function AssistantWidget() {
         )}
       </div>
 
+      {/* Quick-action chips — contextual prompts based on period state.
+          Always visible; chips with no data signal collapse to nothing. */}
+      <QuickActionChips onPick={(prompt) => setInput(prompt)} />
+
       {/* Input */}
       <div className="border-t border-border bg-white p-2">
         <div className="flex items-end gap-2">
@@ -277,6 +282,59 @@ export function AssistantWidget() {
           </Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+// --------------------------------------------------------------------------
+// Quick-action chips
+//
+// Contextual prompts that pre-fill the chat input. The "always" chips
+// show every time; period-conditional ones surface based on insights
+// already on the page (we piggyback on the dashboard's existing
+// queries via React Query cache to avoid an extra fetch).
+// --------------------------------------------------------------------------
+
+
+function QuickActionChips({ onPick }: { onPick: (prompt: string) => void }) {
+  const entityCode = useEntityStore((s) => s.activeEntityCode);
+  // Insights cache is shared with the dashboard insights card; if the
+  // dealer isn't on the dashboard it's a fresh fetch, but small.
+  const insights = useQuery({
+    queryKey: ['assistant-insights', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getAssistantInsights(entityCode!),
+    staleTime: 60_000,
+  });
+
+  const chips: string[] = ["What's my cash balance?", "How's my gross margin?"];
+  const types = new Set((insights.data?.insights ?? []).map((i) => i.type));
+  if (types.has('unclassified_backlog')) {
+    chips.push('Review my unclassified transactions');
+  }
+  if (types.has('period_overdue')) {
+    chips.push("What's left for this month-end close?");
+  }
+  if (types.has('pending_intents')) {
+    chips.push('Check my pending notes');
+  }
+  if (types.has('anomaly')) {
+    chips.push('Explain my largest variance');
+  }
+
+  return (
+    <div className="border-t border-border bg-cloud/40 px-2 py-1.5 flex gap-1.5 flex-wrap">
+      {chips.map((c) => (
+        <button
+          key={c}
+          type="button"
+          onClick={() => onPick(c)}
+          className="text-[11px] rounded-full border border-border bg-white px-2.5 py-1 text-deep-navy hover:bg-cloud transition-colors"
+        >
+          {c}
+        </button>
+      ))}
     </div>
   );
 }
