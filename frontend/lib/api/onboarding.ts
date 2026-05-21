@@ -44,6 +44,37 @@ export interface ChartPreviewResponse {
   };
 }
 
+export interface ChartParseProgress {
+  job_id: string;
+  job_type: 'parse_chart_of_accounts';
+  status: 'pending' | 'running' | 'complete' | 'error';
+  pct_complete: number;
+  current_step: string | null;
+  preview: { accounts: ChartPreviewAccount[]; count: number } | null;
+  filename: string | null;
+  entity_code: string | null;
+  error: string | null;
+}
+
+export interface TbParseProgress {
+  job_id: string;
+  job_type: 'parse_trial_balance';
+  status: 'pending' | 'running' | 'complete' | 'error';
+  pct_complete: number;
+  current_step: string | null;
+  preview: {
+    tb_lines: TbPreviewLine[];
+    total_debits: number;
+    total_credits: number;
+    variance: number;
+    balanced: boolean;
+  } | null;
+  filename: string | null;
+  entity_code: string | null;
+  as_of_date: string | null;
+  error: string | null;
+}
+
 export interface ChartConfirmResponse {
   entity_code: string;
   saved_count: number;
@@ -129,14 +160,25 @@ export async function uploadChartFile(input: {
   entity_code: string;
   actor_email: string;
   file: File;
-}): Promise<ChartPreviewResponse> {
+}): Promise<GLJobResponse> {
   const fd = new FormData();
   fd.append('entity_code', input.entity_code);
   fd.append('actor_email', input.actor_email);
   fd.append('file', input.file);
-  const res = await api.post<ChartPreviewResponse>(
+  // Returns immediately with a job_id — the wizard polls
+  // getChartParseProgress for the actual preview.
+  const res = await api.post<GLJobResponse>(
     '/api/onboarding/chart-of-accounts/upload',
     fd,
+  );
+  return res.data;
+}
+
+export async function getChartParseProgress(
+  jobId: string,
+): Promise<ChartParseProgress> {
+  const res = await api.get<ChartParseProgress>(
+    `/api/onboarding/chart-of-accounts/progress/${jobId}`,
   );
   return res.data;
 }
@@ -169,15 +211,26 @@ export async function uploadOpeningBalancesFile(input: {
   actor_email: string;
   as_of_date: string;
   file: File;
-}): Promise<TbPreviewResponse> {
+}): Promise<GLJobResponse> {
   const fd = new FormData();
   fd.append('entity_code', input.entity_code);
   fd.append('actor_email', input.actor_email);
   fd.append('as_of_date', input.as_of_date);
   fd.append('file', input.file);
-  const res = await api.post<TbPreviewResponse>(
+  // Returns immediately with a job_id — the wizard polls
+  // getOpeningBalancesParseProgress for the actual preview.
+  const res = await api.post<GLJobResponse>(
     '/api/onboarding/opening-balances/upload',
     fd,
+  );
+  return res.data;
+}
+
+export async function getOpeningBalancesParseProgress(
+  jobId: string,
+): Promise<TbParseProgress> {
+  const res = await api.get<TbParseProgress>(
+    `/api/onboarding/opening-balances/progress/${jobId}`,
   );
   return res.data;
 }

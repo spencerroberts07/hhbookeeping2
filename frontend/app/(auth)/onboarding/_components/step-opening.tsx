@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useUser } from '@clerk/nextjs';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEntityStore } from '@/lib/store/entity';
@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import {
   confirmOpeningBalances,
   getOnboardingStatus,
+  getOpeningBalancesParseProgress,
   pullOpeningBalancesFromQbo,
   uploadOpeningBalancesFile,
   type TbPreviewLine,
@@ -43,7 +44,50 @@ export function StepOpening() {
   const existing = status.data?.has_opening_balances;
 
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [parseJobId, setParseJobId] = useState<string | null>(null);
+  const [parseStep, setParseStep] = useState<string | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+  useEffect(() => () => stopPolling(), []);
+
+  const startPolling = (jobId: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const p = await getOpeningBalancesParseProgress(jobId);
+        setParseStep(p.current_step);
+        if (p.status === 'complete' && p.preview) {
+          stopPolling();
+          setParseJobId(null);
+          setPreview(p.preview);
+          if (p.preview.balanced) {
+            toast.success(
+              `Trial balance parsed — ${p.preview.tb_lines.length} accounts, balanced`,
+            );
+          } else {
+            toast.warning(
+              `Out of balance by ${formatMoney(p.preview.variance, { signed: true })}`,
+            );
+          }
+        } else if (p.status === 'error') {
+          stopPolling();
+          setParseJobId(null);
+          setParseError(p.error || 'Parser failed');
+          toast.error(p.error || 'Could not parse the trial balance');
+        }
+      } catch {
+        // 404 / transient — try again next tick.
+      }
+    }, 3000);
+  };
 
   const qboMutation = useMutation({
     mutationFn: () =>
@@ -69,17 +113,15 @@ export function StepOpening() {
         file,
       }),
     onSuccess: (res) => {
-      setPreview(res.preview);
-      if (res.preview.balanced) {
-        toast.success(`Trial balance parsed — ${res.preview.tb_lines.length} accounts, balanced`);
-      } else {
-        toast.warning(
-          `Out of balance by ${formatMoney(res.preview.variance, { signed: true })}`,
-        );
-      }
+      // The upload endpoint now kicks off a background parse and
+      // returns a job_id; poll for the preview.
+      setParseError(null);
+      setParseJobId(res.job_id);
+      setParseStep('Queued');
+      startPolling(res.job_id);
     },
     onError: (err: Error) =>
-      toast.error(err.message || 'Could not parse the trial balance'),
+      toast.error(err.message || 'Could not start the parse'),
   });
 
   const confirmMutation = useMutation({
@@ -257,6 +299,75 @@ export function StepOpening() {
           <Button variant="ghost" onClick={prev}>← Back</Button>
           <Button variant="accent" size="lg" onClick={next}>Continue →</Button>
         </div>
+      </div>
+    );
+  }
+
+  // Parsing in progress
+  if (parseJobId) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-h2 text-deep-navy">Parsing your trial balance…</h2>
+          <p className="text-slate mt-1">
+            Large files take a minute. CSV exports parse instantly; unusual
+            formats fall back to AI.
+          </p>
+        </div>
+        <div className="rounded-xl bg-cloud p-8 text-center">
+          <Loader2 className="h-8 w-8 text-ledger-blue mx-auto animate-spin" />
+          <p className="text-sm text-slate mt-3">
+            {parseStep || 'Working on it…'}
+          </p>
+        </div>
+        <div className="flex justify-between pt-2">
+          <Button
+            variant="ghost"
+            onClick={() => {
+              stopPolling();
+              setParseJobId(null);
+              setParseStep(null);
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Parse error
+  if (parseError) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-h2 text-deep-navy">Couldn't parse that file</h2>
+          <div className="rounded-xl border-2 border-amber-300 bg-amber-50 p-4 mt-3">
+            <p className="text-sm text-amber-900">{parseError}</p>
+          </div>
+        </div>
+        <div className="flex justify-between pt-2">
+          <Button variant="ghost" onClick={prev}>← Back</Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setParseError(null);
+              fileInputRef.current?.click();
+            }}
+          >
+            Try a different file
+          </Button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,.xlsx,.xls,.txt"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) uploadMutation.mutate(f);
+          }}
+        />
       </div>
     );
   }

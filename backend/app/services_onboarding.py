@@ -57,6 +57,8 @@ Reliability notes:
 from __future__ import annotations
 
 import calendar
+import csv
+import io
 import json
 import logging
 import re
@@ -79,6 +81,7 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL_ID = "claude-sonnet-4-6"
 CLAUDE_PARSE_MAX_TOKENS = 8000
+CLAUDE_CALL_TIMEOUT_SECONDS = 60
 
 
 # --------------------------------------------------------------------------
@@ -282,20 +285,35 @@ def _claude_parse_json(system_prompt: str, file_text: str) -> dict[str, Any] | N
     """Run a Claude call expecting a single JSON object back. Returns None
     when the model is unavailable or returns un-parseable text — the
     route layer converts that to a 400 with a clear message.
+
+    Calls Claude with a 60s per-attempt timeout and one retry on
+    transient failure. Callers should try a regex fallback before
+    calling this for known-format files.
     """
     client = _claude_client()
     if not client:
         logger.warning("Claude unavailable — file parser degraded to None")
         return None
-    try:
-        msg = client.messages.create(
-            model=CLAUDE_MODEL_ID,
-            max_tokens=CLAUDE_PARSE_MAX_TOKENS,
-            system=system_prompt,
-            messages=[{"role": "user", "content": file_text[:200_000]}],
-        )
-    except Exception as exc:
-        logger.warning("Claude file-parse call failed: %r", exc)
+
+    msg = None
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            msg = client.messages.create(
+                model=CLAUDE_MODEL_ID,
+                max_tokens=CLAUDE_PARSE_MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": file_text[:200_000]}],
+                timeout=CLAUDE_CALL_TIMEOUT_SECONDS,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Claude file-parse attempt %d failed: %r", attempt, exc
+            )
+    if msg is None:
+        logger.warning("Claude file-parse exhausted retries: %r", last_exc)
         return None
 
     text_out = ""
@@ -321,6 +339,455 @@ def _claude_parse_json(system_prompt: str, file_text: str) -> dict[str, Any] | N
         except json.JSONDecodeError:
             logger.warning("Claude returned non-JSON: %r", text_out[:200])
             return None
+
+
+# --------------------------------------------------------------------------
+# Regex / CSV fallback parsers
+#
+# Cheaper, faster, deterministic. Each parser returns None when it can't
+# confidently identify the format — caller then falls back to Claude.
+# Handles ~90% of cases (QBO TB export, Sage exports, simple CSV/Excel).
+# --------------------------------------------------------------------------
+
+
+_AMOUNT_KEYWORDS_DEBIT = ("debit", " dr ", "\tdr", ",dr", "dr,", "(dr)")
+_AMOUNT_KEYWORDS_CREDIT = ("credit", " cr ", "\tcr", ",cr", "cr,", "(cr)")
+
+
+def _read_csv_rows(file_text: str) -> list[list[str]]:
+    """Read CSV-style text into a list of row-lists. Tolerates extra
+    whitespace and BOMs. Empty input returns []."""
+    if not file_text:
+        return []
+    try:
+        # Sniff the dialect — QBO and Excel exports vary on delimiter.
+        sample = file_text[:8000]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        except csv.Error:
+            dialect = csv.excel  # type: ignore[assignment]
+        reader = csv.reader(io.StringIO(file_text), dialect=dialect)
+        return [row for row in reader]
+    except Exception:
+        # Last-ditch: line/comma split.
+        return [
+            [cell.strip() for cell in line.split(",")]
+            for line in file_text.splitlines()
+        ]
+
+
+def _find_col(headers: list[str], keywords: list[str]) -> int | None:
+    """First column whose lowercased header contains any keyword. Order
+    of `keywords` matters — earlier keywords win."""
+    norm = [h.lower() for h in headers]
+    for kw in keywords:
+        for i, h in enumerate(norm):
+            if kw in h:
+                return i
+    return None
+
+
+def _parse_amount(value: Any) -> Decimal:
+    """Parse currency-shaped strings: $1,234.56 / (1,234.56) / -1234.
+    Returns 0 for blank / non-numeric input."""
+    if value is None:
+        return Decimal("0")
+    s = str(value).strip()
+    if not s or s in ("-", "—", "n/a", "NA"):
+        return Decimal("0")
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1]
+    s = s.replace("$", "").replace(",", "").replace(" ", "").strip()
+    if s.startswith("-"):
+        negative = True
+        s = s[1:]
+    if not s:
+        return Decimal("0")
+    try:
+        v = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+    return -v if negative else v
+
+
+def _find_header_row(
+    rows: list[list[str]], required_keywords: list[list[str]]
+) -> int | None:
+    """Scan the first 50 rows for one that contains a cell matching
+    each keyword group. Returns the index, or None when no row matches.
+
+    `required_keywords` is a list of keyword lists — each inner list is
+    an OR group, all groups must match (AND across groups).
+    """
+    for i, row in enumerate(rows[:50]):
+        cells_lower = [str(c or "").lower() for c in row]
+        matched_all = True
+        for group in required_keywords:
+            if not any(any(kw in c for kw in group) for c in cells_lower):
+                matched_all = False
+                break
+        if matched_all:
+            return i
+    return None
+
+
+def _try_fallback_tb_parser(file_text: str) -> dict[str, Any] | None:
+    """Heuristic CSV/TSV TB parser. Returns the same shape as
+    parse_trial_balance — or None when no debit/credit columns are
+    detected.
+
+    Handles:
+      * Two-column (debit, credit) layouts — QBO, Sage, generic exports.
+      * Single signed-balance column — positive → debit, negative → credit.
+    """
+    rows = _read_csv_rows(file_text)
+    if not rows:
+        return None
+
+    header_idx = _find_header_row(
+        rows,
+        required_keywords=[
+            ["debit", "dr"],
+            ["credit", "cr"],
+        ],
+    )
+
+    if header_idx is not None:
+        headers = [str(c or "").strip() for c in rows[header_idx]]
+        debit_idx = _find_col(headers, ["debit", "dr"])
+        credit_idx = _find_col(headers, ["credit", "cr"])
+        code_idx = _find_col(headers, ["code", "number", "no.", " no", "acct"])
+        name_idx = _find_col(
+            headers, ["account name", "name", "description", "account"]
+        )
+        # If name_idx and code_idx collide (single 'account' column),
+        # treat that column as name and leave code blank.
+        if code_idx is not None and code_idx == name_idx:
+            code_idx = None
+        if debit_idx is None or credit_idx is None:
+            return None
+        return _parse_tb_rows(
+            rows[header_idx + 1:],
+            code_idx=code_idx,
+            name_idx=name_idx,
+            debit_idx=debit_idx,
+            credit_idx=credit_idx,
+            signed_idx=None,
+        )
+
+    # Try single signed-balance layout.
+    header_idx = _find_header_row(
+        rows,
+        required_keywords=[
+            ["balance", "amount", "net"],
+        ],
+    )
+    if header_idx is None:
+        return None
+    headers = [str(c or "").strip() for c in rows[header_idx]]
+    signed_idx = _find_col(headers, ["balance", "amount", "net"])
+    code_idx = _find_col(headers, ["code", "number", "no.", "acct"])
+    name_idx = _find_col(headers, ["account name", "name", "description", "account"])
+    if signed_idx is None:
+        return None
+    if code_idx is not None and code_idx == name_idx:
+        code_idx = None
+    return _parse_tb_rows(
+        rows[header_idx + 1:],
+        code_idx=code_idx,
+        name_idx=name_idx,
+        debit_idx=None,
+        credit_idx=None,
+        signed_idx=signed_idx,
+    )
+
+
+def _parse_tb_rows(
+    data_rows: list[list[str]],
+    *,
+    code_idx: int | None,
+    name_idx: int | None,
+    debit_idx: int | None,
+    credit_idx: int | None,
+    signed_idx: int | None,
+) -> dict[str, Any] | None:
+    tb_lines: list[dict[str, Any]] = []
+    total_dr = Decimal("0")
+    total_cr = Decimal("0")
+    for row in data_rows:
+        if not row or all(not str(c or "").strip() for c in row):
+            continue
+        code = (
+            str(row[code_idx] or "").strip()
+            if code_idx is not None and code_idx < len(row)
+            else ""
+        )
+        name = (
+            str(row[name_idx] or "").strip()
+            if name_idx is not None and name_idx < len(row)
+            else ""
+        )
+        # Skip total / summary / header rows that bleed past the real
+        # header line. QBO and Sage both emit a final "Total" row with
+        # the label in either the code or name column.
+        if not code and not name:
+            continue
+        label_text = f"{code} {name}".lower()
+        if "total" in label_text or label_text.strip() in ("net income", "net loss"):
+            continue
+
+        if signed_idx is not None:
+            net = _parse_amount(
+                row[signed_idx] if signed_idx < len(row) else ""
+            )
+            if net == 0:
+                continue
+            if net > 0:
+                dr, cr = net, Decimal("0")
+            else:
+                dr, cr = Decimal("0"), -net
+        else:
+            dr = _parse_amount(
+                row[debit_idx] if debit_idx is not None and debit_idx < len(row) else ""
+            )
+            cr = _parse_amount(
+                row[credit_idx] if credit_idx is not None and credit_idx < len(row) else ""
+            )
+            if dr == 0 and cr == 0:
+                continue
+        if not code:
+            code = name
+        tb_lines.append({
+            "account_code": code,
+            "account_name": name or code,
+            "debit_balance": dr,
+            "credit_balance": cr,
+        })
+        total_dr += dr
+        total_cr += cr
+
+    if not tb_lines:
+        return None
+    variance = total_dr - total_cr
+    return {
+        "tb_lines": tb_lines,
+        "total_debits": float(total_dr),
+        "total_credits": float(total_cr),
+        "variance": float(variance),
+        "balanced": variance == 0,
+    }
+
+
+def _try_fallback_coa_parser(file_text: str) -> dict[str, Any] | None:
+    """Heuristic chart-of-accounts parser. Looks for a header row with
+    account-code + name + type columns. Returns the same shape as
+    parse_chart_of_accounts or None when format isn't recognized.
+    """
+    rows = _read_csv_rows(file_text)
+    if not rows:
+        return None
+    header_idx = _find_header_row(
+        rows,
+        required_keywords=[
+            ["code", "number", "no.", "acct"],
+            ["name", "description", "account"],
+        ],
+    )
+    if header_idx is None:
+        return None
+    headers = [str(c or "").strip() for c in rows[header_idx]]
+    code_idx = _find_col(headers, ["code", "number", "no.", "acct"])
+    name_idx = _find_col(headers, ["account name", "name", "description"])
+    type_idx = _find_col(headers, ["type", "class", "category"])
+    sub_idx = _find_col(headers, ["subtype", "sub-type", "detail"])
+    parent_idx = _find_col(headers, ["parent"])
+    nb_idx = _find_col(headers, ["normal balance", "normal_balance", "dr/cr"])
+    if code_idx is None or name_idx is None or code_idx == name_idx:
+        return None
+
+    out: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for row in rows[header_idx + 1:]:
+        if not row or all(not str(c or "").strip() for c in row):
+            continue
+        code = str(row[code_idx] or "").strip() if code_idx < len(row) else ""
+        name = str(row[name_idx] or "").strip() if name_idx < len(row) else ""
+        if not code or not name:
+            continue
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        type_val = (
+            str(row[type_idx] or "").strip()
+            if type_idx is not None and type_idx < len(row)
+            else ""
+        )
+        if not type_val:
+            type_val = _infer_type_from_code(code)
+        normal = (
+            str(row[nb_idx] or "").strip().lower()
+            if nb_idx is not None and nb_idx < len(row)
+            else ""
+        )
+        if normal not in ("debit", "credit"):
+            normal = (
+                "debit" if _infer_type_from_code(code) in ("Asset", "Expense", "COGS") else "credit"
+            )
+        out.append({
+            "code": code,
+            "name": name,
+            "type": type_val,
+            "subtype": (
+                str(row[sub_idx] or "").strip()
+                if sub_idx is not None and sub_idx < len(row)
+                else ""
+            ),
+            "normal_balance": normal,
+            "parent_code": (
+                (str(row[parent_idx] or "").strip() or None)
+                if parent_idx is not None and parent_idx < len(row)
+                else None
+            ),
+        })
+    if not out:
+        return None
+    return {"accounts": out, "count": len(out)}
+
+
+def _infer_type_from_code(code: str) -> str:
+    p = (code or "").strip()[:1]
+    return {
+        "1": "Asset",
+        "2": "Liability",
+        "3": "Equity",
+        "4": "Revenue",
+        "5": "COGS",
+        "6": "Expense",
+        "7": "Expense",
+        "8": "Expense",
+        "9": "Expense",
+    }.get(p, "Other")
+
+
+def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
+    """Heuristic GL parser. Looks for date + account + debit/credit
+    columns. Returns the same shape as parse_gl_file (a list of normalized
+    line records) or None.
+    """
+    rows = _read_csv_rows(file_text)
+    if not rows:
+        return None
+    header_idx = _find_header_row(
+        rows,
+        required_keywords=[
+            ["date"],
+            ["account", "acct", "code"],
+            ["debit", "credit", "amount"],
+        ],
+    )
+    if header_idx is None:
+        return None
+    headers = [str(c or "").strip() for c in rows[header_idx]]
+    date_idx = _find_col(headers, ["date"])
+    ref_idx = _find_col(headers, ["reference", "ref", "doc", "txn", "number"])
+    code_idx = _find_col(headers, ["account code", "account number", "code", "acct"])
+    name_idx = _find_col(headers, ["account name", "account", "description"])
+    desc_idx = _find_col(headers, ["description", "memo", "explanation"])
+    cp_idx = _find_col(headers, ["payee", "vendor", "customer", "name"])
+    debit_idx = _find_col(headers, ["debit", "dr"])
+    credit_idx = _find_col(headers, ["credit", "cr"])
+    amount_idx = _find_col(headers, ["amount", "net"])
+    if date_idx is None or code_idx is None or code_idx == name_idx:
+        return None
+    if debit_idx is None and credit_idx is None and amount_idx is None:
+        return None
+
+    out: list[dict[str, Any]] = []
+    for row in rows[header_idx + 1:]:
+        if not row or all(not str(c or "").strip() for c in row):
+            continue
+        raw_date = str(row[date_idx] or "").strip() if date_idx < len(row) else ""
+        if not raw_date:
+            continue
+        txn_date = _parse_loose_date(raw_date)
+        if txn_date is None:
+            continue
+        code = str(row[code_idx] or "").strip() if code_idx < len(row) else ""
+        if not code:
+            continue
+        if debit_idx is not None or credit_idx is not None:
+            dr = _parse_amount(
+                row[debit_idx] if debit_idx is not None and debit_idx < len(row) else ""
+            )
+            cr = _parse_amount(
+                row[credit_idx] if credit_idx is not None and credit_idx < len(row) else ""
+            )
+        else:
+            net = _parse_amount(
+                row[amount_idx] if amount_idx is not None and amount_idx < len(row) else ""
+            )
+            if net >= 0:
+                dr, cr = net, Decimal("0")
+            else:
+                dr, cr = Decimal("0"), -net
+        if dr == 0 and cr == 0:
+            continue
+        out.append({
+            "transaction_date": txn_date,
+            "reference_number": (
+                str(row[ref_idx] or "").strip()
+                if ref_idx is not None and ref_idx < len(row)
+                else ""
+            ),
+            "account_code": code,
+            "account_name": (
+                str(row[name_idx] or "").strip()
+                if name_idx is not None and name_idx < len(row)
+                else ""
+            ),
+            "description": (
+                str(row[desc_idx] or "").strip()
+                if desc_idx is not None and desc_idx < len(row)
+                else ""
+            ),
+            "counterparty_name": (
+                (str(row[cp_idx] or "").strip() or None)
+                if cp_idx is not None and cp_idx < len(row)
+                else None
+            ),
+            "debit_amount": dr,
+            "credit_amount": cr,
+        })
+    if not out:
+        return None
+    return out
+
+
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%m/%d/%Y",
+    "%d/%m/%Y",
+    "%m-%d-%Y",
+    "%d-%m-%Y",
+    "%b %d, %Y",
+    "%d %b %Y",
+    "%B %d, %Y",
+)
+
+
+def _parse_loose_date(value: str) -> DateType | None:
+    s = (value or "").strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -351,13 +818,22 @@ Rules:
 
 
 def parse_chart_of_accounts(file_bytes: bytes, filename: str) -> dict[str, Any]:
-    """Run a file through Claude and return the preview (accounts list)."""
+    """Try the regex/CSV fallback first; fall through to Claude only when
+    the file is in an unknown shape. Returns {accounts, count} or raises
+    ValueError when both paths fail."""
     file_text = _decode_file(file_bytes, filename)
+
+    fallback = _try_fallback_coa_parser(file_text)
+    if fallback:
+        logger.info("CoA parsed via regex fallback (%d accounts)", fallback["count"])
+        return fallback
+
     parsed = _claude_parse_json(_COA_PROMPT, file_text)
     if not parsed:
         raise ValueError(
-            "Could not parse the file. Make sure ANTHROPIC_API_KEY is set "
-            "and the file contains account information."
+            "Could not parse the chart of accounts. Try a CSV with "
+            "columns like 'code, name, type' — or set ANTHROPIC_API_KEY "
+            "to let the AI parser handle arbitrary formats."
         )
     accounts = parsed.get("accounts") or []
     cleaned: list[dict[str, Any]] = []
@@ -492,15 +968,30 @@ Rules:
 
 
 def parse_trial_balance(file_bytes: bytes, filename: str) -> dict[str, Any]:
-    """Run a TB file through Claude. Returns parsed preview with totals
-    and a balanced flag.
+    """Try the regex/CSV fallback first (cheap + fast on QBO/Sage/CSV
+    exports), fall through to Claude on unknown formats.
+
+    Returns the parsed preview with totals + balanced flag, or raises
+    ValueError when both paths fail.
     """
     file_text = _decode_file(file_bytes, filename)
+
+    fallback = _try_fallback_tb_parser(file_text)
+    if fallback:
+        logger.info(
+            "TB parsed via regex fallback (%d lines, balanced=%s)",
+            len(fallback["tb_lines"]),
+            fallback["balanced"],
+        )
+        return fallback
+
     parsed = _claude_parse_json(_TB_PROMPT, file_text)
     if not parsed:
         raise ValueError(
-            "Could not parse the trial balance. Check ANTHROPIC_API_KEY and "
-            "that the file contains account-level balances."
+            "Could not parse the trial balance. Try a CSV with "
+            "columns like 'account, debit, credit' — or set "
+            "ANTHROPIC_API_KEY to let the AI parser handle arbitrary "
+            "formats."
         )
     raw_lines = parsed.get("trial_balance") or []
     cleaned: list[dict[str, Any]] = []
@@ -807,13 +1298,21 @@ Rules:
 
 
 def parse_gl_file(file_bytes: bytes, filename: str) -> list[dict[str, Any]]:
-    """Run a GL file through Claude and return normalized line records."""
+    """Try the regex/CSV fallback first for standard GL exports; fall
+    back to Claude for unknown formats."""
     file_text = _decode_file(file_bytes, filename)
+
+    fallback = _try_fallback_gl_parser(file_text)
+    if fallback:
+        logger.info("GL parsed via regex fallback (%d lines)", len(fallback))
+        return fallback
+
     parsed = _claude_parse_json(_GL_PROMPT, file_text)
     if not parsed:
         raise ValueError(
-            "Could not parse the GL file. Check ANTHROPIC_API_KEY and that "
-            "the file contains date / account / debit / credit columns."
+            "Could not parse the GL file. Try a CSV with columns like "
+            "'date, account, debit, credit' — or set ANTHROPIC_API_KEY "
+            "to let the AI parser handle arbitrary formats."
         )
     raw_lines = parsed.get("lines") or []
     cleaned: list[dict[str, Any]] = []

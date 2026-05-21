@@ -1,15 +1,15 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useUser } from '@clerk/nextjs';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEntityStore } from '@/lib/store/entity';
 import { useOnboardingStore } from '@/lib/store/onboarding';
 import { Button } from '@/components/ui/button';
-import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
 import {
   confirmChart,
+  getChartParseProgress,
   getOnboardingStatus,
   pullChartFromQbo,
   uploadChartFile,
@@ -43,18 +43,59 @@ export function StepChart() {
     onError: () => toast.error('QuickBooks chart pull failed'),
   });
 
-  // File upload path — preview then confirm
+  // File upload path — kick off a background parse, poll for the
+  // preview, then let the dealer confirm.
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [preview, setPreview] = useState<ChartPreviewAccount[] | null>(null);
+  const [parseJobId, setParseJobId] = useState<string | null>(null);
+  const [parseStep, setParseStep] = useState<string | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+  useEffect(() => () => stopPolling(), []);
+
+  const startPolling = (jobId: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const p = await getChartParseProgress(jobId);
+        setParseStep(p.current_step);
+        if (p.status === 'complete' && p.preview) {
+          stopPolling();
+          setPreview(p.preview.accounts);
+          setParseJobId(null);
+          toast.success(
+            `Parsed ${p.preview.count} accounts — review and confirm`,
+          );
+        } else if (p.status === 'error') {
+          stopPolling();
+          setParseJobId(null);
+          setParseError(p.error || 'Parser failed');
+          toast.error(p.error || 'Could not parse the file');
+        }
+      } catch {
+        // 404 / transient — try again next tick.
+      }
+    }, 3000);
+  };
+
   const uploadMutation = useMutation({
     mutationFn: (file: File) =>
       uploadChartFile({ entity_code: entityCode, actor_email: actor, file }),
     onSuccess: (res) => {
-      setPreview(res.preview.accounts);
-      toast.success(`Parsed ${res.preview.count} accounts — review and confirm`);
+      setParseError(null);
+      setParseJobId(res.job_id);
+      setParseStep('Queued');
+      startPolling(res.job_id);
     },
     onError: (err: Error) =>
-      toast.error(err.message || 'Could not parse the file'),
+      toast.error(err.message || 'Could not start the parse'),
   });
   const confirmMutation = useMutation({
     mutationFn: (accounts: ChartPreviewAccount[]) =>
@@ -224,6 +265,75 @@ export function StepChart() {
             Continue →
           </Button>
         </div>
+      </div>
+    );
+  }
+
+  // File path — parsing in progress
+  if (parseJobId) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-h2 text-deep-navy">Parsing your chart…</h2>
+          <p className="text-slate mt-1">
+            Large files can take a minute. We're trying a fast CSV parser
+            first, falling back to AI for unusual formats.
+          </p>
+        </div>
+        <div className="rounded-xl bg-cloud p-8 text-center">
+          <Loader2 className="h-8 w-8 text-ledger-blue mx-auto animate-spin" />
+          <p className="text-sm text-slate mt-3">
+            {parseStep || 'Working on it…'}
+          </p>
+        </div>
+        <div className="flex justify-between pt-2">
+          <Button
+            variant="ghost"
+            onClick={() => {
+              stopPolling();
+              setParseJobId(null);
+              setParseStep(null);
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // File path — error state with retry
+  if (parseError) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-h2 text-deep-navy">Couldn't parse that file</h2>
+          <div className="rounded-xl border-2 border-amber-300 bg-amber-50 p-4 mt-3">
+            <p className="text-sm text-amber-900">{parseError}</p>
+          </div>
+        </div>
+        <div className="flex justify-between pt-2">
+          <Button variant="ghost" onClick={prev}>← Back</Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setParseError(null);
+              fileInputRef.current?.click();
+            }}
+          >
+            Try a different file
+          </Button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,.xlsx,.xls,.txt"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) uploadMutation.mutate(f);
+          }}
+        />
       </div>
     );
   }

@@ -50,6 +50,11 @@ from ..services_onboarding import (
     save_chart_of_accounts,
 )
 
+# Tokens-per-minute on the Claude API are generous but a TB with
+# thousands of rows can still push the parse request past the 30s
+# request timeout. parse_* now runs in a BackgroundTask; the upload
+# endpoints return a job_id immediately and the wizard polls progress.
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
 
@@ -87,29 +92,77 @@ def get_status(
 
 @router.post("/chart-of-accounts/upload")
 async def upload_chart(
+    background_tasks: BackgroundTasks,
     entity_code: str = Form(...),
     actor_email: str = Form(...),
     file: UploadFile = File(...),
     _user: Any = Depends(require_role("admin")),
 ) -> dict[str, Any]:
-    """Parse a chart-of-accounts file via Claude. Returns a preview that
-    the dealer can review/edit before confirming. Nothing is written
-    until POST /confirm.
+    """Kick off chart-of-accounts parsing in the background. Returns
+    immediately with a job_id; the wizard polls
+    /chart-of-accounts/progress/{job_id} until status='complete'.
     """
     enforce_entity_code(_user, entity_code)
     try:
         file_bytes = await file.read()
-        preview = parse_chart_of_accounts(file_bytes, file.filename or "")
-        return {
-            "entity_code": entity_code,
-            "filename": file.filename,
-            "preview": preview,
-        }
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        filename = file.filename or ""
+        with db_session() as session:
+            entity = get_entity_by_code(session, entity_code)
+            if not entity:
+                raise HTTPException(404, f"Unknown entity: {entity_code}")
+            job_id = _create_job(
+                session,
+                entity_id=str(entity["id"]),
+                job_type="parse_chart_of_accounts",
+                actor_email=actor_email,
+            )
+        background_tasks.add_task(
+            _run_parse_chart,
+            job_id=job_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            entity_code=entity_code,
+        )
+        return {"job_id": job_id, "status": "pending"}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("upload_chart failed")
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/chart-of-accounts/progress/{job_id}")
+def chart_progress(
+    job_id: str = Path(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    with db_session() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT id, job_type, status, pct_complete, current_step,
+                       result, error_message
+                  FROM background_jobs
+                 WHERE id = :id
+                 LIMIT 1
+                """
+            ),
+            {"id": job_id},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Unknown job: {job_id}")
+        result = dict(row.get("result") or {})
+        return {
+            "job_id": str(row["id"]),
+            "job_type": row["job_type"],
+            "status": row["status"],
+            "pct_complete": int(row["pct_complete"] or 0),
+            "current_step": row.get("current_step"),
+            "preview": result.get("preview"),
+            "filename": result.get("filename"),
+            "entity_code": result.get("entity_code"),
+            "error": row.get("error_message"),
+        }
 
 
 class ChartConfirmRequest(BaseModel):
@@ -178,31 +231,84 @@ async def pull_chart_qbo(
 
 @router.post("/opening-balances/upload")
 async def upload_opening_balances(
+    background_tasks: BackgroundTasks,
     entity_code: str = Form(...),
     actor_email: str = Form(...),
     as_of_date: str = Form(...),
     file: UploadFile = File(...),
     _user: Any = Depends(require_role("admin")),
 ) -> dict[str, Any]:
-    """Parse a trial balance file via Claude. Returns preview + balanced
-    check. Nothing is written until POST /confirm.
+    """Kick off trial-balance parsing in the background. Returns
+    immediately with a job_id; the wizard polls
+    /opening-balances/progress/{job_id} until status='complete'.
     """
     enforce_entity_code(_user, entity_code)
     try:
         _parse_iso_date(as_of_date, "as_of_date")
         file_bytes = await file.read()
-        preview = parse_trial_balance(file_bytes, file.filename or "")
-        return {
-            "entity_code": entity_code,
-            "as_of_date": as_of_date,
-            "filename": file.filename,
-            "preview": preview,
-        }
+        filename = file.filename or ""
+        with db_session() as session:
+            entity = get_entity_by_code(session, entity_code)
+            if not entity:
+                raise HTTPException(404, f"Unknown entity: {entity_code}")
+            job_id = _create_job(
+                session,
+                entity_id=str(entity["id"]),
+                job_type="parse_trial_balance",
+                actor_email=actor_email,
+            )
+        background_tasks.add_task(
+            _run_parse_tb,
+            job_id=job_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            entity_code=entity_code,
+            as_of_date=as_of_date,
+        )
+        return {"job_id": job_id, "status": "pending"}
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         logger.exception("upload_opening_balances failed")
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/opening-balances/progress/{job_id}")
+def opening_balances_progress(
+    job_id: str = Path(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    with db_session() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT id, job_type, status, pct_complete, current_step,
+                       result, error_message
+                  FROM background_jobs
+                 WHERE id = :id
+                 LIMIT 1
+                """
+            ),
+            {"id": job_id},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Unknown job: {job_id}")
+        result = dict(row.get("result") or {})
+        preview = result.get("preview") or {}
+        return {
+            "job_id": str(row["id"]),
+            "job_type": row["job_type"],
+            "status": row["status"],
+            "pct_complete": int(row["pct_complete"] or 0),
+            "current_step": row.get("current_step"),
+            "preview": preview or None,
+            "filename": result.get("filename"),
+            "entity_code": result.get("entity_code"),
+            "as_of_date": result.get("as_of_date"),
+            "error": row.get("error_message"),
+        }
 
 
 class OpeningConfirmRequest(BaseModel):
@@ -657,6 +763,84 @@ async def _qbo_import_async(
             date_to=date_to,
             actor_email=actor_email,
             progress_callback=progress_callback,
+        )
+
+
+def _run_parse_chart(
+    *,
+    job_id: str,
+    file_bytes: bytes,
+    filename: str,
+    entity_code: str,
+) -> None:
+    """Background worker for chart-of-accounts file parsing."""
+    _update_job(job_id, status="running", started=True, pct=10,
+                current_step="Parsing chart of accounts")
+    try:
+        preview = parse_chart_of_accounts(file_bytes, filename)
+        _update_job(
+            job_id,
+            status="complete",
+            pct=100,
+            current_step="Parse complete",
+            result={
+                "preview": preview,
+                "filename": filename,
+                "entity_code": entity_code,
+            },
+            completed=True,
+        )
+    except ValueError as exc:
+        logger.warning("Chart parse failed for job %s: %r", job_id, exc)
+        _update_job(
+            job_id, status="error", error_message=str(exc), completed=True
+        )
+    except Exception as exc:
+        logger.exception("Chart parse worker crashed for job %s", job_id)
+        _update_job(
+            job_id, status="error", error_message=str(exc), completed=True
+        )
+
+
+def _run_parse_tb(
+    *,
+    job_id: str,
+    file_bytes: bytes,
+    filename: str,
+    entity_code: str,
+    as_of_date: str,
+) -> None:
+    """Background worker for trial-balance file parsing."""
+    _update_job(job_id, status="running", started=True, pct=10,
+                current_step="Parsing trial balance")
+    try:
+        preview = parse_trial_balance(file_bytes, filename)
+        _update_job(
+            job_id,
+            status="complete",
+            pct=100,
+            current_step=(
+                "Parse complete — balanced"
+                if preview.get("balanced")
+                else "Parse complete — out of balance"
+            ),
+            result={
+                "preview": preview,
+                "filename": filename,
+                "entity_code": entity_code,
+                "as_of_date": as_of_date,
+            },
+            completed=True,
+        )
+    except ValueError as exc:
+        logger.warning("TB parse failed for job %s: %r", job_id, exc)
+        _update_job(
+            job_id, status="error", error_message=str(exc), completed=True
+        )
+    except Exception as exc:
+        logger.exception("TB parse worker crashed for job %s", job_id)
+        _update_job(
+            job_id, status="error", error_message=str(exc), completed=True
         )
 
 
