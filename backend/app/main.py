@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from .config import settings
+from .routes.accounts import router as accounts_router
 from .routes.accruals import router as accruals_router
 from .routes.assistant import router as assistant_router
 from .routes.auth import router as auth_router
@@ -133,6 +134,9 @@ app.include_router(assistant_router)
 # Dealer onboarding — 8-step wizard backend (chart, opening balances,
 # GL history pull via QBO or file upload).
 app.include_router(onboarding_router)
+
+# Chart of accounts CRUD — app-native admin for /settings/accounts.
+app.include_router(accounts_router)
 
 
 @app.get("/health", response_model=HealthResponse)

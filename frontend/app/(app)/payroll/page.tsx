@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { listEmployees, listPayrollRuns } from '@/lib/api/payroll';
+import { getCraRemittance } from '@/lib/api/payroll_cra';
 import { formatMoney, formatDate } from '@/lib/utils';
 import { Plus, Upload, FileCheck2 } from 'lucide-react';
 
@@ -23,6 +24,13 @@ export default function PayrollPage() {
     queryKey: ['payroll-runs', entityCode],
     enabled: !!entityCode && tab === 'runs',
     queryFn: () => listPayrollRuns({ entity_code: entityCode!, limit: 24 }),
+  });
+
+  const craYear = new Date().getFullYear();
+  const cra = useQuery({
+    queryKey: ['cra-remittance', entityCode, craYear],
+    enabled: !!entityCode && tab === 'cra',
+    queryFn: () => getCraRemittance(entityCode!, craYear),
   });
 
   const employees = useQuery({
@@ -165,14 +173,55 @@ export default function PayrollPage() {
         {tab === 'cra' && (
           <Card>
             <CardHeader>
-              <CardTitle>CRA remittance</CardTitle>
+              <CardTitle className="flex items-center justify-between">
+                <span>CRA remittance — {craYear}</span>
+                {cra.data && (
+                  <Badge variant="info">
+                    Outstanding: {formatMoney(cra.data.total_outstanding)}
+                  </Badge>
+                )}
+              </CardTitle>
             </CardHeader>
-            <CardContent>
-              {/* TODO: backend endpoint not built — CRA remittance summary
-                   (we have payroll runs but no aggregated remit-by-month). */}
-              <p className="text-sm text-slate">
-                Remittance tracker is built from posted payroll runs. Sum each
-                month&apos;s CRA total and remit by the 15th of the following month.
+            <CardContent className="p-0">
+              {cra.isLoading ? (
+                <div className="p-6 space-y-2">
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                </div>
+              ) : !cra.data || cra.data.remittances.length === 0 ? (
+                <p className="p-6 text-sm text-slate">
+                  No CRA-payable activity recorded for {craYear} yet.
+                </p>
+              ) : (
+                <table className="min-w-full text-sm">
+                  <thead className="bg-cloud">
+                    <tr>
+                      <th className="text-left px-4 py-2 font-semibold text-deep-navy">Period</th>
+                      <th className="text-right px-4 py-2 font-semibold text-deep-navy">Owing</th>
+                      <th className="text-left px-4 py-2 font-semibold text-deep-navy">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {cra.data.remittances.map((r) => (
+                      <tr key={r.period_end} className="hover:bg-cloud">
+                        <td className="px-4 py-2 text-ink">{r.period_label}</td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {formatMoney(r.total_owing)}
+                        </td>
+                        <td className="px-4 py-2">
+                          <Badge variant={r.status === 'remitted' ? 'complete' : 'warning'}>
+                            {r.status}
+                          </Badge>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <p className="p-4 text-xs text-slate">
+                Built from journal_lines on account {cra.data?.cra_account_code ?? '2320'}.
+                Periods marked closed in /month-end count as remitted.
               </p>
             </CardContent>
           </Card>

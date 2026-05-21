@@ -202,6 +202,84 @@ def update_entity(
 
 
 # --------------------------------------------------------------------------
+# Notification preferences (per-entity JSONB on entities)
+# --------------------------------------------------------------------------
+
+
+_DEFAULT_NOTIFICATION_PREFS = {
+    "month_end_reminders": True,
+    "variance_alerts": True,
+    "approval_requests": True,
+    "payment_receipts": True,
+}
+
+
+@router.get("/{entity_code}/notifications")
+def get_notification_preferences(
+    entity_code: str = Path(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    with db_session() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT notification_preferences
+                  FROM entities
+                 WHERE entity_code = :code
+                """
+            ),
+            {"code": entity_code},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        prefs = dict(_DEFAULT_NOTIFICATION_PREFS)
+        prefs.update(row.get("notification_preferences") or {})
+        return {"entity_code": entity_code, "notification_preferences": prefs}
+
+
+class NotificationPrefsRequest(BaseModel):
+    month_end_reminders: bool | None = None
+    variance_alerts: bool | None = None
+    approval_requests: bool | None = None
+    payment_receipts: bool | None = None
+
+
+@router.patch("/{entity_code}/notifications")
+def update_notification_preferences(
+    body: NotificationPrefsRequest,
+    entity_code: str = Path(...),
+    _user: Any = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Merge-update — keys not in the body are left untouched. Returns
+    the full effective prefs after merging."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "No preferences supplied")
+
+    import json as _json
+
+    with db_session() as session:
+        row = session.execute(
+            text(
+                """
+                UPDATE entities
+                   SET notification_preferences =
+                       COALESCE(notification_preferences, '{}'::jsonb) ||
+                       CAST(:patch AS jsonb)
+                 WHERE entity_code = :code
+                RETURNING notification_preferences
+                """
+            ),
+            {"code": entity_code, "patch": _json.dumps(updates)},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        prefs = dict(_DEFAULT_NOTIFICATION_PREFS)
+        prefs.update(row["notification_preferences"] or {})
+        return {"entity_code": entity_code, "notification_preferences": prefs}
+
+
+# --------------------------------------------------------------------------
 # GET /api/me/entities
 # --------------------------------------------------------------------------
 #

@@ -27,6 +27,25 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 
+def content_type_for(filename: str) -> str:
+    """Map a filename suffix to a Content-Type for R2 uploads. Defaults
+    to application/octet-stream when no suffix matches."""
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        return "text/csv"
+    if name.endswith((".xlsx", ".xls", ".xlsm")):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if name.endswith(".ods"):
+        return "application/vnd.oasis.opendocument.spreadsheet"
+    if name.endswith(".pdf"):
+        return "application/pdf"
+    if name.endswith(".txt"):
+        return "text/plain"
+    if name.endswith(".json"):
+        return "application/json"
+    return "application/octet-stream"
+
+
 def _sanitize_filename(name: str) -> str:
     """Strip path separators and tame whitespace. Keep the extension."""
     if not name:

@@ -17,6 +17,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from pydantic import BaseModel, Field
 
+from sqlalchemy import text
+
 from ..db import db_session
 from ..services_auth import enforce_entity_code, require_role
 from ..services_gl_import import (
@@ -27,6 +29,7 @@ from ..services_gl_import import (
     import_gl,
     list_gl_import_runs,
 )
+from ..services_storage import content_type_for, storage_service
 
 
 router = APIRouter(prefix="/api/gl-import", tags=["gl-import"])
@@ -55,9 +58,17 @@ async def post_gl_upload(
 ) -> dict[str, Any]:
     enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
+    # R2 archive — best-effort. Failure here doesn't block the parse.
+    object_key = storage_service.upload_file(
+        file_bytes=file_bytes,
+        original_filename=file.filename or "general_ledger.xlsx",
+        entity_code=entity_code,
+        document_type="gl-import",
+        content_type=content_type_for(file.filename or ""),
+    )
     try:
         with db_session() as session:
-            return import_gl(
+            result = import_gl(
                 session,
                 entity_code=entity_code,
                 file_bytes=file_bytes,
@@ -66,6 +77,15 @@ async def post_gl_upload(
                 period_end=_parse_optional_date("period_end", period_end),
                 actor_email=actor_email,
             )
+            run_id = result.get("run_id") if isinstance(result, dict) else None
+            if object_key and run_id:
+                session.execute(
+                    text(
+                        "UPDATE gl_import_runs SET file_path = :p WHERE id = :id"
+                    ),
+                    {"p": object_key, "id": run_id},
+                )
+            return result
     except HTTPException:
         raise
     except ValueError as exc:

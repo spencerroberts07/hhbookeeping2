@@ -38,6 +38,97 @@ from ..services_payroll_calc import (
 router = APIRouter(prefix="/api/payroll", tags=["payroll"])
 
 
+# --------------------------------------------------------------------------
+# CRA remittance summary
+#
+# Reads journal_lines on the canonical CRA-payable account (2320) for the
+# requested calendar year, grouped by month, and shows per-period owings
+# plus a running total. "Remitted" status currently inferred from the
+# month being closed (period.status='closed' → remitted). We can swap
+# in a real remittance-tracking table later without changing the
+# response shape.
+# --------------------------------------------------------------------------
+
+
+CRA_ACCOUNT_CODE = "2320"
+
+
+@router.get("/cra-remittance")
+def cra_remittance(
+    entity_code: str = Query(...),
+    year: int = Query(..., ge=2000, le=2100),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Calendar-year CRA remittance ledger. `year` is the calendar year
+    the dealer is filing for (matches CRA filing-year semantics)."""
+    from sqlalchemy import text as _text
+    from ..db import db_session as _db_session
+    from ..services import get_entity_by_code as _get_entity
+
+    with _db_session() as session:
+        entity = _get_entity(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+
+        rows = session.execute(
+            _text(
+                """
+                SELECT ap.period_end,
+                       ap.period_label,
+                       ap.status AS period_status,
+                       COALESCE(SUM(jl.credit_amount - jl.debit_amount), 0)
+                           AS net_credit
+                  FROM accounting_periods ap
+                  LEFT JOIN journal_batches jb
+                         ON jb.accounting_period_id = ap.id
+                        AND jb.status <> 'voided'
+                  LEFT JOIN journal_lines jl
+                         ON jl.journal_batch_id = jb.id
+                        AND jl.account_code = :acct
+                 WHERE ap.entity_id = :eid
+                   AND EXTRACT(YEAR FROM ap.period_end) = :yr
+                 GROUP BY ap.period_end, ap.period_label, ap.status
+                 ORDER BY ap.period_end
+                """
+            ),
+            {"acct": CRA_ACCOUNT_CODE, "eid": entity["id"], "yr": year},
+        ).mappings().all()
+
+        remittances: list[dict[str, Any]] = []
+        total_outstanding = 0.0
+        for r in rows:
+            total_owing = float(r["net_credit"])
+            status = "remitted" if r["period_status"] == "closed" else "owing"
+            if status == "owing":
+                total_outstanding += total_owing
+            remittances.append({
+                "period_end": r["period_end"].isoformat(),
+                "period_label": r["period_label"],
+                # Detail rollup — the calc engine doesn't split CRA by
+                # CPP/EI/tax in the GL today, so we surface only the
+                # net liability. Frontend renders Gross/CPP/EI/Tax cells
+                # as "—" until the calc engine writes those breakdowns
+                # to a side table.
+                "gross_payroll": None,
+                "cpp_employer": None,
+                "cpp_employee": None,
+                "ei_employer": None,
+                "ei_remittable": None,
+                "income_tax": None,
+                "total_owing": round(total_owing, 2),
+                "status": status,
+                "remitted_date": None,
+            })
+
+        return {
+            "entity_code": entity_code,
+            "year": year,
+            "remittances": remittances,
+            "total_outstanding": round(total_outstanding, 2),
+            "cra_account_code": CRA_ACCOUNT_CODE,
+        }
+
+
 def _parse_date(name: str, value: str) -> DateType:
     try:
         return DateType.fromisoformat(value)

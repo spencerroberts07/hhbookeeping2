@@ -121,8 +121,18 @@ async def bank_csv_upload(
     try:
         file_bytes = await file.read()
         column_map_override = _parse_column_map_json(column_map_json)
+        # R2 archive — best-effort.
+        from ..services_storage import content_type_for, storage_service
+        from sqlalchemy import text as _text
+        object_key = storage_service.upload_file(
+            file_bytes=file_bytes,
+            original_filename=file.filename or "uploaded.csv",
+            entity_code=entity_code,
+            document_type="bank-csv",
+            content_type=content_type_for(file.filename or ""),
+        )
         with db_session() as session:
-            return run_bank_csv_import(
+            result = run_bank_csv_import(
                 session=session,
                 entity_code=entity_code,
                 file_bytes=file_bytes,
@@ -134,6 +144,16 @@ async def bank_csv_upload(
                 actor_email=actor_email,
                 note=note,
             )
+            run_id = result.get("run_id") if isinstance(result, dict) else None
+            if object_key and run_id:
+                session.execute(
+                    _text(
+                        "UPDATE bank_csv_import_runs SET file_path = :p "
+                        "WHERE id = :id"
+                    ),
+                    {"p": object_key, "id": run_id},
+                )
+            return result
     except HTTPException:
         raise
     except PeriodLockedError as exc:
