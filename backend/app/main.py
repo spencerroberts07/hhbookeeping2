@@ -53,6 +53,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://bookwize.ca",
+        "https://www.bookwize.ca",
         "https://bookwize.onrender.com",
         "https://bookwize-frontend.onrender.com",
     ],
