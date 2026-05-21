@@ -1,31 +1,58 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertCircle, FileWarning, Clock, Receipt } from 'lucide-react';
+import {
+  AlertCircle,
+  AlertTriangle,
+  Clock,
+  FileWarning,
+  Receipt,
+  TrendingUp,
+} from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import Link from 'next/link';
 import { useEntityStore } from '@/lib/store/entity';
+import { getDashboardAlerts } from '@/lib/api/dashboard';
 import { listSuggestions } from '@/lib/api/vendor_classification';
-import { getUnmatchedQueue } from '@/lib/api/invoices';
 import { Skeleton } from '@/components/ui/skeleton';
+
+// Alert icon + accent colour by type. Falls back to a neutral chip
+// when the backend invents a new alert type we don't have an icon for.
+const ICONS: Record<string, LucideIcon> = {
+  period_late: Clock,
+  draft_journals: FileWarning,
+  missing_hh_ap_statement: FileWarning,
+  unmatched_invoices: Receipt,
+  unclassified_transactions: TrendingUp,
+};
+
+function severityClass(severity: string): string {
+  if (severity === 'error') return 'text-red-600';
+  if (severity === 'warning') return 'text-amber-600';
+  return 'text-ledger-blue';
+}
 
 export function AlertsFeed() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
 
-  const pending = useQuery({
+  // Real backend alerts — replaces the static "Missing HH AP statement"
+  // / "Month-end reminder" placeholders.
+  const alerts = useQuery({
+    queryKey: ['dashboard-alerts', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getDashboardAlerts(entityCode!),
+  });
+
+  // Vendor-classification suggestions are still served by their own
+  // endpoint and shown inline at the top of the feed.
+  const suggestions = useQuery({
     queryKey: ['classification-suggestions', entityCode],
     enabled: !!entityCode,
     queryFn: () =>
       listSuggestions({ entity_code: entityCode!, status: 'pending', limit: 5 }),
   });
 
-  const unmatchedInvoices = useQuery({
-    queryKey: ['unmatched-queue', entityCode],
-    enabled: !!entityCode,
-    queryFn: () => getUnmatchedQueue({ entity_code: entityCode! }),
-    select: (data) => data.total,
-  });
-
-  if (pending.isLoading) {
+  if (alerts.isLoading) {
     return (
       <div className="space-y-2">
         <Skeleton className="h-12 w-full" />
@@ -35,43 +62,17 @@ export function AlertsFeed() {
     );
   }
 
-  const items: Array<{
-    icon: typeof AlertCircle;
-    label: string;
-    detail: string;
-    href?: string;
-  }> = [
-    ...((unmatchedInvoices.data ?? 0) > 0
-      ? [
-          {
-            icon: Receipt,
-            label: `${unmatchedInvoices.data} invoice${unmatchedInvoices.data === 1 ? '' : 's'} uploaded but unmatched`,
-            detail: 'Review before period close',
-            href: '/ap/unmatched',
-          },
-        ]
-      : []),
-    ...(pending.data?.suggestions ?? []).map((s) => ({
-      icon: AlertCircle,
-      // Hard-guard every field — sometimes vendor_key is empty for txns
-      // we couldn't normalize, and suggested_account_code is null until
-      // the classifier has a candidate.
+  const backendAlerts = alerts.data?.alerts ?? [];
+  const suggestionAlerts =
+    (suggestions.data?.suggestions ?? []).map((s) => ({
+      type: 'classification_suggestion',
+      severity: 'info' as const,
       label: `Classification suggestion · ${s.vendor_key || 'Bank transaction'}`,
       detail: `${s.suggested_account_code ?? 'Unclassified'} (${(s.confidence ?? 0).toFixed(0)}%)`,
-    })),
-    // TODO: backend endpoint not built — unified alerts feed (period-locks,
-    // unmatched bank, missing documents)
-    {
-      icon: FileWarning,
-      label: 'Missing HH AP statement',
-      detail: 'No statement uploaded for current month yet',
-    },
-    {
-      icon: Clock,
-      label: 'Month-end reminder',
-      detail: 'Close window opens on the 1st of next month',
-    },
-  ];
+      href: undefined,
+    }));
+
+  const items = [...backendAlerts, ...suggestionAlerts];
 
   if (items.length === 0) {
     return <p className="text-sm text-slate">No alerts. Nice work.</p>;
@@ -80,11 +81,12 @@ export function AlertsFeed() {
   return (
     <ul className="space-y-2">
       {items.map((item, idx) => {
-        const Icon = item.icon;
+        const Icon = ICONS[item.type] ?? AlertCircle;
+        const ColorIcon = item.severity === 'warning' ? AlertTriangle : Icon;
         const body = (
           <>
-            <Icon
-              className="h-5 w-5 text-amber-600 mt-0.5 shrink-0"
+            <ColorIcon
+              className={`h-5 w-5 mt-0.5 shrink-0 ${severityClass(item.severity)}`}
               strokeWidth={1.5}
             />
             <div className="min-w-0">

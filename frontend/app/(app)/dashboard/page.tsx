@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
-import { getQuickbooksStatus } from '@/lib/api/dashboard';
+import { getQuickbooksStatus, getGrossMargin } from '@/lib/api/dashboard';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
@@ -92,6 +92,11 @@ export default function DashboardPage() {
     enabled: !!entityCode,
     retry: false,
     queryFn: () => getLatestCashBalancing(entityCode!),
+  });
+  const grossMargin = useQuery({
+    queryKey: ['gross-margin', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getGrossMargin(entityCode!),
   });
 
   if (!entityCode) {
@@ -210,31 +215,14 @@ export default function DashboardPage() {
                     )}
                   </p>
                 </>
-              ) : qbo.isLoading ? (
-                <Skeleton className="h-9 w-32" />
-              ) : qbo.data?.is_connected ? (
+              ) : (
                 <>
                   <div className="text-2xl font-bold text-slate">
                     No cash data yet
                   </div>
                   <p className="text-xs text-slate mt-1">
-                    QBO connected{' '}
-                    {qbo.data.last_synced_at
-                      ? `· last synced ${new Date(qbo.data.last_synced_at).toLocaleString()}`
-                      : ''}
+                    Enable the nightly sync to track cash.
                   </p>
-                </>
-              ) : (
-                <>
-                  <div className="text-2xl font-bold text-slate">
-                    Not connected
-                  </div>
-                  <Link
-                    href="/settings/store"
-                    className="text-xs text-ledger-blue hover:underline"
-                  >
-                    Connect QuickBooks →
-                  </Link>
                 </>
               )}
             </CardContent>
@@ -274,9 +262,19 @@ export default function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                {/* TODO: backend endpoint not built — gross margin time series */}
-                {formatPercent(28.7)}
+                {grossMargin.isLoading ? (
+                  <Skeleton className="h-9 w-24" />
+                ) : grossMargin.data && grossMargin.data.period_end ? (
+                  formatPercent(grossMargin.data.margin_pct)
+                ) : (
+                  <span className="text-slate text-base">No data</span>
+                )}
               </div>
+              {grossMargin.data?.period_label && (
+                <p className="text-xs text-slate mt-1">
+                  {grossMargin.data.period_label}
+                </p>
+              )}
               <GrossMarginSparkline />
             </CardContent>
           </Card>

@@ -230,22 +230,31 @@ def get_current_period(
     entity_code: str = Query(...),
 ) -> dict[str, Any]:
     """
-    Return the period the dashboard should land on:
-      1. The most recent unclosed period whose period_end is on-or-before
-         today. That's the "active" period the dealer is working in —
-         future-dated pre-seeded periods (e.g. FY2027 Sep) are NOT
-         eligible to surface here even when status='draft'.
-      2. If no such period exists (every past period is closed), fall
-         back to the most recent closed period so the dealer sees their
-         last closed books instead of a blank state.
-      3. 404 if no accounting_periods rows exist at all.
+    Return the period the dashboard should land on. Tiered resolution:
+
+      1. Most recent past non-closed period that has at least one
+         non-voided journal_batches row. This is the canonical "active"
+         period — it's where the dealer's real work lives, not just a
+         future-dated draft that was pre-seeded. (Solves the Bridlewood
+         case where Mar/Apr/May 2026 were pre-seeded as draft but every
+         batch sits in Feb 2026.)
+      2. If no such period exists, fall back to the most recent past
+         non-closed period regardless of batches — covers brand-new
+         entities that have a draft period but haven't posted yet.
+      3. If even that's empty, fall back to the most recent closed
+         period so the dealer still has context.
+      4. 404 if no accounting_periods rows exist at all.
 
     Returns: {period_end: 'YYYY-MM-DD', period_label, status}.
     """
     from sqlalchemy import text as _text
 
     with db_session() as session:
-        # Primary: most recent unclosed period with period_end <= today.
+        # Tier 1: has ≥1 approved_to_post batch. This is the strongest
+        # signal of "the period the dealer is actively closing" —
+        # approved-to-post means a journal builder ran and the dealer
+        # signed off. Lone draft_unbalanced cash_balancing batches
+        # don't count.
         row = session.execute(
             _text(
                 """
@@ -255,14 +264,61 @@ def get_current_period(
                  WHERE e.entity_code = :entity_code
                    AND ap.period_end <= CURRENT_DATE
                    AND ap.status <> 'closed'
+                   AND EXISTS (
+                       SELECT 1 FROM journal_batches jb
+                        WHERE jb.accounting_period_id = ap.id
+                          AND jb.status = 'approved_to_post'
+                   )
                  ORDER BY ap.period_end DESC
                  LIMIT 1
                 """
             ),
             {"entity_code": entity_code},
         ).mappings().first()
-        # Fallback: every past period is closed — show the most recent
-        # closed one so the dealer still has context.
+
+        # Tier 2: any non-voided batch (covers brand-new entities with
+        # only draft journals).
+        if not row:
+            row = session.execute(
+                _text(
+                    """
+                    SELECT ap.period_end, ap.period_label, ap.status
+                      FROM accounting_periods ap
+                      JOIN entities e ON e.id = ap.entity_id
+                     WHERE e.entity_code = :entity_code
+                       AND ap.period_end <= CURRENT_DATE
+                       AND ap.status <> 'closed'
+                       AND EXISTS (
+                           SELECT 1 FROM journal_batches jb
+                            WHERE jb.accounting_period_id = ap.id
+                              AND jb.status <> 'voided'
+                       )
+                     ORDER BY ap.period_end DESC
+                     LIMIT 1
+                    """
+                ),
+                {"entity_code": entity_code},
+            ).mappings().first()
+
+        # Tier 3: past + non-closed, no batches yet.
+        if not row:
+            row = session.execute(
+                _text(
+                    """
+                    SELECT ap.period_end, ap.period_label, ap.status
+                      FROM accounting_periods ap
+                      JOIN entities e ON e.id = ap.entity_id
+                     WHERE e.entity_code = :entity_code
+                       AND ap.period_end <= CURRENT_DATE
+                       AND ap.status <> 'closed'
+                     ORDER BY ap.period_end DESC
+                     LIMIT 1
+                    """
+                ),
+                {"entity_code": entity_code},
+            ).mappings().first()
+
+        # Tier 3: everything past is closed — most recent closed period.
         if not row:
             row = session.execute(
                 _text(

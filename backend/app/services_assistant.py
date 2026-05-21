@@ -171,26 +171,64 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
             "vendor_classifications": [],
         }
 
-    # Most-recent unclosed period whose period_end is on-or-before today.
-    # The CURRENT_DATE filter is critical — without it, future pre-seeded
-    # periods (FY2027 Sep etc.) would surface as the "current" period the
-    # assistant believes the dealer is working in. Falls back to the most
-    # recent past period (closed or not) if no eligible row matches.
-    # Mirrors the logic in routes/period_close.py::get_current_period.
+    # Tiered current-period resolution — mirrors routes/period_close.py
+    # ::get_current_period. Prefer periods with approved_to_post
+    # batches (strongest "actively being closed" signal); fall through
+    # to any non-voided; then no-batch past; then closed.
     period = session.execute(
         text(
             """
-            SELECT period_end, period_label, status
-              FROM accounting_periods
-             WHERE entity_id = :eid
-               AND period_end <= CURRENT_DATE
-               AND status <> 'closed'
-             ORDER BY period_end DESC
+            SELECT ap.period_end, ap.period_label, ap.status
+              FROM accounting_periods ap
+             WHERE ap.entity_id = :eid
+               AND ap.period_end <= CURRENT_DATE
+               AND ap.status <> 'closed'
+               AND EXISTS (
+                   SELECT 1 FROM journal_batches jb
+                    WHERE jb.accounting_period_id = ap.id
+                      AND jb.status = 'approved_to_post'
+               )
+             ORDER BY ap.period_end DESC
              LIMIT 1
             """
         ),
         {"eid": entity["id"]},
     ).mappings().first()
+    if not period:
+        period = session.execute(
+            text(
+                """
+                SELECT ap.period_end, ap.period_label, ap.status
+                  FROM accounting_periods ap
+                 WHERE ap.entity_id = :eid
+                   AND ap.period_end <= CURRENT_DATE
+                   AND ap.status <> 'closed'
+                   AND EXISTS (
+                       SELECT 1 FROM journal_batches jb
+                        WHERE jb.accounting_period_id = ap.id
+                          AND jb.status <> 'voided'
+                   )
+                 ORDER BY ap.period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"eid": entity["id"]},
+        ).mappings().first()
+    if not period:
+        period = session.execute(
+            text(
+                """
+                SELECT period_end, period_label, status
+                  FROM accounting_periods
+                 WHERE entity_id = :eid
+                   AND period_end <= CURRENT_DATE
+                   AND status <> 'closed'
+                 ORDER BY period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"eid": entity["id"]},
+        ).mappings().first()
     if not period:
         period = session.execute(
             text(
@@ -1321,13 +1359,20 @@ def _upsert_memory(
 
 def get_balance_summary(session, entity_code: str) -> str | None:
     """Used by /api/assistant/message when intent is query_balance — pulls
-    the most recent cash_balancing_days row and renders a one-liner."""
+    the most recent cash_balancing_days row and renders a one-liner.
+
+    Returns the empty-state message when no cash_balancing_days row
+    exists yet. Per Q3 decision we do NOT fall back to a bank-transaction
+    running sum — too slow and error-prone; the dealer is better served
+    by a clear "enable the nightly sync" prompt than a wrong number.
+    """
     row = session.execute(
         text(
             """
             SELECT business_date, opening_cash, closing_cash, total_sales
               FROM cash_balancing_days
              WHERE entity_id = (SELECT id FROM entities WHERE entity_code = :ec)
+               AND closing_cash IS NOT NULL
              ORDER BY business_date DESC
              LIMIT 1
             """
@@ -1335,11 +1380,10 @@ def get_balance_summary(session, entity_code: str) -> str | None:
         {"ec": entity_code},
     ).mappings().first()
     if not row:
-        return None
-    closing = row["closing_cash"]
-    if closing is None:
-        return f"Latest cash record is {row['business_date']} but closing cash isn't set on that day yet."
+        return (
+            "No cash balancing data yet. Enable the nightly sync to track cash."
+        )
     return (
-        f"Your closing cash on {row['business_date']} was ${float(closing):,.2f}. "
-        f"That's the most recent record I have."
+        f"Your closing cash on {row['business_date']} was "
+        f"${float(row['closing_cash']):,.2f}. That's the most recent record I have."
     )
