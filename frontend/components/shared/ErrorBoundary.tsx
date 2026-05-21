@@ -21,17 +21,24 @@ interface State {
  * trace; in development we print the message + stack for debugging.
  */
 export class ErrorBoundary extends Component<Props, State> {
-  state: State = { hasError: false, error: null };
+  // tsconfig has noImplicitOverride: true — every instance member that
+  // overrides one from React.Component needs the `override` modifier.
+  // `state` is the initial-state property; `componentDidCatch` + `render`
+  // are lifecycle overrides. `getDerivedStateFromError` is static, so it
+  // doesn't take `override`.
+  override state: State = { hasError: false, error: null };
 
   static getDerivedStateFromError(error: Error): State {
     return { hasError: true, error };
   }
 
-  componentDidCatch(error: Error, info: { componentStack?: string | null }) {
+  override componentDidCatch(error: Error, info: { componentStack?: string | null }) {
     // Hook into a logger later — for now console keeps it dev-friendly.
     console.error('[ErrorBoundary]', this.props.label || '', error, info);
   }
 
+  // `reset` and `reload` are class-field arrow functions — not lifecycle
+  // overrides — so they don't take `override`.
   reset = () => {
     this.setState({ hasError: false, error: null });
   };
@@ -42,7 +49,7 @@ export class ErrorBoundary extends Component<Props, State> {
     }
   };
 
-  render() {
+  override render() {
     if (!this.state.hasError) return this.props.children;
 
     const isDev = process.env.NODE_ENV !== 'production';
