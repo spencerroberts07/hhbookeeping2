@@ -1119,21 +1119,34 @@ def _execute_classify(
                 {"ec": entity_code},
             ).mappings().first()
             if entity:
+                # vendor_classification_memory schema notes:
+                #   * confidence_score is numeric(4,3) — 0.000 to ~9.999.
+                #     Production data uses a 0-1 scale; user-confirmed
+                #     classifications go in at the max.
+                #   * source CHECK allows
+                #     ('gl_history','user_confirmed','ai_seeded').
+                #   * Unique constraint is the three-column
+                #     (entity_id, normalized_vendor_key, account_code).
+                #   * No `created_at` column — first_seen_at is
+                #     auto-defaulted by the column.
                 session.execute(
                     text(
                         """
                         INSERT INTO vendor_classification_memory (
                             entity_id, normalized_vendor_key, account_code,
                             debit_or_credit, occurrences_count, confidence_score,
-                            source, last_seen_at, created_at
+                            source, last_seen_at
                         ) VALUES (
-                            :eid, :key, :acct, :dr_cr, 1, 100, 'user_confirmed', NOW(), NOW()
+                            :eid, :key, :acct, :dr_cr, 1, 1.0,
+                            'user_confirmed', NOW()
                         )
-                        ON CONFLICT (entity_id, normalized_vendor_key) DO UPDATE
-                           SET account_code = EXCLUDED.account_code,
-                               debit_or_credit = EXCLUDED.debit_or_credit,
+                        ON CONFLICT (entity_id, normalized_vendor_key, account_code) DO UPDATE
+                           SET debit_or_credit = EXCLUDED.debit_or_credit,
                                occurrences_count = vendor_classification_memory.occurrences_count + 1,
-                               confidence_score = LEAST(100, vendor_classification_memory.confidence_score + 5),
+                               confidence_score = LEAST(
+                                   1,
+                                   vendor_classification_memory.confidence_score + 0.05
+                               ),
                                source = 'user_confirmed',
                                last_seen_at = NOW()
                         """
