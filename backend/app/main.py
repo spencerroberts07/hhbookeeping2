@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from .config import settings
+from .middleware_demo_guard import DemoWriteGuardMiddleware
 from .routes.accounts import router as accounts_router
 from .routes.accruals import router as accruals_router
 from .routes.assistant import router as assistant_router
@@ -63,6 +64,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Server-side enforcement of demo-account read-only mode. Any
+# POST/PUT/PATCH/DELETE that names a DEMO-* entity_code in its
+# JSON or urlencoded body, or query string, gets 403'd before
+# reaching the route. Multipart uploads to demo accounts are
+# blocked by the demo Clerk org being limited to viewer roles
+# (which fail require_role on every write endpoint).
+app.add_middleware(DemoWriteGuardMiddleware)
 
 # Webhook receivers — must be reachable without an auth header.
 # Registered first so they appear at the top of /docs.
