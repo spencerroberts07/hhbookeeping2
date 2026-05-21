@@ -19,6 +19,7 @@ from .routes.clerk_webhook import router as clerk_webhook_router
 from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
 from .routes.depreciation import router as depreciation_router
+from .routes.documents import router as documents_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
 from .routes.entities import me_router as me_router, router as entities_router
 from .routes.gl_import import router as gl_import_router
@@ -146,6 +147,10 @@ app.include_router(onboarding_router)
 
 # Chart of accounts CRUD — app-native admin for /settings/accounts.
 app.include_router(accounts_router)
+
+# Unified documents library — aggregates uploaded files from every
+# per-module run table for the /documents page.
+app.include_router(documents_router)
 
 
 @app.get("/health", response_model=HealthResponse)
