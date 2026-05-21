@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 
-CLAUDE_MODEL_ID = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL_ID = "claude-sonnet-4-6"
 CLAUDE_INTENT_MAX_TOKENS = 800
 CLAUDE_REPLY_MAX_TOKENS = 600
 
