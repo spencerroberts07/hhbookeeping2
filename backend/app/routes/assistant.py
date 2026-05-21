@@ -160,9 +160,14 @@ def post_message(
             context=context,
         )
 
-        # 5a. Special-case the cash-balance query — inject the latest
-        # cash_balancing_days row into the reply when Claude punts.
-        if intent.intent == "query_balance" and ("…" in reply.reply or "Pulling" in reply.reply):
+        # 5a. Special-case the cash-balance query — always inject the
+        # latest cash_balancing_days closing balance. Earlier this only
+        # fired when Claude's reply contained certain trigger strings,
+        # which was fragile — sonnet-4.6 writes around them, so the
+        # dealer never saw the real number. Now: if the intent is
+        # query_balance and the DB has a row, the deterministic balance
+        # line is the authoritative answer.
+        if intent.intent == "query_balance":
             balance_text = get_balance_summary(session, body.entity_code)
             if balance_text:
                 reply.reply = balance_text

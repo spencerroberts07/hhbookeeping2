@@ -53,8 +53,11 @@ export function AlertsFeed() {
       : []),
     ...(pending.data?.suggestions ?? []).map((s) => ({
       icon: AlertCircle,
-      label: `Classification suggestion · ${s.vendor_key}`,
-      detail: `${s.suggested_account_code ?? 'UNCLASSIFIED'} (${(s.confidence ?? 0).toFixed(0)}%)`,
+      // Hard-guard every field — sometimes vendor_key is empty for txns
+      // we couldn't normalize, and suggested_account_code is null until
+      // the classifier has a candidate.
+      label: `Classification suggestion · ${s.vendor_key || 'Bank transaction'}`,
+      detail: `${s.suggested_account_code ?? 'Unclassified'} (${(s.confidence ?? 0).toFixed(0)}%)`,
     })),
     // TODO: backend endpoint not built — unified alerts feed (period-locks,
     // unmatched bank, missing documents)

@@ -173,9 +173,9 @@ export default function BankPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">All</SelectItem>
-                    <SelectItem value="pending">Pending</SelectItem>
+                    <SelectItem value="new">New</SelectItem>
+                    <SelectItem value="needs_review">Needs review</SelectItem>
                     <SelectItem value="reviewed">Reviewed</SelectItem>
-                    <SelectItem value="flagged">Flagged</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

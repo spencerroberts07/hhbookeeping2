@@ -11,7 +11,7 @@ export interface QuickbooksStatus {
 export async function getQuickbooksStatus(
   entityCode: string,
 ): Promise<QuickbooksStatus> {
-  const res = await api.get('/api/dashboard/quickbooks_status', {
+  const res = await api.get('/api/dashboard/quickbooks-status', {
     params: { entity_code: entityCode },
   });
   return res.data;

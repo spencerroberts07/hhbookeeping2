@@ -18,8 +18,8 @@ export interface BatchSummary {
   source_module: string;
   batch_label: string;
   status: string;
-  total_debit: number;
-  total_credit: number;
+  total_debits: number;
+  total_credits: number;
   line_count: number;
 }
 

@@ -1,7 +1,7 @@
 import { api } from './client';
 
 export type BankMatchState = 'matched' | 'needs_review' | 'unmatched' | 'ignored';
-export type BankReviewStatus = 'pending' | 'reviewed' | 'flagged';
+export type BankReviewStatus = 'new' | 'needs_review' | 'reviewed';
 
 export interface BankTransactionRow {
   id: string;

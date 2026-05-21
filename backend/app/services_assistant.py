@@ -171,21 +171,40 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
             "vendor_classifications": [],
         }
 
-    # Most-recent open-or-closed period (mirrors /api/period-close/current).
+    # Most-recent unclosed period whose period_end is on-or-before today.
+    # The CURRENT_DATE filter is critical — without it, future pre-seeded
+    # periods (FY2027 Sep etc.) would surface as the "current" period the
+    # assistant believes the dealer is working in. Falls back to the most
+    # recent past period (closed or not) if no eligible row matches.
+    # Mirrors the logic in routes/period_close.py::get_current_period.
     period = session.execute(
         text(
             """
             SELECT period_end, period_label, status
               FROM accounting_periods
              WHERE entity_id = :eid
-             ORDER BY
-               CASE WHEN status <> 'closed' THEN 0 ELSE 1 END,
-               period_end DESC
+               AND period_end <= CURRENT_DATE
+               AND status <> 'closed'
+             ORDER BY period_end DESC
              LIMIT 1
             """
         ),
         {"eid": entity["id"]},
     ).mappings().first()
+    if not period:
+        period = session.execute(
+            text(
+                """
+                SELECT period_end, period_label, status
+                  FROM accounting_periods
+                 WHERE entity_id = :eid
+                   AND period_end <= CURRENT_DATE
+                 ORDER BY period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"eid": entity["id"]},
+        ).mappings().first()
 
     current_period: dict[str, Any] | None = None
     if period:

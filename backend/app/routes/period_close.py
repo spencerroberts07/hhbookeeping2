@@ -231,20 +231,21 @@ def get_current_period(
 ) -> dict[str, Any]:
     """
     Return the period the dashboard should land on:
-      1. The most recent period whose status != 'closed' (typically 'open' or
-         'submitted_for_close') — that's the "active" period the dealer is
-         working in.
-      2. If every period is closed, the most recent closed period — gives the
-         dealer a view of their last closed books rather than a blank state.
-      3. 404 if no accounting_periods rows exist for this entity at all.
+      1. The most recent unclosed period whose period_end is on-or-before
+         today. That's the "active" period the dealer is working in —
+         future-dated pre-seeded periods (e.g. FY2027 Sep) are NOT
+         eligible to surface here even when status='draft'.
+      2. If no such period exists (every past period is closed), fall
+         back to the most recent closed period so the dealer sees their
+         last closed books instead of a blank state.
+      3. 404 if no accounting_periods rows exist at all.
 
     Returns: {period_end: 'YYYY-MM-DD', period_label, status}.
-    The frontend feeds period_end into /api/period-close/status for the full
-    payload.
     """
     from sqlalchemy import text as _text
 
     with db_session() as session:
+        # Primary: most recent unclosed period with period_end <= today.
         row = session.execute(
             _text(
                 """
@@ -252,14 +253,31 @@ def get_current_period(
                   FROM accounting_periods ap
                   JOIN entities e ON e.id = ap.entity_id
                  WHERE e.entity_code = :entity_code
-                 ORDER BY
-                   CASE WHEN ap.status <> 'closed' THEN 0 ELSE 1 END,
-                   ap.period_end DESC
+                   AND ap.period_end <= CURRENT_DATE
+                   AND ap.status <> 'closed'
+                 ORDER BY ap.period_end DESC
                  LIMIT 1
                 """
             ),
             {"entity_code": entity_code},
         ).mappings().first()
+        # Fallback: every past period is closed — show the most recent
+        # closed one so the dealer still has context.
+        if not row:
+            row = session.execute(
+                _text(
+                    """
+                    SELECT ap.period_end, ap.period_label, ap.status
+                      FROM accounting_periods ap
+                      JOIN entities e ON e.id = ap.entity_id
+                     WHERE e.entity_code = :entity_code
+                       AND ap.period_end <= CURRENT_DATE
+                     ORDER BY ap.period_end DESC
+                     LIMIT 1
+                    """
+                ),
+                {"entity_code": entity_code},
+            ).mappings().first()
     if not row:
         raise HTTPException(
             status_code=404,
