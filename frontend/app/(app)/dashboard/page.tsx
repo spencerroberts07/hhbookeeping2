@@ -11,11 +11,11 @@ import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
 import { getQuickbooksStatus, getGrossMargin } from '@/lib/api/dashboard';
+import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestPosFinancial } from '@/lib/api/pos';
-import { getLatestCashBalancing } from '@/lib/api/cash_balancing';
 import { AssistantWidget } from '@/components/assistant/assistant-widget';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
@@ -88,11 +88,15 @@ export default function DashboardPage() {
     enabled: !!entityCode,
     queryFn: () => getLatestPosFinancial(entityCode!),
   });
-  const cashLatest = useQuery({
-    queryKey: ['cash-balancing-latest', entityCode],
+  // Cash card now reads from QBO live (sum of every active bank
+  // account's CurrentBalance). The cash_balancing_days snapshot from
+  // last night isn't a real-time view — QBO is.
+  const qboBalances = useQuery({
+    queryKey: ['qbo-bank-balances', entityCode],
     enabled: !!entityCode,
-    retry: false,
-    queryFn: () => getLatestCashBalancing(entityCode!),
+    queryFn: () => getQboBankBalances(entityCode!),
+    // Live-ish: stale after 60s, refetch on focus.
+    staleTime: 60 * 1000,
   });
   const grossMargin = useQuery({
     queryKey: ['gross-margin', entityCode],
@@ -189,41 +193,35 @@ export default function DashboardPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {cashLatest.isLoading ? (
+              {qboBalances.isLoading ? (
                 <Skeleton className="h-9 w-32" />
-              ) : cashLatest.data ? (
+              ) : qboBalances.data?.connected ? (
                 <>
                   <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                    {formatMoney(cashLatest.data.closing_balance)}
+                    {formatMoney(qboBalances.data.total_balance)}
                   </div>
                   <p className="text-xs text-slate mt-1">
-                    Closing cash · {cashLatest.data.business_date}
-                    {cashLatest.data.variance !== null && (
-                      <>
-                        {' · '}
-                        <span
-                          className={
-                            cashLatest.data.status === 'balanced'
-                              ? 'text-bw-teal'
-                              : 'text-amber-700'
-                          }
-                        >
-                          {cashLatest.data.status === 'balanced'
-                            ? 'Balanced'
-                            : `Variance ${formatMoney(cashLatest.data.variance, { signed: true })}`}
-                        </span>
-                      </>
-                    )}
+                    {qboBalances.data.accounts.length} bank account
+                    {qboBalances.data.accounts.length === 1 ? '' : 's'} · live
+                    from QuickBooks
                   </p>
+                  {qboBalances.data.fetched_at && (
+                    <p className="text-[10px] text-slate mt-0.5">
+                      Updated {new Date(qboBalances.data.fetched_at).toLocaleTimeString()}
+                    </p>
+                  )}
                 </>
               ) : (
                 <>
                   <div className="text-2xl font-bold text-slate">
-                    No cash data yet
+                    Not connected
                   </div>
-                  <p className="text-xs text-slate mt-1">
-                    Enable the nightly sync to track cash.
-                  </p>
+                  <Link
+                    href="/settings"
+                    className="text-xs text-ledger-blue hover:underline"
+                  >
+                    Connect QuickBooks to see live balance →
+                  </Link>
                 </>
               )}
             </CardContent>

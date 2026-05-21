@@ -173,6 +173,55 @@ class QuickBooksClient:
             response.raise_for_status()
             return response.json()
 
+    async def get_account_balances(
+        self,
+        realm_id: str,
+        access_token: str,
+    ) -> list[dict[str, Any]]:
+        """Pull every active bank-type account with its current balance
+        directly from QBO's Account object. Used by the dashboard cash
+        card to show a live number instead of last night's
+        cash_balancing_days snapshot.
+
+        Returns rows shaped:
+            {
+              "account_id": str,
+              "account_name": str,
+              "account_code": str,         # AcctNum (dealer-set number)
+              "account_type": str,         # always 'Bank' for this caller
+              "account_subtype": str,
+              "current_balance": Decimal,
+              "currency": str,
+            }
+        """
+        rows = await self.query_all(
+            realm_id=realm_id,
+            access_token=access_token,
+            base_query=(
+                "SELECT * FROM Account "
+                "WHERE AccountType = 'Bank' AND Active = true"
+            ),
+            object_name="Account",
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            currency_ref = r.get("CurrencyRef") or {}
+            currency = (
+                currency_ref.get("value")
+                if isinstance(currency_ref, dict)
+                else None
+            ) or "CAD"
+            out.append({
+                "account_id": str(r.get("Id") or ""),
+                "account_name": (r.get("Name") or "").strip() or "Unnamed",
+                "account_code": (r.get("AcctNum") or r.get("Id") or "").strip(),
+                "account_type": r.get("AccountType") or "Bank",
+                "account_subtype": r.get("AccountSubType") or "",
+                "current_balance": _decimal(r.get("CurrentBalance")),
+                "currency": currency,
+            })
+        return out
+
     # ----------------------------------------------------------------------
     # Report endpoints
     # ----------------------------------------------------------------------
