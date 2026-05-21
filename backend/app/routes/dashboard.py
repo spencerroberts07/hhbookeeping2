@@ -35,13 +35,20 @@ def quickbooks_status(entity_code: str = Query(default="1877-8")) -> DashboardRe
                 text("SELECT COUNT(*) AS c FROM quickbooks_transactions WHERE entity_id = :entity_id"),
                 {"entity_id": entity["id"]},
             ).mappings().first()["c"]
+            realm = conn["realm_id"] if conn else None
+            last = conn["connected_at"] if conn else None
             return DashboardResponse(
                 entity_code=entity_code,
                 has_quickbooks_connection=bool(conn),
-                company_realm_id=conn["realm_id"] if conn else None,
+                company_realm_id=realm,
                 imported_accounts=acct_count,
                 imported_transactions=txn_count,
-                last_sync_at=conn["connected_at"] if conn else None,
+                last_sync_at=last,
+                # Frontend-compatible aliases — same data, different keys.
+                is_connected=bool(conn),
+                realm_id=realm,
+                company_name=entity.get("entity_name"),
+                last_synced_at=last,
             )
     except HTTPException:
         raise

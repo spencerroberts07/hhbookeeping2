@@ -36,6 +36,13 @@ class DashboardResponse(BaseModel):
     imported_accounts: int = 0
     imported_transactions: int = 0
     last_sync_at: datetime | None = None
+    # Frontend `QuickbooksStatus` interface expects these names.
+    # Returning both shapes lets the existing frontend work unchanged
+    # while keeping the original payload backwards-compatible.
+    is_connected: bool = False
+    realm_id: str | None = None
+    company_name: str | None = None
+    last_synced_at: datetime | None = None
 
 
 class BankSyncRequest(BaseModel):

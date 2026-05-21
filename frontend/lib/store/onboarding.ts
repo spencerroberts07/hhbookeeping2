@@ -1,95 +1,88 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
+// Onboarding wizard step keys. Order matters — the shell renders the
+// progress indicator off STEP_ORDER and goTo() doesn't constrain to
+// monotonic forward motion.
 export type OnboardingStep =
   | 'welcome'
-  | 'bank'
-  | 'hh-ap'
+  | 'connect'
   | 'chart'
-  | 'payroll'
-  | 'invite'
-  | 'billing'
+  | 'cutover'
+  | 'opening'
+  | 'gl-history'
+  | 'hh-ap'
   | 'complete';
 
 export const STEP_ORDER: OnboardingStep[] = [
   'welcome',
-  'bank',
-  'hh-ap',
+  'connect',
   'chart',
-  'payroll',
-  'invite',
-  'billing',
+  'cutover',
+  'opening',
+  'gl-history',
+  'hh-ap',
   'complete',
 ];
 
 export interface OnboardingState {
   currentStep: OnboardingStep;
-  // Step 1
-  store_number: string;
-  store_name: string;
-  province: string;
-  fiscal_year_end_month: number;
-  fiscal_year_end_day: number;
-  entity_code: string | null; // populated after POST /api/entities
 
-  // Step 2
-  bank_type: string | null;
-  bank_sample_uploaded: boolean;
+  // Step 2 / connect path
+  connect_path: 'qbo' | 'file' | null;
 
-  // Step 3
-  hh_ap_sample_uploaded: boolean;
+  // Step 4 / cutover
+  cutover_date: string; // ISO YYYY-MM-DD
 
-  // Step 4
-  chart_choice: 'standard' | 'custom' | null;
+  // Step 6 / GL history
+  gl_date_from: string;
+  gl_date_to: string;
 
-  // Step 5
-  uses_enetemployer: boolean | null;
-  payroll_sample_uploaded: boolean;
-
-  // Step 6
-  invited_team: Array<{ email: string; role: string }>;
-
-  // Step 7
-  plan_tier: 'starter' | 'professional' | null;
-
-  setField: <K extends keyof Omit<OnboardingState, 'setField' | 'goTo' | 'reset' | 'markComplete'>>(
+  setField: <K extends keyof Omit<OnboardingState, 'setField' | 'goTo' | 'reset' | 'next' | 'prev'>>(
     key: K,
     value: OnboardingState[K],
   ) => void;
   goTo: (step: OnboardingStep) => void;
+  next: () => void;
+  prev: () => void;
   reset: () => void;
-  markComplete: () => void;
+}
+
+function defaultCutoverISO(): string {
+  // Default: start of current fiscal year (Oct 1 for HH dealers).
+  const today = new Date();
+  const year = today.getMonth() >= 9 ? today.getFullYear() : today.getFullYear() - 1;
+  return `${year}-10-01`;
 }
 
 const INITIAL: Omit<
   OnboardingState,
-  'setField' | 'goTo' | 'reset' | 'markComplete'
+  'setField' | 'goTo' | 'next' | 'prev' | 'reset'
 > = {
   currentStep: 'welcome',
-  store_number: '',
-  store_name: '',
-  province: 'ON',
-  fiscal_year_end_month: 12,
-  fiscal_year_end_day: 31,
-  entity_code: null,
-  bank_type: null,
-  bank_sample_uploaded: false,
-  hh_ap_sample_uploaded: false,
-  chart_choice: null,
-  uses_enetemployer: null,
-  payroll_sample_uploaded: false,
-  invited_team: [],
-  plan_tier: null,
+  connect_path: null,
+  cutover_date: defaultCutoverISO(),
+  gl_date_from: '',
+  gl_date_to: '',
 };
 
 export const useOnboardingStore = create<OnboardingState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       ...INITIAL,
       setField: (key, value) => set({ [key]: value } as Partial<OnboardingState>),
       goTo: (step) => set({ currentStep: step }),
+      next: () => {
+        const i = STEP_ORDER.indexOf(get().currentStep);
+        if (i >= 0 && i < STEP_ORDER.length - 1) {
+          set({ currentStep: STEP_ORDER[i + 1]! });
+        }
+      },
+      prev: () => {
+        const i = STEP_ORDER.indexOf(get().currentStep);
+        if (i > 0) set({ currentStep: STEP_ORDER[i - 1]! });
+      },
       reset: () => set(INITIAL),
-      markComplete: () => set({ currentStep: 'complete' }),
     }),
     {
       name: 'bookwize.onboarding',
@@ -106,15 +99,3 @@ export const useOnboardingStore = create<OnboardingState>()(
     },
   ),
 );
-
-export function getNextStep(current: OnboardingStep): OnboardingStep | null {
-  const idx = STEP_ORDER.indexOf(current);
-  if (idx < 0 || idx >= STEP_ORDER.length - 1) return null;
-  return STEP_ORDER[idx + 1] ?? null;
-}
-
-export function getPrevStep(current: OnboardingStep): OnboardingStep | null {
-  const idx = STEP_ORDER.indexOf(current);
-  if (idx <= 0) return null;
-  return STEP_ORDER[idx - 1] ?? null;
-}

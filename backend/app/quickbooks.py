@@ -1,13 +1,18 @@
 import base64
+import calendar
+import logging
 import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import date as DateType, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterable
 from urllib.parse import urlencode
 
 import httpx
 from sqlalchemy import text
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 BANK_ACCOUNT_TYPES = {
     "Bank",
@@ -167,6 +172,319 @@ class QuickBooksClient:
             response = await client.get(url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
+
+    # ----------------------------------------------------------------------
+    # Report endpoints
+    # ----------------------------------------------------------------------
+    async def get_report(
+        self,
+        realm_id: str,
+        access_token: str,
+        report_name: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generic QBO report fetcher. Hits
+        /v3/company/{realm}/reports/{report_name}. Returns raw JSON.
+
+        Caller is responsible for token freshness (use
+        ensure_valid_access_token() before calling).
+        """
+        url = f"{self.api_base_url}/v3/company/{realm_id}/reports/{report_name}"
+        query: dict[str, Any] = {"minorversion": self.minor_version}
+        if params:
+            # QBO accepts most report params as query-string values. Skip
+            # None and stringify dates/decimals so httpx serializes cleanly.
+            for k, v in params.items():
+                if v is None:
+                    continue
+                if isinstance(v, (DateType, datetime)):
+                    query[k] = v.isoformat()[:10]
+                else:
+                    query[k] = str(v)
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.get(url, headers=headers, params=query)
+            response.raise_for_status()
+            return response.json()
+
+    async def get_trial_balance(
+        self,
+        realm_id: str,
+        access_token: str,
+        as_of_date: DateType,
+    ) -> list[dict[str, Any]]:
+        """Pull TrialBalance and parse into a flat list of account rows.
+
+        Returns rows shaped:
+            {
+              "account_id": str,
+              "account_name": str,
+              "account_type": str,    # derived from prefix when QBO omits
+              "account_subtype": str, # may be empty
+              "debit_balance": Decimal,
+              "credit_balance": Decimal,
+              "net_balance": Decimal, # debit - credit
+            }
+        """
+        payload = await self.get_report(
+            realm_id,
+            access_token,
+            "TrialBalance",
+            {
+                "date_macro": "custom",
+                "start_date": as_of_date,
+                "end_date": as_of_date,
+            },
+        )
+        return _parse_trial_balance(payload)
+
+    async def get_general_ledger(
+        self,
+        realm_id: str,
+        access_token: str,
+        date_from: DateType,
+        date_to: DateType,
+        account_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pull GeneralLedger for a date range and flatten into journal-line
+        rows. QBO's GL report is structured by account section; this
+        helper traverses the section tree and emits one row per line.
+
+        QBO's GL report can be slow and large; for multi-year imports the
+        caller should chunk by month and accumulate.
+
+        Returns rows shaped:
+            {
+              "transaction_date": date,
+              "transaction_type": str,
+              "reference_number": str,
+              "account_id": str,
+              "account_name": str,
+              "description": str,
+              "debit_amount": Decimal,
+              "credit_amount": Decimal,
+              "running_balance": Decimal,
+            }
+        """
+        params: dict[str, Any] = {
+            "start_date": date_from,
+            "end_date": date_to,
+            "columns": "tx_date,txn_type,doc_num,name,memo,subt_nat_amount,rbal_nat_amount",
+        }
+        if account_id:
+            params["account"] = account_id
+
+        payload = await self.get_report(
+            realm_id,
+            access_token,
+            "GeneralLedger",
+            params,
+        )
+        return _parse_general_ledger(payload)
+
+
+# --------------------------------------------------------------------------
+# Report parsers
+# --------------------------------------------------------------------------
+
+
+def _decimal(value: Any) -> Decimal:
+    if value in (None, ""):
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _iter_rows(node: Any) -> Iterable[dict[str, Any]]:
+    """Walk the recursive QBO Rows / Row tree. Yields each individual Row
+    dict (both data rows and section headers — caller decides which to keep).
+    """
+    if not isinstance(node, dict):
+        return
+    rows_block = node.get("Rows") or {}
+    for row in rows_block.get("Row", []) or []:
+        yield row
+        # Sections nest further rows under their own Rows key.
+        if row.get("type") == "Section":
+            yield from _iter_rows(row)
+
+
+def _account_type_from_code(code: str) -> str:
+    """Match the prefix convention used elsewhere in the codebase."""
+    p = (code or "").strip()[:1]
+    return {
+        "1": "Asset",
+        "2": "Liability",
+        "3": "Equity",
+        "4": "Revenue",
+        "5": "COGS",
+        "6": "Expense",
+        "7": "Expense",
+        "8": "Expense",
+        "9": "Expense",
+    }.get(p, "Other")
+
+
+def _parse_trial_balance(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Walk a QBO TrialBalance JSON response and yield one row per account.
+
+    QBO TB rows usually carry: account_id, account_name, debit, credit.
+    The report layout uses ColData with positional columns. Column count
+    can vary (some realms include a sub-account column); we defensively
+    pull the last two numeric columns as debit/credit.
+    """
+    out: list[dict[str, Any]] = []
+    for row in _iter_rows(payload):
+        # Sections (header / totals) have no ColData; data rows do.
+        if row.get("type") == "Section":
+            continue
+        col_data = row.get("ColData") or []
+        if not col_data:
+            continue
+        # First column is always the account label. id may be present on
+        # the same column under "id". Defensive: scan for the first
+        # column with a non-empty value.
+        first = col_data[0]
+        account_name = (first.get("value") or "").strip()
+        account_id = str(first.get("id") or "").strip() or account_name
+        if not account_name:
+            continue
+
+        # The last two columns are debit / credit. Pull them positionally
+        # — QBO omits a value when it's zero.
+        numeric_values: list[Decimal] = []
+        for col in col_data[1:]:
+            raw = (col.get("value") or "").strip()
+            if raw == "":
+                numeric_values.append(Decimal("0"))
+            else:
+                numeric_values.append(_decimal(raw))
+
+        if len(numeric_values) >= 2:
+            debit_balance = numeric_values[-2]
+            credit_balance = numeric_values[-1]
+        elif len(numeric_values) == 1:
+            # Some TB report layouts collapse to a single signed column
+            # ("net debit"). Positive → debit, negative → credit.
+            net = numeric_values[0]
+            if net >= 0:
+                debit_balance, credit_balance = net, Decimal("0")
+            else:
+                debit_balance, credit_balance = Decimal("0"), -net
+        else:
+            continue
+
+        if debit_balance == 0 and credit_balance == 0:
+            continue
+
+        out.append({
+            "account_id": account_id,
+            "account_name": account_name,
+            "account_type": _account_type_from_code(account_id),
+            "account_subtype": "",
+            "debit_balance": debit_balance,
+            "credit_balance": credit_balance,
+            "net_balance": debit_balance - credit_balance,
+        })
+    return out
+
+
+def _parse_general_ledger(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Walk a GL report. Each Section is an account; rows under it are
+    transaction lines for that account.
+
+    Returns lines flattened — every line carries its parent account.
+    """
+    out: list[dict[str, Any]] = []
+    rows_block = (payload.get("Rows") or {}).get("Row", []) or []
+    for section in rows_block:
+        if section.get("type") != "Section":
+            continue
+        # The section header is usually a single ColData with the account
+        # name; the account id is on the Header's ColData[0].id.
+        header = section.get("Header") or {}
+        header_cols = header.get("ColData") or []
+        if not header_cols:
+            continue
+        account_name = (header_cols[0].get("value") or "").strip()
+        account_id = str(header_cols[0].get("id") or "").strip() or account_name
+
+        for row in (section.get("Rows") or {}).get("Row", []) or []:
+            if row.get("type") == "Section":
+                # GL sometimes nests sub-account sections — skip nesting,
+                # _iter_rows would double-emit.
+                continue
+            cols = row.get("ColData") or []
+            if not cols:
+                continue
+            # columns: tx_date, txn_type, doc_num, name, memo,
+            # subt_nat_amount, rbal_nat_amount
+            txn_date_str = (cols[0].get("value") if len(cols) > 0 else "") or ""
+            try:
+                txn_date = datetime.strptime(txn_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                # Beginning-of-period totals etc.
+                continue
+            txn_type = (cols[1].get("value") if len(cols) > 1 else "") or ""
+            doc_num = (cols[2].get("value") if len(cols) > 2 else "") or ""
+            name = (cols[3].get("value") if len(cols) > 3 else "") or ""
+            memo = (cols[4].get("value") if len(cols) > 4 else "") or ""
+            subt_raw = (cols[5].get("value") if len(cols) > 5 else "") or ""
+            rbal_raw = (cols[6].get("value") if len(cols) > 6 else "") or ""
+
+            subt = _decimal(subt_raw)
+            running = _decimal(rbal_raw)
+            if subt >= 0:
+                debit_amount, credit_amount = subt, Decimal("0")
+            else:
+                debit_amount, credit_amount = Decimal("0"), -subt
+
+            # Description: prefer memo; fall back to name; fall back to
+            # txn_type so something always renders.
+            description = memo.strip() or name.strip() or txn_type
+
+            out.append({
+                "transaction_date": txn_date,
+                "transaction_type": txn_type,
+                "reference_number": doc_num,
+                "account_id": account_id,
+                "account_name": account_name,
+                "description": description,
+                "counterparty_name": name.strip() or None,
+                "debit_amount": debit_amount,
+                "credit_amount": credit_amount,
+                "running_balance": running,
+            })
+    return out
+
+
+def month_chunks(date_from: DateType, date_to: DateType) -> list[tuple[DateType, DateType]]:
+    """Yield (month_start, month_end) tuples spanning the date range.
+
+    Used by the GL importer so we can pull a month at a time, log
+    progress, and avoid timeouts on multi-year ranges.
+    """
+    if date_to < date_from:
+        return []
+    chunks: list[tuple[DateType, DateType]] = []
+    cursor = DateType(date_from.year, date_from.month, 1)
+    while cursor <= date_to:
+        last_day = calendar.monthrange(cursor.year, cursor.month)[1]
+        month_end = DateType(cursor.year, cursor.month, last_day)
+        start = max(cursor, date_from)
+        end = min(month_end, date_to)
+        chunks.append((start, end))
+        # Advance to first of next month.
+        if cursor.month == 12:
+            cursor = DateType(cursor.year + 1, 1, 1)
+        else:
+            cursor = DateType(cursor.year, cursor.month + 1, 1)
+    return chunks
 
 
 def token_expiry_from_seconds(seconds: int | None) -> datetime | None:

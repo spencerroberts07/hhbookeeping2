@@ -1,5 +1,7 @@
 'use client';
 
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { Topbar } from '@/components/layout/topbar';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -9,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
 import { getQuickbooksStatus } from '@/lib/api/dashboard';
+import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestPosFinancial } from '@/lib/api/pos';
@@ -19,12 +22,35 @@ import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
 import { QuickActions } from './_components/quick-actions';
 import { AlertsFeed } from './_components/alerts-feed';
-import { CalendarPlus } from 'lucide-react';
+import { CalendarPlus, Sparkles } from 'lucide-react';
 import type { AxiosError } from 'axios';
 import Link from 'next/link';
 
 export default function DashboardPage() {
+  const router = useRouter();
   const entityCode = useEntityStore((s) => s.activeEntityCode);
+
+  // Onboarding gate. Three states:
+  //   1. onboarding_complete = true            → render dashboard normally
+  //   2. !complete && entity has zero data     → redirect to /onboarding
+  //   3. !complete && entity has some data     → render dashboard + banner
+  // We don't redirect dealers with partial data (Bridlewood-style) so
+  // they can keep using the app while finishing setup.
+  const onboarding = useQuery({
+    queryKey: ['onboarding-status', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getOnboardingStatus(entityCode!),
+  });
+  useEffect(() => {
+    if (!onboarding.data) return;
+    if (
+      !onboarding.data.onboarding_complete &&
+      !onboarding.data.has_chart_of_accounts &&
+      onboarding.data.journal_line_count === 0
+    ) {
+      router.replace('/onboarding');
+    }
+  }, [onboarding.data, router]);
 
   // Find the period the dashboard should land on by querying the backend
   // for the most recent open-or-closed period. A 404 means no periods
@@ -120,10 +146,34 @@ export default function DashboardPage() {
     );
   }
 
+  const showOnboardingBanner =
+    onboarding.data &&
+    !onboarding.data.onboarding_complete &&
+    (onboarding.data.has_chart_of_accounts || onboarding.data.journal_line_count > 0);
+
   return (
     <>
       <Topbar title="Dashboard" periodLabel={periodLabel} />
       <main className="p-6 space-y-6">
+        {showOnboardingBanner && (
+          <div className="rounded-xl border-2 border-ledger-blue/30 bg-ledger-blue/5 p-4 flex items-center gap-3">
+            <Sparkles className="h-5 w-5 text-ledger-blue shrink-0" />
+            <div className="flex-1">
+              <div className="font-semibold text-deep-navy">
+                Complete your setup to unlock all features
+              </div>
+              <div className="text-xs text-slate">
+                Finish your onboarding checklist — opening balances, GL history,
+                and HH AP statements give the AI assistant the context it needs.
+              </div>
+            </div>
+            <Link href="/onboarding">
+              <Button variant="accent" size="sm">
+                Continue setup →
+              </Button>
+            </Link>
+          </div>
+        )}
         <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
           {/* Cash position */}
           <Card>

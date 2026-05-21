@@ -1,183 +1,62 @@
 'use client';
 
-import { useState } from 'react';
-import { useForm } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
-import { z } from 'zod';
-import { useOnboardingStore } from '@/lib/store/onboarding';
-import { createEntity } from '@/lib/api/entities';
+import { useUser } from '@clerk/nextjs';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import { toast } from 'sonner';
-import type { AxiosError } from 'axios';
+import { useOnboardingStore } from '@/lib/store/onboarding';
+import { useEntityStore } from '@/lib/store/entity';
 
-const PROVINCES = [
-  'AB', 'BC', 'MB', 'NB', 'NL', 'NS', 'NT', 'NU', 'ON', 'PE', 'QC', 'SK', 'YT',
-];
-
-const schema = z.object({
-  store_number: z.string().min(2).max(20),
-  store_name: z.string().min(1),
-  province: z.string().min(2).max(4),
-  fiscal_year_end_month: z.coerce.number().int().min(1).max(12),
-  fiscal_year_end_day: z.coerce.number().int().min(1).max(31),
-});
-type FormValues = z.infer<typeof schema>;
-
+// Step 1: welcome. The entity is created by the Clerk webhook when the
+// org gets provisioned, so by the time the user lands here, the
+// entity_code is already populated in useEntityStore. We just show a
+// confirmation card and kick the user into the connect/upload step.
 export function StepWelcome() {
-  const store = useOnboardingStore();
-  const [submitting, setSubmitting] = useState(false);
-
-  const {
-    register,
-    handleSubmit,
-    setValue,
-    watch,
-    formState: { errors },
-  } = useForm<FormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      store_number: store.store_number,
-      store_name: store.store_name,
-      province: store.province,
-      fiscal_year_end_month: store.fiscal_year_end_month,
-      fiscal_year_end_day: store.fiscal_year_end_day,
-    },
-  });
-
-  const province = watch('province');
-
-  const onSubmit = async (values: FormValues) => {
-    setSubmitting(true);
-    try {
-      store.setField('store_number', values.store_number);
-      store.setField('store_name', values.store_name);
-      store.setField('province', values.province);
-      store.setField('fiscal_year_end_month', values.fiscal_year_end_month);
-      store.setField('fiscal_year_end_day', values.fiscal_year_end_day);
-
-      const entity = await createEntity({
-        entity_code: values.store_number,
-        entity_name: values.store_name,
-        fiscal_year_end_month: values.fiscal_year_end_month,
-        fiscal_year_end_day: values.fiscal_year_end_day,
-        province: values.province,
-        base_currency: 'CAD',
-      });
-      store.setField('entity_code', entity.entity_code);
-      store.goTo('bank');
-      toast.success(`Entity ${entity.entity_code} created`);
-    } catch (err) {
-      const axiosErr = err as AxiosError<{ detail?: string }>;
-      const status = axiosErr.response?.status;
-      const detail = axiosErr.response?.data?.detail;
-      // 409 conflict — entity already exists. We tolerate and move on, since
-      // the user may be resuming onboarding after a crash.
-      if (status === 409) {
-        store.setField('entity_code', values.store_number);
-        store.goTo('bank');
-      } else {
-        toast.error(detail ?? 'Could not create entity');
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  const { user } = useUser();
+  const next = useOnboardingStore((s) => s.next);
+  const entities = useEntityStore((s) => s.entities);
+  const activeCode = useEntityStore((s) => s.activeEntityCode);
+  const entity = entities.find((e) => e.entity_code === activeCode);
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
+    <div className="space-y-6">
       <div>
-        <h2 className="text-h2 text-deep-navy mb-2">
-          Welcome to BookWize
-        </h2>
-        <p className="text-slate">
-          Tell us about your Home Hardware store. This becomes your primary
-          entity in the system — every transaction will be scoped to it.
+        <h1 className="text-h1 text-deep-navy">
+          Welcome to BookWize{user?.firstName ? `, ${user.firstName}` : ''}
+        </h1>
+        <p className="text-slate mt-1">
+          {entity?.entity_name
+            ? `Let's set up ${entity.entity_name}.`
+            : "Let's get your books wired up."}
         </p>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div>
-          <Label htmlFor="store_number">Store number</Label>
-          <Input
-            id="store_number"
-            placeholder="1877-8"
-            {...register('store_number')}
-            aria-invalid={!!errors.store_number}
-          />
-          {errors.store_number && (
-            <p className="text-xs text-red-600 mt-1">
-              {errors.store_number.message}
-            </p>
-          )}
+
+      <div className="rounded-xl bg-cloud p-5 space-y-3">
+        <div className="flex justify-between text-sm">
+          <span className="text-slate">Store name</span>
+          <span className="font-semibold text-deep-navy">
+            {entity?.entity_name ?? '—'}
+          </span>
         </div>
-        <div>
-          <Label htmlFor="store_name">Store name</Label>
-          <Input
-            id="store_name"
-            placeholder="Bridlewood Home Hardware"
-            {...register('store_name')}
-            aria-invalid={!!errors.store_name}
-          />
-          {errors.store_name && (
-            <p className="text-xs text-red-600 mt-1">
-              {errors.store_name.message}
-            </p>
-          )}
-        </div>
-        <div>
-          <Label htmlFor="province">Province</Label>
-          <Select
-            value={province}
-            onValueChange={(v) => setValue('province', v)}
-          >
-            <SelectTrigger id="province">
-              <SelectValue placeholder="Pick a province" />
-            </SelectTrigger>
-            <SelectContent>
-              {PROVINCES.map((p) => (
-                <SelectItem key={p} value={p}>
-                  {p}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <Label htmlFor="fye_month">Fiscal year-end month</Label>
-            <Input
-              id="fye_month"
-              type="number"
-              min={1}
-              max={12}
-              {...register('fiscal_year_end_month')}
-            />
-          </div>
-          <div>
-            <Label htmlFor="fye_day">Day</Label>
-            <Input
-              id="fye_day"
-              type="number"
-              min={1}
-              max={31}
-              {...register('fiscal_year_end_day')}
-            />
-          </div>
+        <div className="flex justify-between text-sm">
+          <span className="text-slate">Store number</span>
+          <span className="font-mono text-deep-navy">{activeCode ?? '—'}</span>
         </div>
       </div>
-      <div className="flex justify-end pt-4">
-        <Button type="submit" disabled={submitting}>
-          {submitting ? 'Creating…' : 'Continue'}
+
+      <div className="text-sm text-slate space-y-2">
+        <p>This setup takes about 5–10 minutes. We'll:</p>
+        <ul className="list-disc list-inside space-y-1 ml-2">
+          <li>Pull or upload your chart of accounts</li>
+          <li>Pick a cut-over date</li>
+          <li>Import your opening balances</li>
+          <li>Load historical transactions so the AI assistant learns your business</li>
+        </ul>
+      </div>
+
+      <div className="flex justify-end pt-2">
+        <Button variant="accent" size="lg" onClick={next}>
+          Get started →
         </Button>
       </div>
-    </form>
+    </div>
   );
 }

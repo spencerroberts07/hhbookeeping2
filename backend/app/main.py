@@ -28,6 +28,7 @@ from .routes.hh_ap_remittance_bank_match import (
     router as hh_ap_remittance_bank_match_router,
 )
 from .routes.month_end import router as month_end_router
+from .routes.onboarding import router as onboarding_router
 from .routes.month_end_close import router as month_end_close_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
 from .routes.month_end_workflow import router as month_end_workflow_router
@@ -128,6 +129,10 @@ app.include_router(reports_router)
 
 # BookWize AI assistant — conversational classifier + entity memory.
 app.include_router(assistant_router)
+
+# Dealer onboarding — 8-step wizard backend (chart, opening balances,
+# GL history pull via QBO or file upload).
+app.include_router(onboarding_router)
 
 
 @app.get("/health", response_model=HealthResponse)
