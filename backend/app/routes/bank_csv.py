@@ -82,7 +82,18 @@ async def bank_csv_preview(
     try:
         file_bytes = await file.read()
         column_map_override = _parse_column_map_json(column_map_json)
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         with db_session() as session:
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="bank_csv",
+            ), None)
             return preview_bank_csv_import(
                 session=session,
                 entity_code=entity_code,
@@ -121,6 +132,10 @@ async def bank_csv_upload(
     try:
         file_bytes = await file.read()
         column_map_override = _parse_column_map_json(column_map_json)
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         # R2 archive — best-effort.
         from ..services_storage import content_type_for, storage_service
         from sqlalchemy import text as _text
@@ -132,6 +147,13 @@ async def bank_csv_upload(
             content_type=content_type_for(file.filename or ""),
         )
         with db_session() as session:
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="bank_csv",
+            ), None)
             result = run_bank_csv_import(
                 session=session,
                 entity_code=entity_code,

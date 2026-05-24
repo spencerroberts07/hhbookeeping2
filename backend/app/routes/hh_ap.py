@@ -2263,6 +2263,10 @@ async def hh_ap_upload_documents(
     _user: dict = Depends(require_role("bookkeeper")),
 ):
     enforce_entity_code(_user, entity_code)
+    from ..services_entity_validation import (
+        raise_or_warn as _raise_or_warn,
+        validate_document_entity as _validate_entity,
+    )
     with db_session() as session:
         entity = get_entity(session, entity_code)
         normalized_document_date = normalize_optional_date_input(document_date)
@@ -2270,11 +2274,24 @@ async def hh_ap_upload_documents(
         inserted_documents: list[dict[str, Any]] = []
         updated_documents: list[dict[str, Any]] = []
         duplicate_documents: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
 
         for upload in files:
             file_bytes = await upload.read()
             if not file_bytes:
                 continue
+
+            # Entity-validation gate. HH AP filenames carry the store
+            # number ('14643_...' = 1464-3); mismatch blocks the save.
+            # Prevents the Lyndhurst-into-Bridlewood class of bug.
+            _vres = _validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=upload.filename or "",
+                document_type=document_type,
+            )
+            _raise_or_warn(_vres, warnings)
 
             source_hash = build_source_hash(file_bytes)
             extracted_text = try_extract_text(file_bytes=file_bytes, filename=upload.filename or "unknown", content_type=upload.content_type)
@@ -2422,6 +2439,7 @@ async def hh_ap_upload_documents(
             "inserted_documents": inserted_documents,
             "updated_documents": updated_documents,
             "duplicate_documents": duplicate_documents,
+            "warnings": warnings,
         }
 
 
@@ -2445,6 +2463,11 @@ async def hh_ap_upload_and_parse_invoices_batch(
     processed_files: list[dict[str, Any]] = []
     failed_files: list[dict[str, Any]] = []
 
+    from ..services_entity_validation import (
+        raise_or_warn as _raise_or_warn,
+        validate_document_entity as _validate_entity,
+    )
+
     for upload in files:
         filename = upload.filename or "unknown"
 
@@ -2456,6 +2479,16 @@ async def hh_ap_upload_and_parse_invoices_batch(
 
             with db_session() as session:
                 entity = get_entity(session, entity_code)
+
+                # Entity gate (blocks mismatched HH store numbers).
+                _vres = _validate_entity(
+                    session,
+                    entity_code=entity_code,
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    document_type="hh_ap_invoice",
+                )
+                _raise_or_warn(_vres, None)  # warnings collated per-file below
 
                 source_hash = build_source_hash(file_bytes)
                 extracted_text = try_extract_text(

@@ -58,6 +58,18 @@ async def post_gl_upload(
 ) -> dict[str, Any]:
     enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
+    from ..services_entity_validation import (
+        raise_or_warn as _raise_or_warn,
+        validate_document_entity as _validate_entity,
+    )
+    with db_session() as _vsession:
+        _raise_or_warn(_validate_entity(
+            _vsession,
+            entity_code=entity_code,
+            file_bytes=file_bytes,
+            filename=file.filename or "",
+            document_type="gl_export",
+        ), None)
     # R2 archive — best-effort. Failure here doesn't block the parse.
     object_key = storage_service.upload_file(
         file_bytes=file_bytes,

@@ -35,7 +35,20 @@ async def post_preview(
     enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
     try:
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         with db_session() as session:
+            # Entity gate — warn-only for bank statements (formats vary
+            # too much to block confidently).
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="bank_pdf",
+            ), None)
             return preview_bank_pdf_import(
                 session=session,
                 entity_code=entity_code,
@@ -64,7 +77,18 @@ async def post_upload(
     enforce_entity_code(_user, entity_code)
     file_bytes = await file.read()
     try:
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         with db_session() as session:
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="bank_pdf",
+            ), None)
             result = run_bank_pdf_import(
                 session=session,
                 entity_code=entity_code,

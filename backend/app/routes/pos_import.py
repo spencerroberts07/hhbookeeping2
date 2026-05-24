@@ -119,6 +119,21 @@ class BuildJournalRequest(BaseModel):
 # --------------------------------------------------------------------------
 
 
+def _pos_entity_gate(session, entity_code: str, file_text: str, file: UploadFile, doc_type: str) -> None:
+    """Small wrapper so every POS endpoint has identical validation."""
+    from ..services_entity_validation import (
+        raise_or_warn as _raise_or_warn,
+        validate_document_entity as _validate_entity,
+    )
+    _raise_or_warn(_validate_entity(
+        session,
+        entity_code=entity_code,
+        file_bytes=file_text.encode("utf-8", errors="ignore") if file_text else b"",
+        filename=file.filename or "",
+        document_type=doc_type,
+    ), None)
+
+
 @router.post("/inventory-adjustment")
 async def post_import_inventory_adjustment(
     entity_code: str = Form(...),
@@ -130,6 +145,7 @@ async def post_import_inventory_adjustment(
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
+            _pos_entity_gate(session, entity_code, file_text, file, "pos_inventory_adj")
             result = import_inventory_adjustment(
                 session,
                 entity_code=entity_code,
@@ -154,6 +170,7 @@ async def post_import_pos_financial(
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
+            _pos_entity_gate(session, entity_code, file_text, file, "pos_financial")
             result = import_pos_financial(
                 session,
                 entity_code=entity_code,
@@ -180,6 +197,7 @@ async def post_import_inventory_value(
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
         with db_session() as session:
+            _pos_entity_gate(session, entity_code, file_text, file, "pos_inventory_value")
             result = import_inventory_value(
                 session,
                 entity_code=entity_code,
@@ -207,6 +225,7 @@ async def post_import_aged_ar(
     snap_override = _parse_optional_date("snapshot_date", snapshot_date)
     try:
         with db_session() as session:
+            _pos_entity_gate(session, entity_code, file_text, file, "pos_aged_ar")
             result = import_aged_ar(
                 session,
                 entity_code=entity_code,
@@ -232,6 +251,7 @@ async def post_import_ar_adjustment(
     file_text, source = await _read_file_text(file)
     try:
         with db_session() as session:
+            _pos_entity_gate(session, entity_code, file_text, file, "pos_ar_adjustment")
             result = import_ar_adjustment(
                 session,
                 entity_code=entity_code,

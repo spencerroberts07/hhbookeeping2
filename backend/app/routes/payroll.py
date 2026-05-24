@@ -254,7 +254,18 @@ async def post_upload_hours(
 
     file_bytes = await file.read()
     try:
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         with db_session() as session:
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="payroll_hours",
+            ), None)
             return build_payroll_run(
                 session,
                 entity_code=entity_code,
@@ -349,7 +360,18 @@ async def post_upload_register(
     pay_date_d = _parse_date("pay_date", pay_date) if pay_date else None
     file_bytes = await file.read()
     try:
+        from ..services_entity_validation import (
+            raise_or_warn as _raise_or_warn,
+            validate_document_entity as _validate_entity,
+        )
         with db_session() as session:
+            _raise_or_warn(_validate_entity(
+                session,
+                entity_code=entity_code,
+                file_bytes=file_bytes,
+                filename=file.filename or "",
+                document_type="payroll_register",
+            ), None)
             return build_payroll_run_from_register(
                 session,
                 entity_code=entity_code,

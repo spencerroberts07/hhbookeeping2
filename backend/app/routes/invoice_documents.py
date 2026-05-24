@@ -247,6 +247,11 @@ async def upload_invoice_documents(
     duplicates: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
+    from ..services_entity_validation import (
+        raise_or_warn as _raise_or_warn,
+        validate_document_entity as _validate_entity,
+    )
+
     for upload in files:
         filename = upload.filename or "invoice.pdf"
         try:
@@ -254,6 +259,19 @@ async def upload_invoice_documents(
             if not file_bytes:
                 failed.append({"file_name": filename, "error": "empty file"})
                 continue
+
+            # Entity gate. HH AP invoices carry the store number in
+            # the filename and PDF; outside-vendor invoices have no
+            # entity identifier and skip validation.
+            with db_session() as _vsession:
+                _raise_or_warn(_validate_entity(
+                    _vsession,
+                    entity_code=entity_code,
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    document_type="invoice_document",
+                    invoice_kind=invoice_type,
+                ), None)
 
             source_hash = _source_hash(file_bytes)
             blob = _extract_pdf_text(file_bytes) or ""
