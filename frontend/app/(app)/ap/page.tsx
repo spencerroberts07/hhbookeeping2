@@ -18,6 +18,7 @@ import { useEntityStore } from '@/lib/store/entity';
 import { getHHAPSummary, listHHAPInvoices } from '@/lib/api/hh_ap';
 import { formatMoney, formatDate } from '@/lib/utils';
 import { MultiFileUpload } from '@/components/shared/multi-file-upload';
+import { HHAPDocumentsTable } from './_components/hh-ap-documents-table';
 import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
 import { listInvoiceDocuments, getUnmatchedQueue } from '@/lib/api/invoices';
 import Link from 'next/link';
@@ -220,6 +221,8 @@ export default function ApPage() {
                 />
               </CardContent>
             </Card>
+
+            <HHAPDocumentsTable />
 
             <Card>
               <CardHeader>

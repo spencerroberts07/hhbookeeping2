@@ -80,3 +80,57 @@ export async function buildRemittanceClearing(input: {
   );
   return res.data;
 }
+
+// --------------------------------------------------------------------------
+// Document parsing status (Item A)
+// --------------------------------------------------------------------------
+
+export interface HHAPDocumentRow {
+  id: string;
+  source_filename: string;
+  document_type: string;
+  processing_status: string;
+  file_size_bytes: number | null;
+  created_at: string | null;
+  period: string | null;
+  records_parsed: number | null;
+  error_message: string | null;
+  file_url: string | null;
+}
+
+export interface HHAPDocumentsResponse {
+  documents: HHAPDocumentRow[];
+  summary: {
+    total: number;
+    parsed: number;
+    pending: number;
+    errors: number;
+  };
+}
+
+export async function listHHAPDocuments(input: {
+  entity_code: string;
+  status?: 'pending' | 'parsed' | 'errors' | string;
+  limit?: number;
+  offset?: number;
+}): Promise<HHAPDocumentsResponse> {
+  const params: Record<string, string | number> = { entity_code: input.entity_code };
+  if (input.status) params.status = input.status;
+  if (input.limit != null) params.limit = input.limit;
+  if (input.offset != null) params.offset = input.offset;
+  const res = await api.get<HHAPDocumentsResponse>('/api/hh-ap/documents', { params });
+  return res.data;
+}
+
+export async function reprocessHHAPDocument(input: {
+  document_id: string;
+  entity_code: string;
+}): Promise<{ ok: boolean; document_id: string; parsing_queued: boolean; message: string }> {
+  const fd = new FormData();
+  fd.append('entity_code', input.entity_code);
+  const res = await api.post(
+    `/api/hh-ap/documents/${input.document_id}/reprocess`,
+    fd,
+  );
+  return res.data;
+}

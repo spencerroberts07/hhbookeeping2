@@ -6,6 +6,7 @@ import {
   X,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   FileText,
   Loader2,
   Trash2,
@@ -431,6 +432,13 @@ export function MultiFileUpload({
         </div>
       )}
 
+      {/* Entity-validation warnings — appear on 200 responses when the
+          uploaded file looks like it might belong to a different store
+          but the server allowed it through (warn-only document types
+          like bank/POS/payroll/GL). HH AP returns 422 on hard
+          mismatches; those land in the error path above. */}
+      <UploadWarnings items={items} />
+
       {/* Summary */}
       {summary && (
         <div className="mt-4 rounded-lg border border-border bg-cloud p-3 text-sm">
@@ -470,6 +478,95 @@ export function MultiFileUpload({
         </div>
       )}
     </Card>
+  );
+}
+
+
+// --------------------------------------------------------------------------
+// UploadWarnings — renders the per-file `warnings` arrays the backend
+// returns when entity validation is warn-only (bank, POS, payroll,
+// GL). Dismissible per file; doesn't block any flow.
+// --------------------------------------------------------------------------
+
+
+interface BackendWarning {
+  kind?: string;
+  message?: string;
+  filename?: string;
+  extracted?: string | null;
+  expected?: string | null;
+  identifier_type?: string;
+}
+
+function UploadWarnings({ items }: { items: FileItem[] }) {
+  // Collect every response.warnings[] across the items array.
+  const allWarnings: Array<{ id: string; file: string; w: BackendWarning }> = [];
+  for (const item of items) {
+    if (item.status !== 'success') continue;
+    const data = (item as { data?: { warnings?: BackendWarning[] } }).data;
+    const ws = data?.warnings;
+    if (!Array.isArray(ws) || ws.length === 0) continue;
+    for (let i = 0; i < ws.length; i++) {
+      allWarnings.push({
+        id: `${item.id}-${i}`,
+        file: item.file.name,
+        w: ws[i] ?? {},
+      });
+    }
+  }
+
+  // Local dismissal state — session-only, fresh each visit.
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const visible = allWarnings.filter((w) => !dismissed.has(w.id));
+  if (visible.length === 0) return null;
+
+  return (
+    <div className="mt-4 space-y-2">
+      {visible.map(({ id, file, w }) => (
+        <div
+          key={id}
+          className="rounded-lg border-2 border-amber-300 bg-amber-50 p-3 text-sm flex items-start gap-3"
+        >
+          <AlertTriangle className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="font-semibold text-amber-900">
+              Store verification warning
+            </div>
+            <div className="text-amber-900/90 mt-1">
+              <span className="font-mono text-xs">{file}</span>
+              {' — '}
+              {w.message ||
+                'could not verify this document belongs to the active store. Please confirm before proceeding.'}
+            </div>
+            {(w.extracted || w.expected) && (
+              <div className="text-xs text-amber-900/70 mt-1">
+                {w.extracted && (
+                  <>
+                    Extracted: <span className="font-mono">{w.extracted}</span>
+                  </>
+                )}
+                {w.extracted && w.expected && ' · '}
+                {w.expected && (
+                  <>
+                    Expected: <span className="font-mono">{w.expected}</span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              setDismissed((d) => new Set([...Array.from(d), id]))
+            }
+            aria-label="Dismiss warning"
+            className="text-amber-700 hover:text-amber-900"
+          >
+            <X className="h-4 w-4" strokeWidth={2} />
+          </button>
+        </div>
+      ))}
+    </div>
   );
 }
 

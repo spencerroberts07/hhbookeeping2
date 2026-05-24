@@ -3357,6 +3357,195 @@ def hh_ap_statements_upsert(
 _STATEMENT_DOC_TYPES = (DOCUMENT_TYPE_HH_STATEMENT, "monthly_statement")
 
 
+# --------------------------------------------------------------------------
+# Document parsing-status visibility (Item A)
+# --------------------------------------------------------------------------
+
+
+def _hh_ap_list_documents_impl(
+    session,
+    *,
+    entity_code: str,
+    status: str | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    """Body of GET /api/hh-ap/documents. Separated so other routes
+    could share the query later. Returns docs[] + summary counts."""
+    from ..services_storage import storage_service as _r2
+
+    entity = get_entity(session, entity_code)
+
+    # Build the status-status filter clause. Two convenience values:
+    # 'pending' (uploaded_pending_parse) and 'parsed' (any parsed_*).
+    where_extras = []
+    params: dict[str, Any] = {"eid": entity["id"]}
+    if status == "pending":
+        where_extras.append("processing_status = 'uploaded_pending_parse'")
+    elif status == "parsed":
+        where_extras.append("processing_status LIKE 'parsed_%'")
+    elif status == "errors" or status == "error":
+        where_extras.append("processing_status = 'parse_error'")
+    elif status:
+        where_extras.append("processing_status = :status")
+        params["status"] = status
+
+    where_sql = " AND ".join(["entity_id = :eid"] + where_extras)
+
+    rows = session.execute(
+        text(
+            f"""
+            SELECT d.id, d.source_filename, d.document_type,
+                   d.processing_status, d.file_size_bytes,
+                   d.document_date, d.created_at, d.r2_object_key,
+                   d.raw_json,
+                   COALESCE((SELECT COUNT(*) FROM hh_ap_statement_lines sl
+                              JOIN hh_ap_statements s ON s.id = sl.statement_id
+                             WHERE s.document_id = d.id), 0) AS statement_lines,
+                   COALESCE((SELECT COUNT(*) FROM hh_ap_invoices i
+                             WHERE i.document_id = d.id), 0) AS invoice_count
+              FROM hh_ap_documents d
+             WHERE {where_sql}
+             ORDER BY d.created_at DESC
+             LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": limit, "offset": offset},
+    ).mappings().all()
+
+    summary = session.execute(
+        text(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE processing_status LIKE 'parsed_%') AS parsed,
+                   COUNT(*) FILTER (WHERE processing_status = 'uploaded_pending_parse') AS pending,
+                   COUNT(*) FILTER (WHERE processing_status = 'parse_error') AS errors
+              FROM hh_ap_documents
+             WHERE entity_id = :eid
+            """
+        ),
+        {"eid": entity["id"]},
+    ).mappings().first() or {}
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        raw = r.get("raw_json") or {}
+        records_parsed = None
+        period = None
+        if r["statement_lines"] > 0:
+            records_parsed = int(r["statement_lines"])
+        elif r["invoice_count"] > 0:
+            records_parsed = int(r["invoice_count"])
+        if r["document_date"]:
+            period = r["document_date"].strftime("%b %Y")
+        error_message = None
+        if isinstance(raw, dict):
+            error_message = raw.get("parse_error")
+        file_url = _r2.get_presigned_url(r["r2_object_key"]) if r.get("r2_object_key") else None
+        out.append({
+            "id": str(r["id"]),
+            "source_filename": r["source_filename"],
+            "document_type": r["document_type"],
+            "processing_status": r["processing_status"],
+            "file_size_bytes": r["file_size_bytes"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "period": period,
+            "records_parsed": records_parsed,
+            "error_message": error_message,
+            "file_url": file_url,
+        })
+
+    return {
+        "documents": out,
+        "summary": {
+            "total": int(summary.get("total") or 0),
+            "parsed": int(summary.get("parsed") or 0),
+            "pending": int(summary.get("pending") or 0),
+            "errors": int(summary.get("errors") or 0),
+        },
+    }
+
+
+@router.get("/documents")
+def hh_ap_list_documents(
+    entity_code: str,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    _user: dict = Depends(require_role("viewer")),
+):
+    """List uploaded HH AP documents + summary counts. Powers the
+    'Recently Uploaded Documents' table in the AP module. The frontend
+    polls this every 10s while any row is pending/parsing and stops
+    once everything is parsed or errored."""
+    try:
+        with db_session() as session:
+            return _hh_ap_list_documents_impl(
+                session,
+                entity_code=entity_code,
+                status=status,
+                limit=int(limit),
+                offset=int(offset),
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/documents/{document_id}/reprocess")
+def hh_ap_reprocess_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    entity_code: str = Form(...),
+    _user: dict = Depends(require_role("admin")),
+):
+    """Reset processing_status to uploaded_pending_parse and queue a
+    background re-parse. Useful when a doc landed in parse_error and
+    the dealer wants to retry after fixing whatever upstream issue."""
+    enforce_entity_code(_user, entity_code)
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        row = session.execute(
+            text(
+                """
+                UPDATE hh_ap_documents
+                   SET processing_status = 'uploaded_pending_parse',
+                       raw_json = COALESCE(raw_json, '{}'::jsonb)
+                                  - 'parse_error',
+                       updated_at = NOW()
+                 WHERE id = :id AND entity_id = :eid
+             RETURNING id, document_type
+                """
+            ),
+            {"id": document_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Document {document_id} not found")
+
+        # Only statement-type docs have an auto-parser today.
+        if row["document_type"] in _STATEMENT_DOC_TYPES:
+            background_tasks.add_task(
+                _run_statement_parse_bg,
+                document_id=str(row["id"]),
+                entity_id=str(entity["id"]),
+            )
+            queued = True
+        else:
+            queued = False
+
+    return {
+        "ok": True,
+        "document_id": document_id,
+        "parsing_queued": queued,
+        "message": (
+            "Re-parse queued in background."
+            if queued
+            else "Status reset. No background parser is wired for this document_type yet."
+        ),
+    }
+
+
 def run_statement_parse(session, *, document_id: str, entity_id: str) -> dict[str, Any]:
     """Parse a single hh_ap_documents row whose document_type is in
     _STATEMENT_DOC_TYPES, upsert hh_ap_statements + hh_ap_statement_lines,
