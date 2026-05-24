@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_endpoint_url: str = ""
 
+    # Static secret used by automated jobs (cron, scheduled tasks) that
+    # can't authenticate as a Clerk user. Routes that accept it look for
+    # the `X-Cron-Secret` HTTP header and bypass the normal role check
+    # when the value matches.
+    #
+    # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    # Set on Render as CRON_SECRET. Empty string disables the cron path
+    # entirely (any X-Cron-Secret header is then rejected).
+    cron_secret: str = ""
+
     # Internal-tier entities. Any entity in this list is treated as
     # plan_tier='internal' (all Professional features, no Stripe) even
     # if no billing_subscriptions row exists — fallback safety net.

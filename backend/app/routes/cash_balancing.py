@@ -1,14 +1,20 @@
 from datetime import datetime, timezone
 import json
+import secrets as _secrets_mod
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..config import settings
 from ..db import db_session
-from ..services_auth import enforce_entity_code, require_role
+from ..services_auth import (
+    _bearer_scheme,
+    enforce_entity_code,
+    require_role,
+)
 from ..google_sheets import (
     DailyCashLine,
     GoogleSheetsClient,
@@ -19,6 +25,39 @@ from ..google_sheets import (
 )
 
 router = APIRouter(prefix="/api/cash-balancing", tags=["cash-balancing"])
+
+
+def verify_sync_auth(
+    request: Request,
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> dict[str, Any]:
+    """Accept EITHER a valid X-Cron-Secret header OR a Clerk bookkeeper
+    session. The cron path is used by the Render scheduled job that
+    can't acquire a Clerk JWT; the Clerk path stays for in-app
+    triggers.
+
+    Constant-time compare on the secret prevents timing leaks. A
+    *wrong* secret returns 403 (not falling through to Clerk) so a
+    misconfigured cron job fails loudly instead of silently 401'ing.
+    """
+    if x_cron_secret is not None:
+        if (
+            settings.cron_secret
+            and _secrets_mod.compare_digest(x_cron_secret, settings.cron_secret)
+        ):
+            return {
+                "id": "cron",
+                "clerk_user_id": "cron",
+                "email": "cron@bookwize.ca",
+                "is_cron": True,
+                "is_superadmin": False,
+                "role": "bookkeeper",
+            }
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+
+    # No cron header → defer to the normal Clerk bookkeeper check.
+    return require_role("bookkeeper")(request, creds)
 
 
 EXCLUDED_DAILY_LABELS = {
@@ -178,9 +217,12 @@ def get_accounting_period_for_date(session, entity_id: str, business_date: str):
 @router.post("/sync")
 async def sync_cash_balancing(
     payload: CashBalancingSyncRequest,
-    _user: Any = Depends(require_role("bookkeeper")),
+    _user: Any = Depends(verify_sync_auth),
 ):
-    enforce_entity_code(_user, payload.entity_code)
+    # Cron callers run system-wide; they aren't pinned to a single
+    # Clerk org so the per-entity match check doesn't apply.
+    if not _user.get("is_cron"):
+        enforce_entity_code(_user, payload.entity_code)
     selected_tabs: list[str] = dedupe_preserve_order(payload.sheet_tabs)
 
     with db_session() as session:
