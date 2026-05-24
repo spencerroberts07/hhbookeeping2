@@ -134,6 +134,36 @@ def _pos_entity_gate(session, entity_code: str, file_text: str, file: UploadFile
     ), None)
 
 
+def _pos_archive_to_r2(
+    entity_code: str, file_text: str, file: UploadFile, doc_type: str
+) -> str | None:
+    """Best-effort R2 archive. POS endpoints decode to text immediately
+    so we re-encode for R2 storage — lossy on binary but POS reports
+    are text/tab-delimited."""
+    from ..services_storage import (
+        content_type_for as _ct_for,
+        storage_service as _r2,
+    )
+    return _r2.upload_file(
+        file_bytes=file_text.encode("utf-8", errors="ignore") if file_text else b"",
+        original_filename=file.filename or f"{doc_type}.txt",
+        entity_code=entity_code,
+        document_type=doc_type,
+        content_type=_ct_for(file.filename or "report.txt"),
+    )
+
+
+def _pos_set_run_file_path(session, run_id: str | None, r2_key: str | None) -> None:
+    """UPDATE pos_import_runs.file_path on the just-created run row."""
+    if not run_id or not r2_key:
+        return
+    from sqlalchemy import text as _text
+    session.execute(
+        _text("UPDATE pos_import_runs SET file_path = :p WHERE id = :id"),
+        {"p": r2_key, "id": run_id},
+    )
+
+
 @router.post("/inventory-adjustment")
 async def post_import_inventory_adjustment(
     entity_code: str = Form(...),
@@ -146,6 +176,7 @@ async def post_import_inventory_adjustment(
     try:
         with db_session() as session:
             _pos_entity_gate(session, entity_code, file_text, file, "pos_inventory_adj")
+            r2_key = _pos_archive_to_r2(entity_code, file_text, file, "pos-inventory-adjustment")
             result = import_inventory_adjustment(
                 session,
                 entity_code=entity_code,
@@ -154,6 +185,11 @@ async def post_import_inventory_adjustment(
                 actor_email=actor_email,
             )
             result["extraction_source"] = source
+            _pos_set_run_file_path(
+                session,
+                result.get("import_run_id") or result.get("run_id"),
+                r2_key,
+            )
             return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -171,6 +207,7 @@ async def post_import_pos_financial(
     try:
         with db_session() as session:
             _pos_entity_gate(session, entity_code, file_text, file, "pos_financial")
+            r2_key = _pos_archive_to_r2(entity_code, file_text, file, "pos-financial")
             result = import_pos_financial(
                 session,
                 entity_code=entity_code,
@@ -179,6 +216,11 @@ async def post_import_pos_financial(
                 actor_email=actor_email,
             )
             result["extraction_source"] = source
+            _pos_set_run_file_path(
+                session,
+                result.get("import_run_id") or result.get("run_id"),
+                r2_key,
+            )
             return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -198,6 +240,7 @@ async def post_import_inventory_value(
     try:
         with db_session() as session:
             _pos_entity_gate(session, entity_code, file_text, file, "pos_inventory_value")
+            r2_key = _pos_archive_to_r2(entity_code, file_text, file, "pos-inventory-value")
             result = import_inventory_value(
                 session,
                 entity_code=entity_code,
@@ -207,6 +250,11 @@ async def post_import_inventory_value(
                 snapshot_date_override=snap_override,
             )
             result["extraction_source"] = source
+            _pos_set_run_file_path(
+                session,
+                result.get("import_run_id") or result.get("run_id"),
+                r2_key,
+            )
             return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -226,6 +274,7 @@ async def post_import_aged_ar(
     try:
         with db_session() as session:
             _pos_entity_gate(session, entity_code, file_text, file, "pos_aged_ar")
+            r2_key = _pos_archive_to_r2(entity_code, file_text, file, "pos-aged-ar")
             result = import_aged_ar(
                 session,
                 entity_code=entity_code,
@@ -235,6 +284,11 @@ async def post_import_aged_ar(
                 snapshot_date_override=snap_override,
             )
             result["extraction_source"] = source
+            _pos_set_run_file_path(
+                session,
+                result.get("import_run_id") or result.get("run_id"),
+                r2_key,
+            )
             return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -252,6 +306,7 @@ async def post_import_ar_adjustment(
     try:
         with db_session() as session:
             _pos_entity_gate(session, entity_code, file_text, file, "pos_ar_adjustment")
+            r2_key = _pos_archive_to_r2(entity_code, file_text, file, "pos-ar-adjustment")
             result = import_ar_adjustment(
                 session,
                 entity_code=entity_code,
@@ -260,6 +315,11 @@ async def post_import_ar_adjustment(
                 actor_email=actor_email,
             )
             result["extraction_source"] = source
+            _pos_set_run_file_path(
+                session,
+                result.get("import_run_id") or result.get("run_id"),
+                r2_key,
+            )
             return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

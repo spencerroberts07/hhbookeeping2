@@ -258,6 +258,11 @@ async def post_upload_hours(
             raise_or_warn as _raise_or_warn,
             validate_document_entity as _validate_entity,
         )
+        from ..services_storage import (
+            content_type_for as _ct_for,
+            storage_service as _r2,
+        )
+        from sqlalchemy import text as _text
         with db_session() as session:
             _raise_or_warn(_validate_entity(
                 session,
@@ -266,7 +271,14 @@ async def post_upload_hours(
                 filename=file.filename or "",
                 document_type="payroll_hours",
             ), None)
-            return build_payroll_run(
+            r2_key = _r2.upload_file(
+                file_bytes=file_bytes,
+                original_filename=file.filename or "hours.ods",
+                entity_code=entity_code,
+                document_type="payroll-hours",
+                content_type=_ct_for(file.filename or "hours.ods"),
+            )
+            result = build_payroll_run(
                 session,
                 entity_code=entity_code,
                 file_bytes=file_bytes,
@@ -280,6 +292,17 @@ async def post_upload_hours(
                 vacation_paid_overrides=vac_dict,
                 actor_email=actor_email,
             )
+            # Persist R2 key onto the run row that was just created.
+            run_id = (
+                result.get("payroll_run_id") or result.get("run_id")
+                if isinstance(result, dict) else None
+            )
+            if r2_key and run_id:
+                session.execute(
+                    _text("UPDATE payroll_runs SET file_path = :p WHERE id = :id"),
+                    {"p": r2_key, "id": run_id},
+                )
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -364,6 +387,11 @@ async def post_upload_register(
             raise_or_warn as _raise_or_warn,
             validate_document_entity as _validate_entity,
         )
+        from ..services_storage import (
+            content_type_for as _ct_for,
+            storage_service as _r2,
+        )
+        from sqlalchemy import text as _text
         with db_session() as session:
             _raise_or_warn(_validate_entity(
                 session,
@@ -372,7 +400,14 @@ async def post_upload_register(
                 filename=file.filename or "",
                 document_type="payroll_register",
             ), None)
-            return build_payroll_run_from_register(
+            r2_key = _r2.upload_file(
+                file_bytes=file_bytes,
+                original_filename=file.filename or "payroll_register.pdf",
+                entity_code=entity_code,
+                document_type="payroll-register",
+                content_type=_ct_for(file.filename or "payroll_register.pdf"),
+            )
+            result = build_payroll_run_from_register(
                 session,
                 entity_code=entity_code,
                 file_bytes=file_bytes,
@@ -382,6 +417,16 @@ async def post_upload_register(
                 period_number_override=period_number,
                 pay_date_override=pay_date_d,
             )
+            run_id = (
+                result.get("payroll_run_id") or result.get("run_id")
+                if isinstance(result, dict) else None
+            )
+            if r2_key and run_id:
+                session.execute(
+                    _text("UPDATE payroll_runs SET file_path = :p WHERE id = :id"),
+                    {"p": r2_key, "id": run_id},
+                )
+            return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

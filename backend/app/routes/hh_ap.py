@@ -2278,6 +2278,8 @@ async def hh_ap_upload_documents(
         duplicate_documents: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
 
+        from ..services_storage import storage_service as _r2
+
         for upload in files:
             file_bytes = await upload.read()
             if not file_bytes:
@@ -2294,6 +2296,29 @@ async def hh_ap_upload_documents(
                 document_type=document_type,
             )
             _raise_or_warn(_vres, warnings)
+
+            # R2 archive (best-effort). When R2 is configured every
+            # new upload gets an object key; we still write file_bytes
+            # as a fallback until the migration script clears existing
+            # rows.
+            # TODO: Once all rows confirmed in R2 and file_bytes = NULL
+            # for all rows, drop the file_bytes column.
+            r2_object_key = _r2.upload_file(
+                file_bytes=file_bytes,
+                original_filename=upload.filename or "document.pdf",
+                entity_code=entity_code,
+                document_type="hh-ap-documents",
+                content_type=upload.content_type or "application/pdf",
+            )
+            if not r2_object_key and _r2.enabled:
+                warnings.append({
+                    "kind": "r2_upload_failed",
+                    "filename": upload.filename,
+                    "message": (
+                        "Could not archive this file to R2. The parsed data "
+                        "is still saved; the source PDF was kept in the DB."
+                    ),
+                })
 
             source_hash = build_source_hash(file_bytes)
             extracted_text = try_extract_text(file_bytes=file_bytes, filename=upload.filename or "unknown", content_type=upload.content_type)
@@ -2335,6 +2360,7 @@ async def hh_ap_upload_documents(
                                 content_type = :content_type,
                                 file_size_bytes = :file_size_bytes,
                                 file_bytes = :file_bytes,
+                                r2_object_key = COALESCE(:r2_key, r2_object_key),
                                 extracted_text = COALESCE(:extracted_text, extracted_text),
                                 processing_status = :processing_status,
                                 raw_json = CAST(:raw_json AS jsonb),
@@ -2349,6 +2375,7 @@ async def hh_ap_upload_documents(
                             "content_type": upload.content_type,
                             "file_size_bytes": len(file_bytes),
                             "file_bytes": file_bytes,
+                            "r2_key": r2_object_key,
                             "extracted_text": extracted_text,
                             "processing_status": processing_status,
                             "raw_json": json_dumps({"content_type": upload.content_type, "file_size_bytes": len(file_bytes)}),
@@ -2388,6 +2415,7 @@ async def hh_ap_upload_documents(
                         content_type,
                         file_size_bytes,
                         file_bytes,
+                        r2_object_key,
                         extracted_text,
                         raw_json
                     ) VALUES (
@@ -2401,6 +2429,7 @@ async def hh_ap_upload_documents(
                         :content_type,
                         :file_size_bytes,
                         :file_bytes,
+                        :r2_key,
                         :extracted_text,
                         CAST(:raw_json AS jsonb)
                     )
@@ -2415,6 +2444,7 @@ async def hh_ap_upload_documents(
                     "document_date": normalized_document_date,
                     "processing_status": processing_status,
                     "content_type": upload.content_type,
+                    "r2_key": r2_object_key,
                     "file_size_bytes": len(file_bytes),
                     "file_bytes": file_bytes,
                     "extracted_text": extracted_text,
@@ -2492,6 +2522,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
         raise_or_warn as _raise_or_warn,
         validate_document_entity as _validate_entity,
     )
+    from ..services_storage import storage_service as _r2
 
     for upload in files:
         filename = upload.filename or "unknown"
@@ -2514,6 +2545,15 @@ async def hh_ap_upload_and_parse_invoices_batch(
                     document_type="hh_ap_invoice",
                 )
                 _raise_or_warn(_vres, None)  # warnings collated per-file below
+
+                # R2 archive (best-effort) — see notes in upload-documents.
+                r2_object_key = _r2.upload_file(
+                    file_bytes=file_bytes,
+                    original_filename=filename,
+                    entity_code=entity_code,
+                    document_type="hh-ap-documents",
+                    content_type=upload.content_type or "application/pdf",
+                )
 
                 source_hash = build_source_hash(file_bytes)
                 extracted_text = try_extract_text(
@@ -2569,6 +2609,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                     content_type = :content_type,
                                     file_size_bytes = :file_size_bytes,
                                     file_bytes = :file_bytes,
+                                    r2_object_key = COALESCE(:r2_key, r2_object_key),
                                     extracted_text = COALESCE(:extracted_text, extracted_text),
                                     processing_status = :processing_status,
                                     raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:raw_json AS jsonb),
@@ -2582,6 +2623,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 "content_type": upload.content_type,
                                 "file_size_bytes": len(file_bytes),
                                 "file_bytes": file_bytes,
+                                "r2_key": r2_object_key,
                                 "extracted_text": extracted_text,
                                 "processing_status": initial_processing_status,
                                 "raw_json": json_dumps(
@@ -2607,6 +2649,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 content_type,
                                 file_size_bytes,
                                 file_bytes,
+                                r2_object_key,
                                 extracted_text,
                                 raw_json
                             ) VALUES (
@@ -2620,6 +2663,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 :content_type,
                                 :file_size_bytes,
                                 :file_bytes,
+                                :r2_key,
                                 :extracted_text,
                                 CAST(:raw_json AS jsonb)
                             )
@@ -2636,6 +2680,7 @@ async def hh_ap_upload_and_parse_invoices_batch(
                             "content_type": upload.content_type,
                             "file_size_bytes": len(file_bytes),
                             "file_bytes": file_bytes,
+                            "r2_key": r2_object_key,
                             "extracted_text": extracted_text,
                             "raw_json": json_dumps(
                                 {
