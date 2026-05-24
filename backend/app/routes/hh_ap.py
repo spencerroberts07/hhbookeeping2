@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from collections import Counter
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -2256,6 +2256,7 @@ class HHAPMatchRunRequest(BaseModel):
 
 @router.post("/upload-documents")
 async def hh_ap_upload_documents(
+    background_tasks: BackgroundTasks,
     entity_code: str = Form(...),
     document_type: str = Form(...),
     document_date: str | None = Form(default=None),
@@ -2267,6 +2268,7 @@ async def hh_ap_upload_documents(
         raise_or_warn as _raise_or_warn,
         validate_document_entity as _validate_entity,
     )
+    statement_doc_ids: list[str] = []  # filled below; parsed in background after response
     with db_session() as session:
         entity = get_entity(session, entity_code)
         normalized_document_date = normalize_optional_date_input(document_date)
@@ -2429,6 +2431,22 @@ async def hh_ap_upload_documents(
                     "created_at": doc_row["created_at"].isoformat() if doc_row["created_at"] else None,
                 }
             )
+            # Queue auto-parse for statement-type docs. The BG task
+            # runs after this response is sent and updates
+            # hh_ap_documents.processing_status from
+            # 'uploaded_pending_parse' to 'parsed_statement' (or
+            # 'parse_error' on failure).
+            if document_type in _STATEMENT_DOC_TYPES:
+                statement_doc_ids.append(str(doc_row["id"]))
+
+        entity_id_str = str(entity["id"])
+        for doc_id in statement_doc_ids:
+            background_tasks.add_task(
+                _run_statement_parse_bg,
+                document_id=doc_id,
+                entity_id=entity_id_str,
+            )
+        parsing_started = bool(statement_doc_ids)
 
         return {
             "entity_code": entity["entity_code"],
@@ -2440,6 +2458,13 @@ async def hh_ap_upload_documents(
             "updated_documents": updated_documents,
             "duplicate_documents": duplicate_documents,
             "warnings": warnings,
+            "parsing_started": parsing_started,
+            "parsing_doc_ids": statement_doc_ids,
+            "message": (
+                "Parsing started in background. Check status in the AP module."
+                if parsing_started
+                else "Documents archived. No automatic parsing triggered for this document_type."
+            ),
         }
 
 
@@ -3284,6 +3309,225 @@ def hh_ap_statements_upsert(
             "statement_month_end": str(payload.statement_month_end),
         }
 
+_STATEMENT_DOC_TYPES = (DOCUMENT_TYPE_HH_STATEMENT, "monthly_statement")
+
+
+def run_statement_parse(session, *, document_id: str, entity_id: str) -> dict[str, Any]:
+    """Parse a single hh_ap_documents row whose document_type is in
+    _STATEMENT_DOC_TYPES, upsert hh_ap_statements + hh_ap_statement_lines,
+    and flip the document's processing_status. Reusable from both the
+    parse-document endpoint and the upload-documents BackgroundTask.
+
+    Returns a summary dict; raises on errors so the caller can record
+    them. Caller owns the db_session lifecycle.
+    """
+    document = session.execute(
+        text(
+            """
+            SELECT id, document_type, source_filename, document_date,
+                   processing_status, raw_json, file_bytes
+              FROM hh_ap_documents
+             WHERE entity_id = :entity_id
+               AND id = :document_id
+               AND document_type = ANY(:doc_types)
+             LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "document_id": document_id,
+            "doc_types": list(_STATEMENT_DOC_TYPES),
+        },
+    ).mappings().first()
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail=f"HH statement document {document_id} not found",
+        )
+    if not document["file_bytes"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Document {document_id} has no stored file bytes to parse",
+        )
+
+    parsed = parse_hh_statement_document(document["file_bytes"])
+    statement_month_end = parsed["statement_month_end"]
+    statement_date = document["document_date"] or statement_month_end
+
+    existing_statement = session.execute(
+        text(
+            """
+            SELECT id FROM hh_ap_statements
+             WHERE entity_id = :entity_id
+               AND (document_id = :document_id OR statement_month_end = :sme)
+             ORDER BY created_at DESC LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "document_id": document["id"],
+            "sme": statement_month_end,
+        },
+    ).mappings().first()
+
+    statement_raw_json = {
+        "source_filename": document["source_filename"],
+        "summary_balances": parsed["summary_balances"],
+        "due_bucket_totals": parsed["due_bucket_totals"],
+        "summary_components": parsed["summary_components"],
+    }
+
+    if existing_statement:
+        statement_row = session.execute(
+            text(
+                """
+                UPDATE hh_ap_statements
+                   SET document_id = :document_id,
+                       statement_date = :statement_date,
+                       statement_month_end = :sme,
+                       total_open_balance = :tob,
+                       raw_json = CAST(:raw_json AS jsonb),
+                       updated_at = NOW()
+                 WHERE id = :id
+             RETURNING id
+                """
+            ),
+            {
+                "id": existing_statement["id"],
+                "document_id": document["id"],
+                "statement_date": statement_date,
+                "sme": statement_month_end,
+                "tob": parsed["total_open_balance"],
+                "raw_json": json_dumps(statement_raw_json),
+            },
+        ).mappings().first()
+    else:
+        statement_row = session.execute(
+            text(
+                """
+                INSERT INTO hh_ap_statements (
+                    entity_id, document_id, statement_date,
+                    statement_month_end, total_open_balance, raw_json
+                ) VALUES (
+                    :entity_id, :document_id, :statement_date,
+                    :sme, :tob, CAST(:raw_json AS jsonb)
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "entity_id": entity_id,
+                "document_id": document["id"],
+                "statement_date": statement_date,
+                "sme": statement_month_end,
+                "tob": parsed["total_open_balance"],
+                "raw_json": json_dumps(statement_raw_json),
+            },
+        ).mappings().first()
+
+    session.execute(
+        text("DELETE FROM hh_ap_statement_lines WHERE statement_id = :sid"),
+        {"sid": statement_row["id"]},
+    )
+
+    inserted_lines = 0
+    for line in parsed["lines"]:
+        session.execute(
+            text(
+                """
+                INSERT INTO hh_ap_statement_lines (
+                    statement_id, entity_id, invoice_number, invoice_type,
+                    invoice_date, due_date, invoice_amount, open_amount,
+                    current_amount, past_due_amount, matched_invoice_id,
+                    match_status, is_missing_download, raw_json
+                ) VALUES (
+                    :sid, :eid, :inum, :itype, :idate, :ddate,
+                    :iamt, :oamt, :camt, :pdamt,
+                    NULL, :mstatus, FALSE, CAST(:rj AS jsonb)
+                )
+                """
+            ),
+            {
+                "sid": statement_row["id"],
+                "eid": entity_id,
+                "inum": normalize_invoice_number(line["invoice_number"]),
+                "itype": line["invoice_type"],
+                "idate": line["invoice_date"],
+                "ddate": line["due_date"],
+                "iamt": line["invoice_amount"],
+                "oamt": line["open_amount"],
+                "camt": line["current_amount"],
+                "pdamt": line["past_due_amount"],
+                "mstatus": MATCH_STATUS_UNMATCHED,
+                "rj": json_dumps(line["raw_json"]),
+            },
+        )
+        inserted_lines += 1
+
+    session.execute(
+        text(
+            """
+            UPDATE hh_ap_documents
+               SET processing_status = :ps,
+                   raw_json = COALESCE(raw_json, '{}'::jsonb) || CAST(:pj AS jsonb),
+                   updated_at = NOW()
+             WHERE id = :id
+            """
+        ),
+        {
+            "id": document["id"],
+            "ps": PROCESSING_STATUS_PARSED_STATEMENT,
+            "pj": json_dumps({
+                "parsed_as": DOCUMENT_TYPE_HH_STATEMENT,
+                "lines_parsed": inserted_lines,
+            }),
+        },
+    )
+
+    return {
+        "statement_id": str(statement_row["id"]),
+        "document_id": str(document["id"]),
+        "statement_month_end": str(statement_month_end),
+        "total_open_balance": float(parsed["total_open_balance"] or 0),
+        "lines": inserted_lines,
+    }
+
+
+def _run_statement_parse_bg(document_id: str, entity_id: str) -> None:
+    """BackgroundTask wrapper — opens its own db_session, swallows
+    errors into the document's processing_status so a parser failure
+    doesn't crash the worker.
+    """
+    import logging as _l
+    _log = _l.getLogger(__name__)
+    try:
+        with db_session() as session:
+            run_statement_parse(
+                session, document_id=document_id, entity_id=entity_id
+            )
+    except Exception as exc:
+        _log.exception("Background statement parse failed for %s", document_id)
+        try:
+            with db_session() as session:
+                session.execute(
+                    text(
+                        """
+                        UPDATE hh_ap_documents
+                           SET processing_status = 'parse_error',
+                               raw_json = COALESCE(raw_json, '{}'::jsonb)
+                                          || jsonb_build_object('parse_error', :msg),
+                               updated_at = NOW()
+                         WHERE id = :id
+                        """
+                    ),
+                    {"id": document_id, "msg": str(exc)[:500]},
+                )
+        except Exception:
+            _log.exception(
+                "Could not even mark document %s as parse_error", document_id
+            )
+
+
 @router.post("/statements/parse-document")
 def hh_ap_parse_statement_document(
     payload: HHAPParseStatementDocumentRequest,
@@ -3300,11 +3544,11 @@ def hh_ap_parse_statement_document(
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
                       AND id = :document_id
-                      AND document_type = :document_type
+                      AND document_type = ANY(:doc_types)
                     LIMIT 1
                     """
                 ),
-                {"entity_id": entity["id"], "document_id": payload.document_id, "document_type": DOCUMENT_TYPE_HH_STATEMENT},
+                {"entity_id": entity["id"], "document_id": payload.document_id, "doc_types": list(_STATEMENT_DOC_TYPES)},
             ).mappings().first()
         else:
             document = session.execute(
@@ -3313,12 +3557,12 @@ def hh_ap_parse_statement_document(
                     SELECT id, document_type, source_filename, document_date, processing_status, raw_json, file_bytes
                     FROM hh_ap_documents
                     WHERE entity_id = :entity_id
-                      AND document_type = :document_type
+                      AND document_type = ANY(:doc_types)
                     ORDER BY created_at DESC
                     LIMIT 1
                     """
                 ),
-                {"entity_id": entity["id"], "document_type": DOCUMENT_TYPE_HH_STATEMENT},
+                {"entity_id": entity["id"], "doc_types": list(_STATEMENT_DOC_TYPES)},
             ).mappings().first()
 
         if not document:
