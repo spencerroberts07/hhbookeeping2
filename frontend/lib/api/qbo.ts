@@ -3,6 +3,8 @@ import { api } from './client';
 export interface QboBankAccount {
   account_name: string;
   account_code: string;
+  /** QBO AccountSubType: 'Checking' | 'Savings' | 'CreditCard' | 'LineOfCredit' | … */
+  account_subtype: string;
   current_balance: number;
   currency: string;
 }

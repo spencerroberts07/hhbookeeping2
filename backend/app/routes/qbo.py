@@ -82,10 +82,15 @@ async def bank_balances(
         # Best-effort currency from the first account; QBO realms are
         # typically single-currency for the dealers we serve.
         currency = rows[0]["currency"] if rows else "CAD"
+        # account_subtype lets the frontend categorize each account
+        # (Checking vs Savings vs CreditLine/LineOfCredit). QBO uses
+        # CamelCase values like "Checking" / "Savings" / "CreditCard" /
+        # "LineOfCredit".
         accounts = [
             {
                 "account_name": r["account_name"],
                 "account_code": r["account_code"],
+                "account_subtype": r["account_subtype"],
                 "current_balance": float(r["current_balance"]),
                 "currency": r["currency"],
             }

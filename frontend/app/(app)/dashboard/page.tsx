@@ -15,7 +15,6 @@ import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
-import { getLatestPosFinancial } from '@/lib/api/pos';
 import { AssistantWidget } from '@/components/assistant/assistant-widget';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
@@ -82,11 +81,6 @@ export default function DashboardPage() {
     queryKey: ['period-status', entityCode, periodEnd],
     enabled: !!entityCode && !!periodEnd,
     queryFn: () => getPeriodStatus(entityCode!, periodEnd!),
-  });
-  const posLatest = useQuery({
-    queryKey: ['pos-latest', entityCode],
-    enabled: !!entityCode,
-    queryFn: () => getLatestPosFinancial(entityCode!),
   });
   // Cash card now reads from QBO live (sum of every active bank
   // account's CurrentBalance). The cash_balancing_days snapshot from
@@ -197,19 +191,52 @@ export default function DashboardPage() {
                 <Skeleton className="h-9 w-32" />
               ) : qboBalances.data?.connected ? (
                 <>
-                  <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                    {formatMoney(qboBalances.data.total_balance)}
+                  <div className="space-y-1 mb-2">
+                    {qboBalances.data.accounts.map((a) => {
+                      // Credit-line subtypes carry a credit-natural
+                      // balance; QBO sometimes returns the outstanding
+                      // draw as a positive number, so we colour by
+                      // subtype rather than by sign.
+                      const isCredit = /credit|loan/i.test(a.account_subtype);
+                      const isNegative = a.current_balance < 0;
+                      const color =
+                        isCredit || isNegative ? 'text-amber-700' : 'text-ink';
+                      return (
+                        <div
+                          key={`${a.account_code}-${a.account_name}`}
+                          className="flex justify-between text-sm tabular-nums"
+                        >
+                          <span className="text-slate truncate pr-2">
+                            {a.account_name}
+                          </span>
+                          <span className={`font-semibold ${color}`}>
+                            {formatMoney(a.current_balance, { signed: isCredit || isNegative })}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <p className="text-xs text-slate mt-1">
-                    {qboBalances.data.accounts.length} bank account
-                    {qboBalances.data.accounts.length === 1 ? '' : 's'} · live
-                    from QuickBooks
+                  <div className="border-t border-border my-2" />
+                  <div className="flex justify-between items-baseline">
+                    <span className="text-xs uppercase tracking-wider text-slate">
+                      Net position
+                    </span>
+                    <span
+                      className={
+                        'text-2xl font-extrabold tabular-nums ' +
+                        (qboBalances.data.total_balance < 0
+                          ? 'text-red-600'
+                          : 'text-bw-teal')
+                      }
+                    >
+                      {formatMoney(qboBalances.data.total_balance)}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-slate mt-1">
+                    Live from QuickBooks
+                    {qboBalances.data.fetched_at &&
+                      ` · ${new Date(qboBalances.data.fetched_at).toLocaleTimeString()}`}
                   </p>
-                  {qboBalances.data.fetched_at && (
-                    <p className="text-[10px] text-slate mt-0.5">
-                      Updated {new Date(qboBalances.data.fetched_at).toLocaleTimeString()}
-                    </p>
-                  )}
                 </>
               ) : (
                 <>
@@ -227,27 +254,35 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
 
-          {/* Sales this month */}
+          {/* Sales — current period MTD. Pulled from journal_lines on
+              4xxx accounts via the gross-margin endpoint (which already
+              returns the per-period sales sum). Label switches to
+              "(closed)" when the period is closed, "(open)" otherwise. */}
           <Card>
             <CardHeader>
               <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
-                Sales — last month closed
+                {grossMargin.data?.period_label
+                  ? `Sales — ${grossMargin.data.period_label}`
+                  : 'Sales — current period'}
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {posLatest.isLoading ? (
+              {grossMargin.isLoading ? (
                 <Skeleton className="h-9 w-32" />
-              ) : posLatest.data?.snapshot_period_end ? (
+              ) : grossMargin.data && grossMargin.data.period_end ? (
                 <>
                   <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                    {formatMoney(posLatest.data.total_sales)}
+                    {formatMoney(grossMargin.data.sales)}
                   </div>
                   <p className="text-xs text-slate mt-1">
-                    Period ending {posLatest.data.snapshot_period_end}
+                    From journal_lines (4xxx) ·{' '}
+                    {periodStatus.data?.status === 'closed'
+                      ? 'closed'
+                      : 'open'}
                   </p>
                 </>
               ) : (
-                <p className="text-sm text-slate">No POS data yet</p>
+                <p className="text-sm text-slate">No journal data yet</p>
               )}
             </CardContent>
           </Card>
