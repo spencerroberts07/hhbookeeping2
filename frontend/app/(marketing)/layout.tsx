@@ -54,10 +54,10 @@ export default function MarketingLayout({
             <Link href="/pricing" className="hover:text-bw-teal mr-4">
               Pricing
             </Link>
-            <Link href="/legal/terms" className="hover:text-bw-teal mr-4">
+            <Link href="/terms" className="hover:text-bw-teal mr-4">
               Terms
             </Link>
-            <Link href="/legal/privacy" className="hover:text-bw-teal">
+            <Link href="/privacy" className="hover:text-bw-teal">
               Privacy
             </Link>
           </div>
