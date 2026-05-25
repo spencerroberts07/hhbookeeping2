@@ -857,3 +857,436 @@ def cash_balancing_status(entity_code: str):
             "closing_cash_day_count": (closing_cash_day_count or {}).get("closing_cash_day_count", 0),
             "latest_run": dict(latest_run) if latest_run else None,
         }
+
+
+# --------------------------------------------------------------------------
+# Tab UI endpoints (added with the /bank Cash Balancing tab)
+#
+# These power the three tabs on the /bank page. Heavy work happens in
+# SQL; minimal Python-side grouping.
+# --------------------------------------------------------------------------
+
+
+def _classify_status(over_short: float) -> str:
+    """Same $10 threshold as the spec for status colour-coding."""
+    if over_short > 10:
+        return "over"
+    if over_short < -10:
+        return "short"
+    return "balanced"
+
+
+@router.get("/days")
+def cash_balancing_days(
+    entity_code: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Daily summary + tender breakdown for the date range. Default
+    range: current calendar month. Returns days[] + summary{} where
+    each day carries computed over_short, paid_outs, and lines[]."""
+    from datetime import date as _Date, datetime as _DateTime
+    import calendar as _cal
+
+    today = _DateTime.utcnow().date()
+    df = (
+        _Date.fromisoformat(date_from)
+        if date_from
+        else _Date(today.year, today.month, 1)
+    )
+    if date_to:
+        dt = _Date.fromisoformat(date_to)
+    else:
+        dt = _Date(df.year, df.month, _cal.monthrange(df.year, df.month)[1])
+
+    with db_session() as session:
+        entity = session.execute(
+            text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+
+        day_rows = session.execute(
+            text(
+                """
+                SELECT id, business_date, opening_cash, closing_cash,
+                       total_sales, total_hst
+                  FROM cash_balancing_days
+                 WHERE entity_id = :eid
+                   AND business_date BETWEEN :df AND :dt
+              ORDER BY business_date ASC
+                """
+            ),
+            {"eid": entity["id"], "df": df, "dt": dt},
+        ).mappings().all()
+        day_ids = [r["id"] for r in day_rows]
+        line_rows = (
+            session.execute(
+                text(
+                    """
+                    SELECT cash_balancing_day_id, line_label, line_code,
+                           amount, mapped_account_code
+                      FROM cash_balancing_lines
+                     WHERE cash_balancing_day_id = ANY(:ids)
+                  ORDER BY cash_balancing_day_id, line_label
+                    """
+                ),
+                {"ids": day_ids},
+            ).mappings().all()
+            if day_ids
+            else []
+        )
+
+    lines_by_day: dict[Any, list[dict[str, Any]]] = {}
+    for r in line_rows:
+        lines_by_day.setdefault(r["cash_balancing_day_id"], []).append({
+            "line_label": r["line_label"],
+            "line_code": r["line_code"],
+            "amount": float(r["amount"] or 0),
+            "mapped_account_code": r["mapped_account_code"],
+        })
+
+    days: list[dict[str, Any]] = []
+    total_sales = total_hst = total_over = total_short = 0.0
+    balanced_days = over_days = short_days = 0
+    for d in day_rows:
+        lines = lines_by_day.get(d["id"], [])
+        # Per the design call:
+        #   over_short = amount on the 'Cash over (short)' line.
+        #   paid_outs  = sum of lines whose mapped GL is 6xxx.
+        over_short = next(
+            (l["amount"] for l in lines if l["line_label"] == "Cash over (short)"),
+            0.0,
+        )
+        paid_outs = sum(
+            l["amount"]
+            for l in lines
+            if (l["mapped_account_code"] or "").startswith("6")
+        )
+        status = _classify_status(over_short)
+        sales = float(d["total_sales"] or 0)
+        hst = float(d["total_hst"] or 0)
+        total_sales += sales
+        total_hst += hst
+        if status == "over":
+            total_over += over_short
+            over_days += 1
+        elif status == "short":
+            total_short += over_short
+            short_days += 1
+        else:
+            balanced_days += 1
+
+        days.append({
+            "id": str(d["id"]),
+            "business_date": d["business_date"].isoformat(),
+            "day_of_week": d["business_date"].strftime("%a"),
+            "opening_cash": float(d["opening_cash"] or 0),
+            "closing_cash": float(d["closing_cash"] or 0),
+            "total_sales": sales,
+            "total_hst": hst,
+            "paid_outs": paid_outs,
+            "over_short": over_short,
+            "status": status,
+            "lines": lines,
+        })
+
+    return {
+        "entity_code": entity_code,
+        "date_from": df.isoformat(),
+        "date_to": dt.isoformat(),
+        "days": days,
+        "summary": {
+            "total_sales": round(total_sales, 2),
+            "total_hst": round(total_hst, 2),
+            "total_over": round(total_over, 2),
+            "total_short": round(total_short, 2),
+            "net_variance": round(total_over + total_short, 2),
+            "day_count": len(days),
+            "balanced_days": balanced_days,
+            "over_days": over_days,
+            "short_days": short_days,
+        },
+    }
+
+
+@router.get("/month-end-batch")
+def cash_balancing_month_end_batch(
+    entity_code: str,
+    period_id: str | None = None,
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """The cash_balancing journal batch for a period. period_id omitted
+    returns the most-recent batch. Carries an explicit imbalance number
+    so the UI can show the UNBALANCED banner without recomputing."""
+    with db_session() as session:
+        entity = session.execute(
+            text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+
+        params: dict[str, Any] = {"eid": entity["id"]}
+        where_period = ""
+        if period_id:
+            where_period = "AND accounting_period_id = :pid"
+            params["pid"] = period_id
+
+        batch = session.execute(
+            text(
+                f"""
+                SELECT id, status, total_debits, total_credits,
+                       batch_label, summary_json, accounting_period_id
+                  FROM journal_batches
+                 WHERE entity_id = :eid
+                   AND source_module = 'cash_balancing'
+                   {where_period}
+              ORDER BY created_at DESC LIMIT 1
+                """
+            ),
+            params,
+        ).mappings().first()
+
+        if not batch:
+            return {
+                "batch_id": None,
+                "status": None,
+                "period_id": period_id,
+                "total_debits": 0.0,
+                "total_credits": 0.0,
+                "imbalance": 0.0,
+                "is_balanced": True,
+                "lines": [],
+            }
+
+        lines = session.execute(
+            text(
+                """
+                SELECT line_number, account_code,
+                       debit_amount, credit_amount, memo
+                  FROM journal_lines
+                 WHERE journal_batch_id = :bid
+              ORDER BY line_number
+                """
+            ),
+            {"bid": batch["id"]},
+        ).mappings().all()
+
+        line_dr = sum((float(l["debit_amount"] or 0) for l in lines), 0.0)
+        line_cr = sum((float(l["credit_amount"] or 0) for l in lines), 0.0)
+        imbalance = round(line_dr - line_cr, 2)
+
+        return {
+            "batch_id": str(batch["id"]),
+            "status": batch["status"],
+            "period_id": str(batch["accounting_period_id"]),
+            "batch_label": batch["batch_label"],
+            "total_debits": float(batch["total_debits"] or 0),
+            "total_credits": float(batch["total_credits"] or 0),
+            "imbalance": imbalance,
+            "is_balanced": abs(imbalance) < 0.01,
+            "summary_json": batch.get("summary_json") or {},
+            "lines": [
+                {
+                    "line_number": l["line_number"],
+                    "account_code": l["account_code"],
+                    "memo": l["memo"],
+                    "debit_amount": float(l["debit_amount"] or 0),
+                    "credit_amount": float(l["credit_amount"] or 0),
+                }
+                for l in lines
+            ],
+        }
+
+
+class FixImbalanceRequest(BaseModel):
+    entity_code: str = Field(..., examples=["1877-8"])
+    period_id: str = Field(...)
+    offset_account_code: str = Field(default="1020")
+    offset_description: str = Field(
+        default="Cash balancing close — balancing offset (float movement + misc reconciliation)"
+    )
+    actor_email: str | None = None
+
+
+@router.post("/fix-imbalance")
+def cash_balancing_fix_imbalance(
+    body: FixImbalanceRequest,
+    _user: Any = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Post a one-line balancing entry to the cash_balancing batch
+    for the period. Only runs on draft_unbalanced. After posting, the
+    batch is recomputed and flipped to status='draft'."""
+    with db_session() as session:
+        entity = session.execute(
+            text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+
+        batch = session.execute(
+            text(
+                """
+                SELECT id, status, total_debits, total_credits
+                  FROM journal_batches
+                 WHERE entity_id = :eid
+                   AND accounting_period_id = :pid
+                   AND source_module = 'cash_balancing'
+              ORDER BY created_at DESC LIMIT 1
+                """
+            ),
+            {"eid": entity["id"], "pid": body.period_id},
+        ).mappings().first()
+        if not batch:
+            raise HTTPException(404, "No cash_balancing batch for this period.")
+        if batch["status"] != "draft_unbalanced":
+            raise HTTPException(
+                409,
+                f"Batch is in '{batch['status']}' — fix-imbalance only runs on draft_unbalanced.",
+            )
+
+        dr = float(batch["total_debits"] or 0)
+        cr = float(batch["total_credits"] or 0)
+        imbalance = round(dr - cr, 2)
+        if abs(imbalance) < 0.01:
+            raise HTTPException(409, "Batch totals already balance.")
+
+        next_line_no = (
+            session.execute(
+                text(
+                    """
+                    SELECT COALESCE(MAX(line_number), 0) + 1 AS n
+                      FROM journal_lines
+                     WHERE journal_batch_id = :bid
+                    """
+                ),
+                {"bid": batch["id"]},
+            ).scalar()
+        ) or 1
+
+        # imbalance > 0 (Dr > Cr) → post a Cr to balance.
+        # imbalance < 0 (Cr > Dr) → post a Dr to balance.
+        if imbalance > 0:
+            line_dr, line_cr = 0.0, abs(imbalance)
+        else:
+            line_dr, line_cr = abs(imbalance), 0.0
+
+        session.execute(
+            text(
+                """
+                INSERT INTO journal_lines (
+                    journal_batch_id, line_number, account_code,
+                    debit_amount, credit_amount, memo, source_json
+                ) VALUES (
+                    :bid, :ln, :acct, :dr, :cr, :memo, :sj
+                )
+                """
+            ),
+            {
+                "bid": batch["id"],
+                "ln": next_line_no,
+                "acct": body.offset_account_code,
+                "dr": line_dr,
+                "cr": line_cr,
+                "memo": body.offset_description,
+                "sj": json.dumps(
+                    {
+                        "reason": "fix_imbalance",
+                        "actor": body.actor_email,
+                        "imbalance_resolved": imbalance,
+                    }
+                ),
+            },
+        )
+
+        new_dr = round(dr + line_dr, 2)
+        new_cr = round(cr + line_cr, 2)
+        session.execute(
+            text(
+                """
+                UPDATE journal_batches
+                   SET total_debits = :dr,
+                       total_credits = :cr,
+                       status = 'draft',
+                       updated_at = NOW()
+                 WHERE id = :id
+                """
+            ),
+            {"dr": new_dr, "cr": new_cr, "id": batch["id"]},
+        )
+
+        return {
+            "batch_id": str(batch["id"]),
+            "status": "draft",
+            "total_debits": new_dr,
+            "total_credits": new_cr,
+            "imbalance_resolved": imbalance,
+            "balancing_line": {
+                "line_number": next_line_no,
+                "account_code": body.offset_account_code,
+                "debit_amount": line_dr,
+                "credit_amount": line_cr,
+                "memo": body.offset_description,
+            },
+        }
+
+
+@router.get("/sync-history")
+def cash_balancing_sync_history(
+    entity_code: str,
+    limit: int = 20,
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Recent cash_balancing_import_runs for the entity."""
+    with db_session() as session:
+        entity = session.execute(
+            text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+
+        rows = session.execute(
+            text(
+                """
+                SELECT id, run_type, status, started_at, finished_at,
+                       tabs_read, summary_json, error_text
+                  FROM cash_balancing_import_runs
+                 WHERE entity_id = :eid
+              ORDER BY started_at DESC
+                 LIMIT :limit
+                """
+            ),
+            {"eid": entity["id"], "limit": int(limit)},
+        ).mappings().all()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        started = r["started_at"]
+        finished = r["finished_at"]
+        duration = (
+            (finished - started).total_seconds()
+            if started and finished
+            else None
+        )
+        tabs_read = r.get("tabs_read") or []
+        sj = r.get("summary_json") or {}
+        out.append({
+            "id": str(r["id"]),
+            "run_type": r["run_type"],
+            "status": r["status"],
+            "started_at": started.isoformat() if started else None,
+            "finished_at": finished.isoformat() if finished else None,
+            "duration_seconds": round(duration, 1) if duration else None,
+            "tabs_read": (
+                len(tabs_read) if isinstance(tabs_read, list) else None
+            ),
+            "days_upserted": sj.get("days_updated") or sj.get("days_upserted"),
+            "lines_inserted": sj.get("lines_inserted"),
+            "error_text": r.get("error_text"),
+        })
+    return {"runs": out, "count": len(out)}
