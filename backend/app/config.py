@@ -24,8 +24,13 @@ class Settings(BaseSettings):
     qbo_redirect_uri: str
     qbo_scope: str = "com.intuit.quickbooks.accounting"
     qbo_auth_url: str = "https://appcenter.intuit.com/connect/oauth2"
+    # OAuth token endpoint — same host for sandbox and production. Do NOT
+    # swap this when toggling environments.
     qbo_token_url: str = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-    qbo_api_base_url: str = "https://quickbooks.api.intuit.com"
+    # QBO REST API base URL. Env var: QBO_BASE_URL. Defaults to production.
+    # Sandbox uses https://sandbox-quickbooks.api.intuit.com — only override
+    # for explicit sandbox testing against an Intuit-issued sandbox realm.
+    qbo_base_url: str = "https://quickbooks.api.intuit.com"
     qbo_minor_version: str = "75"
     default_entity_code: str = "1877-8"
     google_sheets_service_account_email: str = "replace_me"
