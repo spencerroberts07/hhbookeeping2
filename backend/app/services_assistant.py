@@ -172,9 +172,8 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
         }
 
     # Tiered current-period resolution — mirrors routes/period_close.py
-    # ::get_current_period. Prefer periods with approved_to_post
-    # batches (strongest "actively being closed" signal); fall through
-    # to any non-voided; then no-batch past; then closed.
+    # ::get_current_period. Oldest-first so the assistant surfaces the
+    # next period that needs to be closed rather than the most recent.
     period = session.execute(
         text(
             """
@@ -182,13 +181,13 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
               FROM accounting_periods ap
              WHERE ap.entity_id = :eid
                AND ap.period_end <= CURRENT_DATE
-               AND ap.status <> 'closed'
+               AND ap.status NOT IN ('closed_locked', 'approved_to_close')
                AND EXISTS (
                    SELECT 1 FROM journal_batches jb
                     WHERE jb.accounting_period_id = ap.id
                       AND jb.status = 'approved_to_post'
                )
-             ORDER BY ap.period_end DESC
+             ORDER BY ap.period_end ASC
              LIMIT 1
             """
         ),
@@ -202,13 +201,13 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
                   FROM accounting_periods ap
                  WHERE ap.entity_id = :eid
                    AND ap.period_end <= CURRENT_DATE
-                   AND ap.status <> 'closed'
+                   AND ap.status NOT IN ('closed_locked', 'approved_to_close')
                    AND EXISTS (
                        SELECT 1 FROM journal_batches jb
                         WHERE jb.accounting_period_id = ap.id
                           AND jb.status <> 'voided'
                    )
-                 ORDER BY ap.period_end DESC
+                 ORDER BY ap.period_end ASC
                  LIMIT 1
                 """
             ),
@@ -222,8 +221,8 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
                   FROM accounting_periods
                  WHERE entity_id = :eid
                    AND period_end <= CURRENT_DATE
-                   AND status <> 'closed'
-                 ORDER BY period_end DESC
+                   AND status NOT IN ('closed_locked', 'approved_to_close')
+                 ORDER BY period_end ASC
                  LIMIT 1
                 """
             ),
