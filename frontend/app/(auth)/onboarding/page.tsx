@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { Suspense, useEffect } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useUser } from '@clerk/nextjs';
 import { useQuery } from '@tanstack/react-query';
@@ -17,7 +17,29 @@ import { StepGLHistory } from './_components/step-gl-history';
 import { StepHHAP } from './_components/step-hh-ap';
 import { StepComplete } from './_components/step-complete';
 
+// Next.js 14 requires any component that reads useSearchParams() to be
+// wrapped in a Suspense boundary, otherwise the whole page bails out of
+// static generation and the build fails. Split the search-params read
+// into an inner component and mount it under <Suspense>.
 export default function OnboardingPage() {
+  return (
+    <Suspense fallback={<OnboardingSkeleton />}>
+      <OnboardingContent />
+    </Suspense>
+  );
+}
+
+function OnboardingSkeleton() {
+  return (
+    <div className="space-y-3">
+      <Skeleton className="h-8 w-1/2" />
+      <Skeleton className="h-4 w-3/4" />
+      <Skeleton className="h-32 w-full" />
+    </div>
+  );
+}
+
+function OnboardingContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const force = searchParams.get('force') === 'true';
@@ -63,13 +85,7 @@ export default function OnboardingPage() {
   }, [status.data, currentStep, goTo, router, force]);
 
   if (!isLoaded || status.isLoading) {
-    return (
-      <div className="space-y-3">
-        <Skeleton className="h-8 w-1/2" />
-        <Skeleton className="h-4 w-3/4" />
-        <Skeleton className="h-32 w-full" />
-      </div>
-    );
+    return <OnboardingSkeleton />;
   }
 
   if (!entityCode) {
