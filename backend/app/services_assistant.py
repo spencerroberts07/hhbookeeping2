@@ -1375,7 +1375,7 @@ def learn_from_period_close(
     """
     if isinstance(period_end, str):
         try:
-            period_end_d = datetime.strptime(period_end, "%Y-%m-%d").date()
+            period_end_d = DateTimeType.strptime(period_end, "%Y-%m-%d").date()
         except ValueError:
             return {"observations_created": 0, "skipped": "bad date"}
     else:
@@ -1502,7 +1502,7 @@ def learn_from_period_close(
               FROM vendor_classification_memory
              WHERE entity_id = :eid
                AND first_seen_at >= :ps
-               AND first_seen_at <= :pe::date + INTERVAL '1 day'
+               AND first_seen_at <= CAST(:pe AS date) + INTERVAL '1 day'
              ORDER BY first_seen_at DESC LIMIT 5
             """
         ),
