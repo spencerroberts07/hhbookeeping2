@@ -26,7 +26,7 @@ class QuickBooksClient:
     def __init__(self) -> None:
         self.auth_url = settings.qbo_auth_url
         self.token_url = settings.qbo_token_url
-        self.api_base_url = settings.qbo_base_url.rstrip("/")
+        self.api_base_url = settings.qbo_api_base_url.rstrip("/")
         self.scope = settings.qbo_scope
         self.redirect_uri = settings.qbo_redirect_uri
         self.minor_version = settings.qbo_minor_version
