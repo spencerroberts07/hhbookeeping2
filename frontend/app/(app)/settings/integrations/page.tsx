@@ -21,6 +21,12 @@ import {
 } from '@/lib/api/dashboard';
 import { formatDate } from '@/lib/utils';
 
+// Force dynamic so Next.js doesn't try to prerender this page at
+// build time — the Zustand store + React Query state only resolve
+// client-side and a prerender failure under static generation would
+// cascade to a route-not-found at runtime.
+export const dynamic = 'force-dynamic';
+
 const DEMO_REALM_ID = '9341456852590440';
 
 export default function IntegrationsSettingsPage() {
@@ -31,11 +37,17 @@ export default function IntegrationsSettingsPage() {
   const q = useQuery({
     queryKey: ['qbo-status', entityCode],
     enabled: !!entityCode,
-    queryFn: () => getQuickbooksStatus(entityCode!),
+    queryFn: () => {
+      if (!entityCode) throw new Error('No active entity');
+      return getQuickbooksStatus(entityCode);
+    },
   });
 
   const connect = useMutation({
-    mutationFn: () => startQuickbooksConnect(entityCode!),
+    mutationFn: () => {
+      if (!entityCode) throw new Error('No active entity');
+      return startQuickbooksConnect(entityCode);
+    },
     onSuccess: (res) => {
       window.location.href = res.authorization_url;
     },
@@ -43,7 +55,10 @@ export default function IntegrationsSettingsPage() {
   });
 
   const disconnect = useMutation({
-    mutationFn: () => disconnectQuickbooks(entityCode!),
+    mutationFn: () => {
+      if (!entityCode) throw new Error('No active entity');
+      return disconnectQuickbooks(entityCode);
+    },
     onSuccess: (res) => {
       toast.success(
         `QuickBooks disconnected. Cleared ${res.account_mappings_cleared} account mapping(s).`,
@@ -54,6 +69,25 @@ export default function IntegrationsSettingsPage() {
   });
 
   const isDemoRealm = q.data?.realm_id === DEMO_REALM_ID;
+
+  // Pre-hydration: Zustand persist hasn't restored localStorage yet.
+  // Render a stable skeleton instead of churning through render branches
+  // that depend on the active entity.
+  if (!entityCode) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Database className="h-5 w-5 text-ledger-blue" />
+            QuickBooks Online
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Skeleton className="h-24 w-full" />
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <div className="space-y-4">
