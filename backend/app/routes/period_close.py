@@ -253,13 +253,11 @@ def get_current_period(
       1. Oldest past non-closed period that has at least one
          approved_to_post batch — i.e. work has actually landed and is
          awaiting close.
-      2. Oldest past non-closed period with any non-voided batch —
-         covers periods that have work in progress (draft batches).
-      3. Oldest past non-closed period with no batches yet — surfaces
-         the first month chronologically that hasn't been touched.
-      4. Fallback to the most recent closed period so the dealer still
+      2. Oldest past non-closed period regardless of batches — surfaces
+         the first month chronologically that hasn't been closed.
+      3. Fallback to the most recent closed period so the dealer still
          has context.
-      5. 404 if no accounting_periods rows exist at all.
+      4. 404 if no accounting_periods rows exist at all.
 
     Returns: {period_end: 'YYYY-MM-DD', period_label, status}.
     """
@@ -288,30 +286,7 @@ def get_current_period(
             {"entity_code": entity_code},
         ).mappings().first()
 
-        # Tier 2: oldest with any non-voided batch.
-        if not row:
-            row = session.execute(
-                _text(
-                    """
-                    SELECT ap.period_end, ap.period_label, ap.status
-                      FROM accounting_periods ap
-                      JOIN entities e ON e.id = ap.entity_id
-                     WHERE e.entity_code = :entity_code
-                       AND ap.period_end <= CURRENT_DATE
-                       AND ap.status NOT IN ('closed_locked', 'approved_to_close')
-                       AND EXISTS (
-                           SELECT 1 FROM journal_batches jb
-                            WHERE jb.accounting_period_id = ap.id
-                              AND jb.status <> 'voided'
-                       )
-                     ORDER BY ap.period_end ASC
-                     LIMIT 1
-                    """
-                ),
-                {"entity_code": entity_code},
-            ).mappings().first()
-
-        # Tier 3: oldest past non-closed, no batches yet.
+        # Tier 2: oldest past non-closed, regardless of batch state.
         if not row:
             row = session.execute(
                 _text(
@@ -329,7 +304,7 @@ def get_current_period(
                 {"entity_code": entity_code},
             ).mappings().first()
 
-        # Tier 4: everything past is closed — most recent closed period.
+        # Tier 3: everything past is closed — most recent closed period.
         if not row:
             row = session.execute(
                 _text(

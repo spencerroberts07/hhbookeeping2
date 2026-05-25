@@ -197,26 +197,6 @@ def build_entity_context(session, entity_code: str) -> dict[str, Any]:
         period = session.execute(
             text(
                 """
-                SELECT ap.period_end, ap.period_label, ap.status
-                  FROM accounting_periods ap
-                 WHERE ap.entity_id = :eid
-                   AND ap.period_end <= CURRENT_DATE
-                   AND ap.status NOT IN ('closed_locked', 'approved_to_close')
-                   AND EXISTS (
-                       SELECT 1 FROM journal_batches jb
-                        WHERE jb.accounting_period_id = ap.id
-                          AND jb.status <> 'voided'
-                   )
-                 ORDER BY ap.period_end ASC
-                 LIMIT 1
-                """
-            ),
-            {"eid": entity["id"]},
-        ).mappings().first()
-    if not period:
-        period = session.execute(
-            text(
-                """
                 SELECT period_end, period_label, status
                   FROM accounting_periods
                  WHERE entity_id = :eid
