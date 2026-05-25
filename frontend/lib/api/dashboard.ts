@@ -17,6 +17,38 @@ export async function getQuickbooksStatus(
   return res.data;
 }
 
+export interface QuickbooksConnectResponse {
+  entity_code: string;
+  authorization_url: string;
+  state: string;
+}
+
+export async function startQuickbooksConnect(
+  entityCode: string,
+): Promise<QuickbooksConnectResponse> {
+  const res = await api.get<QuickbooksConnectResponse>(
+    '/api/auth/quickbooks/connect',
+    { params: { entity_code: entityCode } },
+  );
+  return res.data;
+}
+
+export interface QuickbooksDisconnectResponse {
+  entity_code: string;
+  disconnected_connections: Array<{ id: string; realm_id: string }>;
+  account_mappings_cleared: number;
+}
+
+export async function disconnectQuickbooks(
+  entityCode: string,
+): Promise<QuickbooksDisconnectResponse> {
+  const res = await api.post<QuickbooksDisconnectResponse>(
+    '/api/auth/quickbooks/disconnect',
+    { entity_code: entityCode },
+  );
+  return res.data;
+}
+
 export interface GrossMarginResponse {
   entity_code: string;
   period_end: string | null;

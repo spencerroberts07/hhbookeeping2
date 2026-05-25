@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useUser } from '@clerk/nextjs';
 import { useQuery } from '@tanstack/react-query';
 import { useOnboardingStore } from '@/lib/store/onboarding';
@@ -19,6 +19,8 @@ import { StepComplete } from './_components/step-complete';
 
 export default function OnboardingPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const force = searchParams.get('force') === 'true';
   const { isLoaded, isSignedIn } = useUser();
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const currentStep = useOnboardingStore((s) => s.currentStep);
@@ -39,7 +41,10 @@ export default function OnboardingPage() {
 
   useEffect(() => {
     if (!status.data) return;
-    if (status.data.onboarding_complete) {
+    // ?force=true bypasses the onboarding_complete redirect so admins
+    // can re-enter the wizard after setup — e.g. to re-connect QBO to
+    // a different company file or re-import the GL.
+    if (status.data.onboarding_complete && !force) {
       router.replace('/dashboard');
       return;
     }
@@ -55,7 +60,7 @@ export default function OnboardingPage() {
       else if (!status.data.has_gl_history) goTo('gl-history');
       else goTo('hh-ap');
     }
-  }, [status.data, currentStep, goTo, router]);
+  }, [status.data, currentStep, goTo, router, force]);
 
   if (!isLoaded || status.isLoading) {
     return (

@@ -8,10 +8,12 @@ OAuth state is persisted to the `oauth_state_cache` table on /connect and
 verified-and-consumed on /callback. Previously /connect echoed a state
 the callback never checked — that's the CSRF gap migration 030 closed.
 """
+from typing import Any
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from ..config import settings
@@ -19,6 +21,7 @@ from ..db import db_session
 from ..quickbooks import QuickBooksClient
 from ..schemas import ConnectResponse
 from ..services import connect_company, get_entity_by_code
+from ..services_auth import enforce_entity_code, require_role
 
 router = APIRouter(prefix="/api/auth/quickbooks", tags=["quickbooks-auth"])
 
@@ -116,3 +119,57 @@ async def callback(
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class DisconnectRequest(BaseModel):
+    entity_code: str
+
+
+@router.post("/disconnect")
+def disconnect_quickbooks(
+    body: DisconnectRequest,
+    _user: Any = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Mark the active QBO connection inactive. Does NOT revoke the token
+    upstream — Intuit's refresh token will simply expire on its own — but
+    blocks any further use by this app. Also clears the stale account_id
+    mappings so a re-connect to a different company doesn't inherit them.
+    """
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = get_entity_by_code(session, body.entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+
+        result = session.execute(
+            text(
+                """
+                UPDATE quickbooks_connections
+                   SET is_active = FALSE,
+                       disconnected_at = NOW()
+                 WHERE entity_id = :eid AND is_active = TRUE
+                 RETURNING id, realm_id
+                """
+            ),
+            {"eid": entity["id"]},
+        ).mappings().all()
+
+        cleared = session.execute(
+            text(
+                """
+                UPDATE accounts
+                   SET quickbooks_account_id = NULL
+                 WHERE entity_id = :eid
+                   AND quickbooks_account_id IS NOT NULL
+                """
+            ),
+            {"eid": entity["id"]},
+        )
+
+    return {
+        "entity_code": body.entity_code,
+        "disconnected_connections": [
+            {"id": str(r["id"]), "realm_id": r["realm_id"]} for r in result
+        ],
+        "account_mappings_cleared": cleared.rowcount or 0,
+    }
