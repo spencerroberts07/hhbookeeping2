@@ -2297,12 +2297,11 @@ async def hh_ap_upload_documents(
             )
             _raise_or_warn(_vres, warnings)
 
-            # R2 archive (best-effort). When R2 is configured every
-            # new upload gets an object key; we still write file_bytes
-            # as a fallback until the migration script clears existing
-            # rows.
-            # TODO: Once all rows confirmed in R2 and file_bytes = NULL
-            # for all rows, drop the file_bytes column.
+            # R2 archive (best-effort). hh_ap_documents.file_bytes was
+            # dropped in migration 035 — only the R2 object key is
+            # persisted now. Fail-tolerant: if R2 isn't configured or
+            # the upload fails, r2_object_key stays None and the DB
+            # row still gets written.
             r2_object_key = _r2.upload_file(
                 file_bytes=file_bytes,
                 original_filename=upload.filename or "document.pdf",
@@ -2315,8 +2314,8 @@ async def hh_ap_upload_documents(
                     "kind": "r2_upload_failed",
                     "filename": upload.filename,
                     "message": (
-                        "Could not archive this file to R2. The parsed data "
-                        "is still saved; the source PDF was kept in the DB."
+                        "Could not archive this file to R2. The parsed "
+                        "data is still saved."
                     ),
                 })
 
@@ -2359,7 +2358,6 @@ async def hh_ap_upload_documents(
                             SET document_date = COALESCE(:document_date, document_date),
                                 content_type = :content_type,
                                 file_size_bytes = :file_size_bytes,
-                                file_bytes = :file_bytes,
                                 r2_object_key = COALESCE(:r2_key, r2_object_key),
                                 extracted_text = COALESCE(:extracted_text, extracted_text),
                                 processing_status = :processing_status,
@@ -2374,7 +2372,6 @@ async def hh_ap_upload_documents(
                             "document_date": normalized_document_date,
                             "content_type": upload.content_type,
                             "file_size_bytes": len(file_bytes),
-                            "file_bytes": file_bytes,
                             "r2_key": r2_object_key,
                             "extracted_text": extracted_text,
                             "processing_status": processing_status,
@@ -2414,7 +2411,6 @@ async def hh_ap_upload_documents(
                         processing_status,
                         content_type,
                         file_size_bytes,
-                        file_bytes,
                         r2_object_key,
                         extracted_text,
                         raw_json
@@ -2428,7 +2424,6 @@ async def hh_ap_upload_documents(
                         :processing_status,
                         :content_type,
                         :file_size_bytes,
-                        :file_bytes,
                         :r2_key,
                         :extracted_text,
                         CAST(:raw_json AS jsonb)
@@ -2446,7 +2441,6 @@ async def hh_ap_upload_documents(
                     "content_type": upload.content_type,
                     "r2_key": r2_object_key,
                     "file_size_bytes": len(file_bytes),
-                    "file_bytes": file_bytes,
                     "extracted_text": extracted_text,
                     "raw_json": json_dumps({"content_type": upload.content_type, "file_size_bytes": len(file_bytes)}),
                 },
@@ -2608,7 +2602,6 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 SET document_date = COALESCE(:document_date, document_date),
                                     content_type = :content_type,
                                     file_size_bytes = :file_size_bytes,
-                                    file_bytes = :file_bytes,
                                     r2_object_key = COALESCE(:r2_key, r2_object_key),
                                     extracted_text = COALESCE(:extracted_text, extracted_text),
                                     processing_status = :processing_status,
@@ -2622,7 +2615,6 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 "document_date": normalized_document_date,
                                 "content_type": upload.content_type,
                                 "file_size_bytes": len(file_bytes),
-                                "file_bytes": file_bytes,
                                 "r2_key": r2_object_key,
                                 "extracted_text": extracted_text,
                                 "processing_status": initial_processing_status,
@@ -2648,7 +2640,6 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 processing_status,
                                 content_type,
                                 file_size_bytes,
-                                file_bytes,
                                 r2_object_key,
                                 extracted_text,
                                 raw_json
@@ -2662,7 +2653,6 @@ async def hh_ap_upload_and_parse_invoices_batch(
                                 :processing_status,
                                 :content_type,
                                 :file_size_bytes,
-                                :file_bytes,
                                 :r2_key,
                                 :extracted_text,
                                 CAST(:raw_json AS jsonb)
@@ -2679,7 +2669,6 @@ async def hh_ap_upload_and_parse_invoices_batch(
                             "processing_status": initial_processing_status,
                             "content_type": upload.content_type,
                             "file_size_bytes": len(file_bytes),
-                            "file_bytes": file_bytes,
                             "r2_key": r2_object_key,
                             "extracted_text": extracted_text,
                             "raw_json": json_dumps(
@@ -4458,6 +4447,161 @@ def hh_ap_match_run(
             "unmatched_remittance_line_count": unmatched_remittance_count,
             "matched_invoice_count": len(matched_invoice_ids),
         }
+
+@router.get("/summary")
+def hh_ap_summary(entity_code: str):
+    """Dashboard "HH AP — aging" card payload.
+
+    Returns:
+      current_balance        — running GL balance on account 2030 (credit
+                               positive), from non-voided journal_lines
+      aging                  — open-invoice aging buckets, computed from
+                               hh_ap_invoices.due_date relative to today
+      dating_total           — sum of HH-direct (dated) unmatched invoices
+                               — the deferred-payment portion that hasn't
+                               cleared into the next remittance yet
+      last_statement_date    — MAX(statement_date) on hh_ap_statements
+      last_statement_amount  — total_open_balance from that latest statement
+      gl_variance            — last_statement_amount - current_balance
+      unreconciled_invoice_count — invoices where match_status <> 'matched'
+
+    Pure read, scoped by entity_id. No 404 if data is missing — empty
+    counts and None dates instead, so the frontend card renders gracefully.
+    """
+    today = date.today()
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        entity_id = entity["id"]
+
+        # GL balance on 2030 — net of all non-voided journal_lines.
+        # 2030 is an AP liability so we report credit-positive
+        # (credit_amount - debit_amount). Cross-entity safety: filter via
+        # journal_batches.entity_id, since journal_lines doesn't have its
+        # own entity column.
+        balance_row = session.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(SUM(jl.credit_amount), 0)
+                  - COALESCE(SUM(jl.debit_amount), 0) AS balance
+                  FROM journal_lines jl
+                  JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                 WHERE jb.entity_id = :entity_id
+                   AND jl.account_code = '2030'
+                   AND COALESCE(jb.status, '') <> 'voided'
+                """
+            ),
+            {"entity_id": entity_id},
+        ).mappings().first()
+        current_balance = float(
+            (balance_row or {}).get("balance", 0) or 0
+        )
+
+        # Aging buckets — open (unmatched) invoices, bucketed by days
+        # since due_date. We treat invoices with no due_date as "current"
+        # rather than dropping them so the totals still tie to count.
+        aging_row = session.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(SUM(CASE
+                        WHEN due_date IS NULL THEN total_amount
+                        WHEN :today - due_date <= 0 THEN total_amount
+                        ELSE 0 END), 0) AS current_amt,
+                    COALESCE(SUM(CASE
+                        WHEN :today - due_date BETWEEN 1 AND 30 THEN total_amount
+                        ELSE 0 END), 0) AS over_30,
+                    COALESCE(SUM(CASE
+                        WHEN :today - due_date BETWEEN 31 AND 60 THEN total_amount
+                        ELSE 0 END), 0) AS over_60,
+                    COALESCE(SUM(CASE
+                        WHEN :today - due_date > 60 THEN total_amount
+                        ELSE 0 END), 0) AS over_90
+                  FROM hh_ap_invoices
+                 WHERE entity_id = :entity_id
+                   AND match_status <> 'matched'
+                """
+            ),
+            {"entity_id": entity_id, "today": today},
+        ).mappings().first() or {}
+        aging = {
+            "current": float(aging_row.get("current_amt", 0) or 0),
+            "over_30": float(aging_row.get("over_30", 0) or 0),
+            "over_60": float(aging_row.get("over_60", 0) or 0),
+            "over_90": float(aging_row.get("over_90", 0) or 0),
+        }
+
+        # Dating total — unmatched HH-direct (deferred-payment) invoices.
+        # HH 'direct' invoices are the dated/deferred-AP family; once the
+        # remittance lands they move to matched.
+        dating_row = session.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(total_amount), 0) AS dating_total
+                  FROM hh_ap_invoices
+                 WHERE entity_id = :entity_id
+                   AND invoice_type = 'hh_direct'
+                   AND match_status <> 'matched'
+                """
+            ),
+            {"entity_id": entity_id},
+        ).mappings().first() or {}
+        dating_total = float(dating_row.get("dating_total", 0) or 0)
+
+        # Most recent statement (date + open balance).
+        latest_statement = session.execute(
+            text(
+                """
+                SELECT statement_date, statement_month_end, total_open_balance
+                  FROM hh_ap_statements
+                 WHERE entity_id = :entity_id
+                 ORDER BY statement_date DESC NULLS LAST
+                 LIMIT 1
+                """
+            ),
+            {"entity_id": entity_id},
+        ).mappings().first()
+        if latest_statement:
+            last_statement_date = (
+                latest_statement["statement_date"].isoformat()
+                if latest_statement["statement_date"]
+                else None
+            )
+            last_statement_amount = float(
+                latest_statement["total_open_balance"] or 0
+            )
+        else:
+            last_statement_date = None
+            last_statement_amount = 0.0
+
+        # Variance: statement says we owe X, GL says X' — gap is X - X'.
+        gl_variance = round(last_statement_amount - current_balance, 2)
+
+        # Count of unreconciled (unmatched) invoices.
+        unreconciled_row = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS n
+                  FROM hh_ap_invoices
+                 WHERE entity_id = :entity_id
+                   AND match_status <> 'matched'
+                """
+            ),
+            {"entity_id": entity_id},
+        ).mappings().first() or {}
+        unreconciled_invoice_count = int(unreconciled_row.get("n", 0) or 0)
+
+        return {
+            "entity_code": entity["entity_code"],
+            "current_balance": round(current_balance, 2),
+            "aging": aging,
+            "dating_total": round(dating_total, 2),
+            "last_statement_date": last_statement_date,
+            "last_statement_amount": round(last_statement_amount, 2),
+            "gl_variance": gl_variance,
+            "unreconciled_invoice_count": unreconciled_invoice_count,
+        }
+
 
 @router.get("/status")
 def hh_ap_status(entity_code: str):

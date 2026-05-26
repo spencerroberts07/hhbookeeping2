@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
-import { getQuickbooksStatus, getGrossMargin } from '@/lib/api/dashboard';
+import { getGrossMargin } from '@/lib/api/dashboard';
 import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
@@ -67,11 +67,6 @@ export default function DashboardPage() {
   const periodEnd = currentPeriod.data?.period_end ?? null;
   const periodLabel = periodEnd ? formatMonthLabel(periodEnd) : undefined;
 
-  const qbo = useQuery({
-    queryKey: ['qbo-status', entityCode],
-    enabled: !!entityCode,
-    queryFn: () => getQuickbooksStatus(entityCode!),
-  });
   const apSummary = useQuery({
     queryKey: ['hh-ap-summary', entityCode],
     enabled: !!entityCode,
