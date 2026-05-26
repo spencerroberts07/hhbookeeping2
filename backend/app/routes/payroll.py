@@ -445,14 +445,90 @@ def post_build_journal(
     enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
-            return build_payroll_journal(
+            result = build_payroll_journal(
                 session,
                 entity_code=body.entity_code,
                 payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
             )
+            # Backfill payroll_cra_breakdowns. Idempotent via UNIQUE
+            # constraint on payroll_run_id; we ON CONFLICT update so
+            # rebuilds after edits stay consistent.
+            _backfill_cra_breakdown(session, payroll_run_id=payroll_run_id,
+                                    entity_code=body.entity_code)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _backfill_cra_breakdown(session, *, payroll_run_id: str, entity_code: str) -> None:
+    """Write/refresh the payroll_cra_breakdowns row for this run. Called
+    after build_payroll_journal so the snapshot lines up with the
+    journal totals. Best-effort: a failure here logs but does not roll
+    back the journal."""
+    from sqlalchemy import text as _text
+    import logging as _l
+    try:
+        run = session.execute(
+            _text(
+                """
+                SELECT pr.id, pr.entity_id, pr.period_start, pr.period_end,
+                       pr.pay_date, pr.total_gross, pr.total_fed_tax,
+                       pr.total_cpp_ee, pr.total_cpp_er, pr.total_ei_ee,
+                       pr.total_ei_er, pr.cra_remittance_amount
+                  FROM payroll_runs pr
+                  JOIN entities e ON e.id = pr.entity_id
+                 WHERE pr.id = :rid AND e.entity_code = :ec
+                """
+            ),
+            {"rid": payroll_run_id, "ec": entity_code},
+        ).mappings().first()
+        if not run:
+            return
+        session.execute(
+            _text(
+                """
+                INSERT INTO payroll_cra_breakdowns (
+                    entity_id, payroll_run_id, business_number,
+                    period_start, period_end, pay_date, gross_taxable,
+                    fed_tax, cpp_employee, cpp_employer, ei_employee,
+                    ei_employer, total_remittance
+                ) VALUES (
+                    :eid, :rid, :bn, :ps, :pe, :pd, :gross, :fed,
+                    :cppee, :cpper, :eiee, :eier, :total
+                )
+                ON CONFLICT (payroll_run_id) DO UPDATE SET
+                    business_number = EXCLUDED.business_number,
+                    period_start = EXCLUDED.period_start,
+                    period_end = EXCLUDED.period_end,
+                    pay_date = EXCLUDED.pay_date,
+                    gross_taxable = EXCLUDED.gross_taxable,
+                    fed_tax = EXCLUDED.fed_tax,
+                    cpp_employee = EXCLUDED.cpp_employee,
+                    cpp_employer = EXCLUDED.cpp_employer,
+                    ei_employee = EXCLUDED.ei_employee,
+                    ei_employer = EXCLUDED.ei_employer,
+                    total_remittance = EXCLUDED.total_remittance
+                """
+            ),
+            {
+                "eid": run["entity_id"], "rid": payroll_run_id,
+                "bn": PAYROLL_BUSINESS_NUMBER,
+                "ps": run["period_start"], "pe": run["period_end"],
+                "pd": run["pay_date"],
+                "gross": run["total_gross"] or 0,
+                "fed": run["total_fed_tax"] or 0,
+                "cppee": run["total_cpp_ee"] or 0,
+                "cpper": run["total_cpp_er"] or 0,
+                "eiee": run["total_ei_ee"] or 0,
+                "eier": run["total_ei_er"] or 0,
+                "total": run["cra_remittance_amount"] or 0,
+            },
+        )
+    except Exception:
+        _l.getLogger(__name__).exception(
+            "cra_breakdowns backfill failed for run %s — non-fatal", payroll_run_id,
+        )
 
 
 @router.get("/runs")
@@ -560,6 +636,411 @@ def post_schedule_withdrawals(
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ----------------------------------------------------------------------
+# Employee edit endpoint (named PUT for the frontend editor drawer)
+# ----------------------------------------------------------------------
+
+
+class UpdateEmployeeRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+    first_name: str | None = None
+    last_name: str | None = None
+    employment_type: str | None = None
+    hourly_rate: float | None = None
+    biweekly_salary: float | None = None
+    vacation_rate: float | None = None
+    province: str | None = None
+    federal_td1_claim_code: int | None = None
+    provincial_td1_claim_code: int | None = None
+    cpp_exempt: bool | None = None
+    ei_exempt: bool | None = None
+    has_life_insurance: bool | None = None
+    life_insurance_biweekly: float | None = None
+    is_active: bool | None = None
+    start_date: str | None = None
+    address: str | None = None
+    bank_transit: str | None = None
+    bank_institution: str | None = None
+    bank_account: str | None = None
+    notes: str | None = None
+
+
+@router.get("/employees/{employee_id}")
+def get_employee_detail(
+    employee_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Full employee row for the editor drawer. The /employees list
+    endpoint returns a slimmer projection; this one returns everything
+    the edit form needs."""
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        row = session.execute(
+            _text(
+                """
+                SELECT id, entity_id, employee_number, first_name, last_name,
+                       full_name, employment_type, hourly_rate, biweekly_salary,
+                       vacation_rate, province, federal_td1_claim_code,
+                       provincial_td1_claim_code, cpp_exempt, ei_exempt,
+                       has_life_insurance, life_insurance_biweekly, is_active,
+                       start_date, address, bank_transit, bank_institution,
+                       bank_account, ods_name_key, notes, created_at, updated_at
+                  FROM payroll_employees
+                 WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": employee_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(404, f"Employee {employee_id} not found")
+        return {
+            k: (v.isoformat() if hasattr(v, "isoformat") else (str(v) if isinstance(v, Decimal) else v))
+            for k, v in dict(row).items()
+        }
+
+
+@router.put("/employees/{employee_id}")
+def put_update_employee(
+    body: UpdateEmployeeRequest,
+    employee_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Partial-update an existing payroll_employees row. Same fields as
+    /employees/upsert but addressed by UUID (the editor drawer has the
+    id in hand). Strictly scoped — refuses to update an employee under
+    a different entity."""
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+
+    payload = body.model_dump(exclude_none=True)
+    payload.pop("entity_code", None)
+    payload.pop("actor_email", None)
+    if not payload:
+        raise HTTPException(400, "No fields to update")
+
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+
+        # Cross-entity safety: must match.
+        existing = session.execute(
+            _text(
+                "SELECT id, first_name, last_name FROM payroll_employees "
+                "WHERE id = :id AND entity_id = :eid"
+            ),
+            {"id": employee_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not existing:
+            raise HTTPException(
+                404, f"Employee {employee_id} not found for entity {body.entity_code}"
+            )
+
+        # Maintain full_name if first/last changed.
+        new_first = payload.get("first_name", existing["first_name"])
+        new_last = payload.get("last_name", existing["last_name"])
+        if "first_name" in payload or "last_name" in payload:
+            payload["full_name"] = f"{(new_first or '').strip()} {(new_last or '').strip()}".strip()
+
+        set_clauses = ", ".join(f"{k} = :{k}" for k in payload.keys())
+        params = {**payload, "id": employee_id}
+        params["updated_at"] = datetime.utcnow()
+        session.execute(
+            _text(
+                f"UPDATE payroll_employees SET {set_clauses}, updated_at = :updated_at "
+                "WHERE id = :id"
+            ),
+            params,
+        )
+        row = session.execute(
+            _text(
+                "SELECT id, entity_id, employee_number, first_name, last_name, "
+                "full_name, employment_type, hourly_rate, biweekly_salary, "
+                "vacation_rate, province, federal_td1_claim_code, "
+                "provincial_td1_claim_code, cpp_exempt, ei_exempt, "
+                "has_life_insurance, life_insurance_biweekly, is_active, "
+                "start_date, address, bank_transit, bank_institution, "
+                "bank_account, notes, updated_at "
+                "FROM payroll_employees WHERE id = :id"
+            ),
+            {"id": employee_id},
+        ).mappings().first()
+        return {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in dict(row).items()}
+
+
+# ----------------------------------------------------------------------
+# EFT (CPA 005) file generation — direct-deposit payroll
+#
+# Spec: see services_payroll_eft.py. Generates a 1464-char text file
+# accepted by TD Business Banking. File is uploaded to R2 (fail-tolerant);
+# audit row written to payroll_eft_files; presigned URL surfaced via
+# the matching GET endpoint.
+#
+# Bridlewood's payroll BN is the only one configured for now. When
+# additional entities go live, move this to a per-entity setting.
+# ----------------------------------------------------------------------
+
+
+# TODO: Move to entities table when additional dealers come online.
+PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
+# TODO: Replace with the TD-issued 10-digit originator number once
+# Bridlewood completes EFT origination setup with TD Business Banking.
+EFT_ORIGINATOR_ID = "BRIDLEWOOD"
+EFT_SHORT_NAME = "BRIDLEWOOD HH"
+EFT_LONG_NAME = "BRIDLEWOOD HOME HARDWARE"
+
+
+class GenerateEftRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/runs/{payroll_run_id}/generate-eft")
+def post_generate_eft(
+    body: GenerateEftRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Generate a CPA-005 EFT file for an approved payroll run.
+
+    Validates:
+      - run exists for this entity and is in approved/posted state
+      - every paid employee has bank_transit + bank_institution + bank_account
+
+    On success: file uploaded to R2, row written to payroll_eft_files,
+    response includes object key + summary totals. R2 failure is
+    fail-tolerant — DB row still written, file_path=NULL, frontend
+    surfaces a warning on the download endpoint."""
+    from sqlalchemy import text as _text
+    from .. import services_payroll_eft as _eft
+    from ..services_storage import storage_service as _r2
+
+    enforce_entity_code(_user, body.entity_code)
+
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id, entity_code FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+
+        run = session.execute(
+            _text(
+                """
+                SELECT id, pay_run_number, period_start, period_end, pay_date,
+                       status, workflow_status, total_net_pay
+                  FROM payroll_runs
+                 WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not run:
+            raise HTTPException(404, f"Payroll run {payroll_run_id} not found")
+
+        wf = run["workflow_status"] or run["status"]
+        if wf not in {"approved", "approved_to_post", "posted"}:
+            raise HTTPException(
+                409,
+                f"Payroll run must be approved before EFT generation "
+                f"(workflow_status={wf!r})",
+            )
+
+        # Pull every paid employee with their bank info. net_pay > 0.
+        rows = session.execute(
+            _text(
+                """
+                SELECT pe.id, pe.full_name, pe.bank_transit, pe.bank_institution,
+                       pe.bank_account, prl.net_pay
+                  FROM payroll_run_lines prl
+                  JOIN payroll_employees pe ON pe.id = prl.employee_id
+                 WHERE prl.payroll_run_id = :rid AND prl.net_pay > 0
+                 ORDER BY pe.employee_number
+                """
+            ),
+            {"rid": payroll_run_id},
+        ).mappings().all()
+        if not rows:
+            raise HTTPException(400, "No paid employees on this run.")
+
+        # Block if anyone is missing bank info.
+        missing: list[str] = []
+        for r in rows:
+            if not (r["bank_transit"] and r["bank_institution"] and r["bank_account"]):
+                missing.append(r["full_name"])
+        if missing:
+            raise HTTPException(
+                400,
+                "Cannot generate EFT — missing bank info for: " + ", ".join(missing),
+            )
+
+        # Monotonic file_creation_number per entity.
+        next_num_row = session.execute(
+            _text(
+                """
+                SELECT COALESCE(MAX(file_creation_number), 0) + 1 AS n
+                  FROM payroll_eft_files
+                 WHERE entity_id = :eid
+                """
+            ),
+            {"eid": entity["id"]},
+        ).mappings().first()
+        file_creation_number = int(next_num_row["n"])
+
+        header = _eft.EFTHeader(
+            originator_id=EFT_ORIGINATOR_ID,
+            file_creation_number=file_creation_number,
+            creation_date=DateType.today(),
+            originator_short_name=EFT_SHORT_NAME,
+            originator_long_name=EFT_LONG_NAME,
+        )
+        employees = [
+            _eft.EFTEmployee(
+                name=r["full_name"],
+                transit=r["bank_transit"],
+                institution=r["bank_institution"],
+                account=r["bank_account"],
+                amount=Decimal(str(r["net_pay"])),
+            )
+            for r in rows
+        ]
+
+        try:
+            built = _eft.build_eft_file(
+                header=header,
+                employees=employees,
+                payment_date=run["pay_date"],
+                cross_reference=f"PAYROLL-{run['pay_run_number']}",
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        # R2 archive (fail-tolerant). file_path stays NULL on failure;
+        # the DB row records the generation event regardless so we have
+        # an audit trail of what was sent to TD.
+        filename = f"payroll-eft-{run['pay_run_number']}-{file_creation_number:04d}.txt"
+        r2_key = _r2.upload_file(
+            file_bytes=built.text.encode("ascii", errors="replace"),
+            original_filename=filename,
+            entity_code=entity["entity_code"],
+            document_type="payroll-eft",
+            content_type="text/plain",
+        )
+
+        eft_row = session.execute(
+            _text(
+                """
+                INSERT INTO payroll_eft_files (
+                    entity_id, payroll_run_id, file_name, file_path,
+                    record_count, total_amount, file_creation_number,
+                    summary_json, actor_email
+                ) VALUES (
+                    :eid, :rid, :fn, :fp, :rc, :ta, :fcn,
+                    CAST(:sj AS jsonb), :ae
+                )
+                RETURNING id, generated_at
+                """
+            ),
+            {
+                "eid": entity["id"],
+                "rid": payroll_run_id,
+                "fn": filename,
+                "fp": r2_key,
+                "rc": built.record_count,
+                "ta": built.total_amount,
+                "fcn": file_creation_number,
+                "sj": json.dumps({
+                    "credit_count": built.credit_count,
+                    "originator_id": EFT_ORIGINATOR_ID,
+                    "business_number": PAYROLL_BUSINESS_NUMBER,
+                    "pay_run_number": run["pay_run_number"],
+                }),
+                "ae": body.actor_email,
+            },
+        ).mappings().first()
+
+        return {
+            "id": str(eft_row["id"]),
+            "payroll_run_id": payroll_run_id,
+            "file_name": filename,
+            "file_path": r2_key,
+            "r2_uploaded": bool(r2_key),
+            "record_count": built.record_count,
+            "credit_count": built.credit_count,
+            "total_amount": float(built.total_amount),
+            "file_creation_number": file_creation_number,
+            "generated_at": eft_row["generated_at"].isoformat(),
+        }
+
+
+@router.get("/runs/{payroll_run_id}/eft/download")
+def get_eft_download(
+    payroll_run_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Return a presigned R2 URL for the most-recent EFT file on this
+    run. 404 if no file exists; 409 if R2 didn't store the file (e.g.
+    R2 was down when the file was generated). The TXT is available
+    again by re-running generate-eft."""
+    from sqlalchemy import text as _text
+    from ..services_storage import storage_service as _r2
+
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        eft = session.execute(
+            _text(
+                """
+                SELECT id, file_name, file_path, record_count, total_amount,
+                       file_creation_number, generated_at
+                  FROM payroll_eft_files
+                 WHERE payroll_run_id = :rid AND entity_id = :eid
+                 ORDER BY generated_at DESC LIMIT 1
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+
+    if not eft:
+        raise HTTPException(404, "No EFT file generated for this run yet.")
+    if not eft["file_path"]:
+        raise HTTPException(
+            409,
+            "EFT file metadata exists but the file isn't in R2 — re-run "
+            "generate-eft to produce a downloadable copy.",
+        )
+
+    presigned = _r2.get_presigned_url(eft["file_path"], expires_in=3600)
+    if not presigned:
+        raise HTTPException(503, "R2 presign failed; try again in a moment.")
+    return {
+        "file_name": eft["file_name"],
+        "download_url": presigned,
+        "expires_in_seconds": 3600,
+        "record_count": eft["record_count"],
+        "total_amount": float(eft["total_amount"]),
+        "file_creation_number": eft["file_creation_number"],
+        "generated_at": eft["generated_at"].isoformat(),
+    }
 
 
 # ----------------------------------------------------------------------

@@ -91,8 +91,16 @@ export default function PayrollPage() {
                   </thead>
                   <tbody className="divide-y divide-border">
                     {runs.data.runs.map((r) => (
-                      <tr key={r.id} className="hover:bg-cloud">
-                        <td className="px-4 py-2 text-ink font-mono text-xs">{r.pay_run_number}</td>
+                      <tr
+                        key={r.id}
+                        className="hover:bg-cloud cursor-pointer"
+                        onClick={() => { window.location.href = `/payroll/runs/${r.id}`; }}
+                      >
+                        <td className="px-4 py-2 text-ink font-mono text-xs">
+                          <Link href={`/payroll/runs/${r.id}`} className="hover:text-ledger-blue">
+                            {r.pay_run_number}
+                          </Link>
+                        </td>
                         <td className="px-4 py-2 text-ink">
                           {formatDate(r.period_start)} – {formatDate(r.period_end)}
                         </td>
@@ -166,6 +174,14 @@ export default function PayrollPage() {
                   </tbody>
                 </table>
               )}
+              <div className="p-3 border-t border-border bg-cloud/40 text-right">
+                <Link
+                  href="/payroll/employees"
+                  className="text-xs text-ledger-blue hover:underline"
+                >
+                  Manage employees (edit / add) →
+                </Link>
+              </div>
             </CardContent>
           </Card>
         )}

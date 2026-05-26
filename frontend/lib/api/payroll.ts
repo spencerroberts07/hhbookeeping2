@@ -22,6 +22,62 @@ export interface Employee {
   is_active: boolean;
   ods_name_key: string | null;
   notes: string | null;
+  // Fields exposed by the editor drawer (returned from PUT
+  // /employees/{id} and listed by /employees).
+  province?: string | null;
+  federal_td1_claim_code?: number | null;
+  provincial_td1_claim_code?: number | null;
+  cpp_exempt?: boolean;
+  ei_exempt?: boolean;
+  start_date?: string | null;
+  address?: string | null;
+  bank_transit?: string | null;
+  bank_institution?: string | null;
+  bank_account?: string | null;
+}
+
+export interface UpdateEmployeeInput {
+  entity_code: string;
+  actor_email: string;
+  first_name?: string;
+  last_name?: string;
+  employment_type?: string;
+  hourly_rate?: number;
+  biweekly_salary?: number;
+  vacation_rate?: number;
+  province?: string;
+  federal_td1_claim_code?: number;
+  provincial_td1_claim_code?: number;
+  cpp_exempt?: boolean;
+  ei_exempt?: boolean;
+  has_life_insurance?: boolean;
+  life_insurance_biweekly?: number;
+  is_active?: boolean;
+  start_date?: string;
+  address?: string;
+  bank_transit?: string;
+  bank_institution?: string;
+  bank_account?: string;
+  notes?: string;
+}
+
+export async function updateEmployee(
+  employeeId: string,
+  input: UpdateEmployeeInput,
+): Promise<Employee> {
+  const res = await api.put(`/api/payroll/employees/${employeeId}`, input);
+  return res.data;
+}
+
+export async function getEmployeeDetail(
+  entityCode: string,
+  employeeId: string,
+): Promise<Employee> {
+  const res = await api.get<Employee>(
+    `/api/payroll/employees/${employeeId}`,
+    { params: { entity_code: entityCode } },
+  );
+  return res.data;
 }
 
 export interface PayrollRun {
@@ -86,13 +142,74 @@ export async function listPayrollRuns(params: {
   return res.data;
 }
 
+export interface PayrollRunLine {
+  id: string;
+  employee_id: string;
+  employee_number: number;
+  full_name: string;
+  employment_type: string;
+  is_on_vacation: boolean;
+  week1_hours: string;
+  week2_hours: string;
+  total_hours: string;
+  hourly_rate: string | null;
+  reg_hours_pay: string;
+  salary_pay: string;
+  stat_pay: string;
+  vacation_paid: string;
+  gross_pay: string;
+  taxable_gross: string;
+  fed_tax: string;
+  cpp_ee: string;
+  cpp_er: string;
+  ei_ee: string;
+  ei_er: string;
+  life_taxable_benefit: string;
+  vacation_earned: string;
+  net_pay: string;
+  notes: string | null;
+}
+
+export interface PayrollRunDetail {
+  entity_code: string;
+  run: {
+    id: string;
+    pay_run_number: string;
+    period_number: number;
+    period_start: string;
+    period_end: string;
+    pay_date: string;
+    pay_type: string;
+    status: string;
+    workflow_status: string;
+    active_employees: number;
+    paid_employees: number;
+    total_gross: string;
+    total_net_pay: string;
+    total_fed_tax: string;
+    total_cpp_ee: string;
+    total_cpp_er: string;
+    total_ei_ee: string;
+    total_ei_er: string;
+    total_life_taxable: string;
+    total_vacation_earned: string;
+    total_vacation_paid: string;
+    total_stat_pay: string;
+    cra_remittance_amount: string;
+    journal_batch_id: string | null;
+    summary: Record<string, unknown>;
+  };
+  lines: PayrollRunLine[];
+}
+
 export async function getPayrollRun(
   entityCode: string,
   payrollRunId: string,
-): Promise<unknown> {
-  const res = await api.get(`/api/payroll/runs/${payrollRunId}`, {
-    params: { entity_code: entityCode },
-  });
+): Promise<PayrollRunDetail> {
+  const res = await api.get<PayrollRunDetail>(
+    `/api/payroll/runs/${payrollRunId}`,
+    { params: { entity_code: entityCode } },
+  );
   return res.data;
 }
 
@@ -182,6 +299,53 @@ export async function schedulePayrollWithdrawals(
   const res = await api.post(
     `/api/payroll/runs/${payrollRunId}/schedule-withdrawals`,
     body,
+  );
+  return res.data;
+}
+
+// ---- EFT generation ------------------------------------------------------
+
+export interface GenerateEftResponse {
+  id: string;
+  payroll_run_id: string;
+  file_name: string;
+  file_path: string | null;
+  r2_uploaded: boolean;
+  record_count: number;
+  credit_count: number;
+  total_amount: number;
+  file_creation_number: number;
+  generated_at: string;
+}
+
+export async function generatePayrollEft(
+  payrollRunId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<GenerateEftResponse> {
+  const res = await api.post<GenerateEftResponse>(
+    `/api/payroll/runs/${payrollRunId}/generate-eft`,
+    body,
+  );
+  return res.data;
+}
+
+export interface PayrollEftDownload {
+  file_name: string;
+  download_url: string;
+  expires_in_seconds: number;
+  record_count: number;
+  total_amount: number;
+  file_creation_number: number;
+  generated_at: string;
+}
+
+export async function getPayrollEftDownload(
+  entityCode: string,
+  payrollRunId: string,
+): Promise<PayrollEftDownload> {
+  const res = await api.get<PayrollEftDownload>(
+    `/api/payroll/runs/${payrollRunId}/eft/download`,
+    { params: { entity_code: entityCode } },
   );
   return res.data;
 }
