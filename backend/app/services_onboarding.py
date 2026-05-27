@@ -191,7 +191,11 @@ def detect_existing_data(session, entity_id: str) -> dict[str, Any]:
         {"eid": entity_id},
     ).mappings().first() or {}
 
-    has_chart = account_count > 0
+    # A real chart always has 50+ entries; the threshold sits at 10 so
+    # the small set of placeholder rows that get inserted by other
+    # modules (CRA 2320, OBE 3900) don't make the wizard think a chart
+    # has been imported and skip the Chart step.
+    has_chart = account_count > 10
     has_opening = opening is not None
     return {
         "has_chart_of_accounts": has_chart,
