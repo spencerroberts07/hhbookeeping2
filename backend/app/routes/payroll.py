@@ -830,11 +830,16 @@ def put_update_employee(
 
 # TODO: Move to entities table when additional dealers come online.
 PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
-# TODO: Replace with the TD-issued 10-digit originator number once
-# Bridlewood completes EFT origination setup with TD Business Banking.
-EFT_ORIGINATOR_ID = "BRIDLEWOOD"
+# TD-issued 10-character originator ID. Provided by Spencer / TD's
+# EFT origination setup. Must be exactly 10 chars for CPA-005.
+EFT_ORIGINATOR_ID = "TPBHC10203"
 EFT_SHORT_NAME = "BRIDLEWOOD HH"
 EFT_LONG_NAME = "BRIDLEWOOD HOME HARDWARE"
+# Return-credit routing — where TD credits funds back if an EFT is
+# undeliverable. Bridlewood's operating account at TD.
+EFT_RETURN_INSTITUTION = "0004"
+EFT_RETURN_TRANSIT = "10202"
+EFT_RETURN_ACCOUNT = "06905660371"
 
 
 class GenerateEftRequest(BaseModel):
@@ -941,6 +946,9 @@ def post_generate_eft(
             creation_date=DateType.today(),
             originator_short_name=EFT_SHORT_NAME,
             originator_long_name=EFT_LONG_NAME,
+            return_institution=EFT_RETURN_INSTITUTION,
+            return_transit=EFT_RETURN_TRANSIT,
+            return_account=EFT_RETURN_ACCOUNT,
         )
         employees = [
             _eft.EFTEmployee(

@@ -144,13 +144,23 @@ class EFTEmployee:
 
 @dataclass
 class EFTHeader:
-    """A-record context."""
+    """A-record context.
+
+    Return-account fields: the bank routing information TD should
+    credit back to when an EFT can't be delivered (e.g. account
+    closed). Per CPA-005 these go in the C-record's positions 65-86
+    rather than the A-record's reserved area, but they're file-level
+    constants for a given originator so we carry them on the header
+    object and write them into every C-record."""
 
     originator_id: str             # 10-char originator number from TD
     file_creation_number: int      # monotonically increasing per originator
     creation_date: date
     originator_short_name: str     # 15 char, shown on payee statements
     originator_long_name: str      # 30 char, settlement / clearing label
+    return_institution: str        # 4-digit FI number for return-credit
+    return_transit: str            # 5-digit branch for return-credit
+    return_account: str            # up to 12-digit account for return-credit
     destination_data_centre: str = TD_DESTINATION_DATA_CENTRE
     currency_code: str = "CAD"
 
@@ -204,7 +214,15 @@ def _build_c_record(
     parts.append(institution)
     parts.append(transit)
     parts.append(account)
-    parts.append(_zpad(0, 22))                                        # 65-86: item trace (zero-filled)
+    # 65-86: return-account routing (where TD credits back undelivered EFTs).
+    # Standard CPA-005: institution (4) + transit (5) + account (12) + filler (1).
+    ret_inst = _pad(header.return_institution.strip(), 4)             # 65-68
+    ret_trans = _pad(header.return_transit.strip(), 5)                # 69-73
+    ret_acct = _pad(_sanitize_account(header.return_account), 12)     # 74-85
+    parts.append(ret_inst)
+    parts.append(ret_trans)
+    parts.append(ret_acct)
+    parts.append(_pad("", 1))                                         # 86: filler
     parts.append(_pad("", 3))                                         # 87-89: stored txn type
     parts.append(_pad(header.originator_short_name, 15))              # 90-104
     parts.append(_pad(employee.name, 30))                             # 105-134: payee name
