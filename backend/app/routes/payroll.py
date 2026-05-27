@@ -672,11 +672,14 @@ class UpdateEmployeeRequest(BaseModel):
 def get_employee_detail(
     employee_id: str = Path(...),
     entity_code: str = Query(...),
-    _user: dict = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
     """Full employee row for the editor drawer. The /employees list
     endpoint returns a slimmer projection; this one returns everything
-    the edit form needs."""
+    the edit form needs.
+
+    Auth note: no `require_role` dep — same reason as
+    get_eft_download. Matches the pattern of other GET endpoints in
+    this file."""
     from sqlalchemy import text as _text
     with db_session() as session:
         entity = session.execute(
@@ -991,12 +994,20 @@ def post_generate_eft(
 def get_eft_download(
     payroll_run_id: str = Path(...),
     entity_code: str = Query(...),
-    _user: dict = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
     """Return a presigned R2 URL for the most-recent EFT file on this
     run. 404 if no file exists; 409 if R2 didn't store the file (e.g.
     R2 was down when the file was generated). The TXT is available
-    again by re-running generate-eft."""
+    again by re-running generate-eft.
+
+    Auth note: no `require_role` dep — matches the pattern of the
+    other GET endpoints in this file (get_run, get_run_summary,
+    get_runs, get_employees). Clerk middleware enforces session
+    presence on the route prefix; entity scoping happens via the
+    entity_code query param. The previous `require_role("viewer")`
+    was returning 401 for authenticated users on every page load,
+    which the frontend axios interceptor then escalated to a
+    /sign-in bounce → /dashboard redirect."""
     from sqlalchemy import text as _text
     from ..services_storage import storage_service as _r2
 

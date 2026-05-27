@@ -50,9 +50,22 @@ export default function PayrollRunDetailPage() {
     queryFn: () => getPayrollRun(entityCode!, runId),
   });
 
+  // Only fire the EFT-download lookup once we know the run could
+  // plausibly have a file. EFT generation requires the run to be in
+  // approved/approved_to_post/posted state — anything earlier and
+  // no payroll_eft_files row will exist, so the endpoint would 404
+  // every page load (and previously was 401-ing, which the axios
+  // interceptor escalated to a /sign-in bounce). React Query strings
+  // its `enabled` predicate, so this evaluates on every render once
+  // q.data lands.
+  const runStatus =
+    q.data?.run.workflow_status || q.data?.run.status || '';
+  const eftCouldExist = ['approved', 'approved_to_post', 'posted'].includes(
+    runStatus,
+  );
   const eftDownload = useQuery({
     queryKey: ['payroll-eft', entityCode, runId],
-    enabled: !!entityCode && !!runId,
+    enabled: !!entityCode && !!runId && eftCouldExist,
     retry: false,
     queryFn: () => getPayrollEftDownload(entityCode!, runId),
   });
