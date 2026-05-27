@@ -33,8 +33,17 @@ export function ClerkTokenBridge({ children }: { children: React.ReactNode }) {
   });
 
   useEffect(() => {
+    // Wait until Clerk is fully loaded before installing the resolver.
+    // Otherwise we'd flip the `resolverReady` gate in lib/api/client.ts
+    // while authLoaded is still false — the gate releases, the
+    // interceptor calls tokenResolver(), it returns null, and the
+    // request goes out with no Authorization header. Result: backend
+    // `require_role(...)` 401s on the first batch of GETs (POST clicks
+    // happen after Clerk loads so they work — explaining the
+    // GET-only failure pattern).
+    if (!authLoaded) return;
     setTokenResolver(async () => {
-      if (!authLoaded || !isSignedIn) return null;
+      if (!isSignedIn) return null;
       return getToken();
     });
   }, [authLoaded, isSignedIn, getToken]);
