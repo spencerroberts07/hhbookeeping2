@@ -12,6 +12,7 @@ const TABS = [
   { href: '/settings/billing', label: 'Billing' },
   { href: '/settings/accounts', label: 'Chart of accounts' },
   { href: '/settings/integrations', label: 'Integrations' },
+  { href: '/settings/data-import', label: 'Data import' },
   { href: '/settings/notifications', label: 'Notifications' },
 ];
 

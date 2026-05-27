@@ -1,5 +1,8 @@
 'use client';
 
+import { useState } from 'react';
+import Link from 'next/link';
+import { useUser } from '@clerk/nextjs';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -7,9 +10,11 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   AlertTriangle,
+  ArrowRight,
   CheckCircle2,
   Database,
   Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useEntityStore } from '@/lib/store/entity';
@@ -19,6 +24,10 @@ import {
   getQuickbooksStatus,
   startQuickbooksConnect,
 } from '@/lib/api/dashboard';
+import {
+  getOnboardingStatus,
+  pullChartFromQbo,
+} from '@/lib/api/onboarding';
 import { formatDate } from '@/lib/utils';
 
 // Force dynamic so Next.js doesn't try to prerender this page at
@@ -184,6 +193,12 @@ export default function IntegrationsSettingsPage() {
                   Admin role required to change this connection.
                 </p>
               )}
+
+              {/* Chart of Accounts sync — pulls from the connected QBO
+                  company and upserts into the local accounts table.
+                  Reuses the onboarding chart-of-accounts/qbo endpoint
+                  (entity-scoped, no wizard state). */}
+              <ChartOfAccountsSection isAdmin={isAdmin} />
             </div>
           ) : (
             <div className="space-y-4">
@@ -209,6 +224,121 @@ export default function IntegrationsSettingsPage() {
           )}
         </CardContent>
       </Card>
+
+      <Card>
+        <CardContent className="py-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="font-semibold text-deep-navy">Bulk data import</div>
+              <p className="text-sm text-slate mt-0.5">
+                Upload trial balances or GL CSV exports outside the onboarding
+                wizard.
+              </p>
+            </div>
+            <Link
+              href="/settings/data-import"
+              className="inline-flex items-center gap-1 text-sm font-semibold text-ledger-blue hover:underline"
+            >
+              Open data import
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function ChartOfAccountsSection({ isAdmin }: { isAdmin: boolean }) {
+  const entityCode = useEntityStore((s) => s.activeEntityCode);
+  const { user } = useUser();
+  const actor = user?.primaryEmailAddress?.emailAddress ?? '';
+  const qc = useQueryClient();
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
+
+  const status = useQuery({
+    queryKey: ['onboarding-status', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getOnboardingStatus(entityCode!),
+  });
+
+  const sync = useMutation({
+    mutationFn: () => {
+      if (!entityCode) throw new Error('No active entity');
+      return pullChartFromQbo({ entity_code: entityCode, actor_email: actor });
+    },
+    onSuccess: (res) => {
+      setLastSyncedAt(new Date());
+      toast.success(
+        `Synced ${res.account_count} account${res.account_count === 1 ? '' : 's'} from QuickBooks`,
+      );
+      qc.invalidateQueries({ queryKey: ['onboarding-status', entityCode] });
+    },
+    onError: (err: Error) =>
+      toast.error(err.message || 'Could not sync chart of accounts'),
+  });
+
+  const currentCount = status.data?.account_count ?? 0;
+
+  return (
+    <div className="border-t border-border pt-4 mt-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <Database className="h-4 w-4 text-ledger-blue" />
+        <span className="font-semibold text-deep-navy">Chart of accounts</span>
+      </div>
+      <p className="text-sm text-slate">
+        Sync your QBO chart of accounts to BookWize. Each sync upserts every
+        account from QuickBooks and writes the QBO account id mapping that
+        later GL imports rely on.
+      </p>
+      <dl className="text-sm grid grid-cols-[120px_1fr] gap-x-3 gap-y-1 text-slate">
+        <dt>Accounts loaded</dt>
+        <dd className="text-ink">{currentCount}</dd>
+        <dt>Last synced</dt>
+        <dd className="text-ink">
+          {lastSyncedAt
+            ? formatDate(lastSyncedAt.toISOString(), 'MMM dd, yyyy HH:mm')
+            : sync.data
+              ? 'Just now'
+              : 'Never (this session)'}
+        </dd>
+      </dl>
+      <div className="flex flex-wrap items-center gap-2 pt-1">
+        <Button
+          variant="outline"
+          onClick={() => sync.mutate()}
+          disabled={!isAdmin || sync.isPending}
+        >
+          {sync.isPending ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <RefreshCw className="h-4 w-4 mr-2" />
+          )}
+          Sync chart of accounts
+        </Button>
+        {sync.isError && (
+          <span className="text-xs text-red-700 inline-flex items-center gap-1">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Sync failed — try again
+          </span>
+        )}
+      </div>
+      {sync.data && (
+        <div className="rounded-md border border-bw-teal/30 bg-bw-teal/5 p-3 text-sm">
+          <div className="flex items-center gap-2 font-semibold text-deep-navy">
+            <CheckCircle2 className="h-4 w-4 text-bw-teal" />
+            {sync.data.account_count} accounts synced
+          </div>
+          <p className="text-xs text-slate mt-1 ml-6">
+            {sync.data.bank_account_count} bank-type accounts found.
+          </p>
+        </div>
+      )}
+      {!isAdmin && (
+        <p className="text-xs text-slate">
+          Admin role required to sync the chart.
+        </p>
+      )}
     </div>
   );
 }
