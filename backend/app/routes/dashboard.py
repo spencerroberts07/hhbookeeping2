@@ -9,6 +9,7 @@ from ..db import db_session
 from ..schemas import DashboardResponse
 from ..services import get_entity_by_code
 from ..services_auth import require_role
+from ..services_period_close import LOCKED_STATUSES
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -150,7 +151,10 @@ def dashboard_alerts(
             period_end: DateType = period["period_end"]
             days_since = (today - period_end).days
             # Period is "late" once we're past month-end + a 10-day grace.
-            if days_since > 10 and period["status"] != "closed":
+            # Suppress the alert if the period is already in a locked
+            # status (closed_locked or mid-approval approved_to_close) —
+            # those mean the user is already on it or finished.
+            if days_since > 10 and period["status"] not in LOCKED_STATUSES:
                 alerts.append({
                     "type": "period_late",
                     "severity": "warning",
@@ -259,7 +263,7 @@ def _current_period_for_entity(session, entity_id: str) -> dict[str, Any] | None
           FROM accounting_periods ap
          WHERE ap.entity_id = :eid
            AND ap.period_end <= CURRENT_DATE
-           AND ap.status <> 'closed'
+           AND ap.status NOT IN ('closed_locked', 'approved_to_close')
            AND EXISTS (
                SELECT 1 FROM journal_batches jb
                 WHERE jb.accounting_period_id = ap.id
@@ -278,7 +282,7 @@ def _current_period_for_entity(session, entity_id: str) -> dict[str, Any] | None
           FROM accounting_periods ap
          WHERE ap.entity_id = :eid
            AND ap.period_end <= CURRENT_DATE
-           AND ap.status <> 'closed'
+           AND ap.status NOT IN ('closed_locked', 'approved_to_close')
            AND EXISTS (
                SELECT 1 FROM journal_batches jb
                 WHERE jb.accounting_period_id = ap.id
@@ -297,7 +301,7 @@ def _current_period_for_entity(session, entity_id: str) -> dict[str, Any] | None
           FROM accounting_periods
          WHERE entity_id = :eid
            AND period_end <= CURRENT_DATE
-           AND status <> 'closed'
+           AND status NOT IN ('closed_locked', 'approved_to_close')
          ORDER BY period_end DESC LIMIT 1
         """
     )

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..db import db_session
 from ..services_auth import enforce_entity_code, require_role
+from ..services_period_close import STATUS_CLOSED_LOCKED
 from ..services_payroll import (
     approve_payroll_run,
     build_payroll_journal,
@@ -44,9 +45,9 @@ router = APIRouter(prefix="/api/payroll", tags=["payroll"])
 # Reads journal_lines on the canonical CRA-payable account (2320) for the
 # requested calendar year, grouped by month, and shows per-period owings
 # plus a running total. "Remitted" status currently inferred from the
-# month being closed (period.status='closed' → remitted). We can swap
-# in a real remittance-tracking table later without changing the
-# response shape.
+# month being closed_locked (period.status = STATUS_CLOSED_LOCKED →
+# remitted). We can swap in a real remittance-tracking table later
+# without changing the response shape.
 # --------------------------------------------------------------------------
 
 
@@ -98,7 +99,11 @@ def cra_remittance(
         total_outstanding = 0.0
         for r in rows:
             total_owing = float(r["net_credit"])
-            status = "remitted" if r["period_status"] == "closed" else "owing"
+            status = (
+                "remitted"
+                if r["period_status"] == STATUS_CLOSED_LOCKED
+                else "owing"
+            )
             if status == "owing":
                 total_outstanding += total_owing
             remittances.append({
