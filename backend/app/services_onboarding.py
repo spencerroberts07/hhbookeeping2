@@ -98,8 +98,17 @@ def detect_existing_data(session, entity_id: str) -> dict[str, Any]:
     pre-fill the wizard so dealers with partial setup (like Bridlewood)
     don't see a blank slate.
     """
+    # Filter on is_active so deactivated chart rows don't make the
+    # onboarding wizard think a chart is already loaded. Without this,
+    # cleaning up a bad chart import (e.g. the QBO sample-company rows
+    # that were soft-deactivated for Bridlewood) leaves the count high
+    # and has_chart_of_accounts=true, so the wizard skips the Chart
+    # step instead of prompting for a fresh upload.
     accounts_row = session.execute(
-        text("SELECT COUNT(*) AS c FROM accounts WHERE entity_id = :eid"),
+        text(
+            "SELECT COUNT(*) AS c FROM accounts "
+            "WHERE entity_id = :eid AND is_active = TRUE"
+        ),
         {"eid": entity_id},
     ).mappings().first()
     account_count = int((accounts_row or {}).get("c") or 0)
