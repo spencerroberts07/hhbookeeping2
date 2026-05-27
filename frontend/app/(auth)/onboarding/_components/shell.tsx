@@ -1,7 +1,8 @@
 'use client';
 
 import Image from 'next/image';
-import { Check } from 'lucide-react';
+import Link from 'next/link';
+import { Check, LogOut } from 'lucide-react';
 import { STEP_ORDER, useOnboardingStore, type OnboardingStep } from '@/lib/store/onboarding';
 import { cn } from '@/lib/utils';
 
@@ -37,6 +38,18 @@ export function OnboardingShell({ children }: { children: React.ReactNode }) {
         <div className="text-xs text-white/60">
           Step {Math.min(currentIdx + 1, STEP_ORDER.length)} of {STEP_ORDER.length}
         </div>
+        {/* Always-visible escape hatch. Onboarding state is persisted in
+            zustand+localStorage, so navigating to /dashboard doesn't reset
+            progress — the user can return and resume from the Setup
+            sidebar entry. */}
+        <Link
+          href="/dashboard"
+          className="ml-3 inline-flex items-center gap-1.5 rounded-md border border-white/20 px-2.5 py-1.5 text-xs font-medium text-white/80 hover:bg-white/10 hover:text-white transition-colors"
+          aria-label="Exit to dashboard (progress is saved)"
+        >
+          <LogOut className="h-3.5 w-3.5" strokeWidth={1.5} />
+          Exit to dashboard
+        </Link>
       </header>
 
       {/* Progress bar */}

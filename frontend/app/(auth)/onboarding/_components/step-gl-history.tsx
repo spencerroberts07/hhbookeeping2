@@ -54,6 +54,12 @@ export function StepGLHistory() {
   const [progress, setProgress] = useState<GLProgressResponse | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Hard cap so the user is never stuck staring at the progress bar.
+  // GL imports of a few years take a couple minutes; if we haven't
+  // seen a 'complete' or 'error' status after 10 minutes the worker is
+  // hung — surface an error so the dealer can retry or skip.
+  const POLLING_TIMEOUT_MS = 10 * 60 * 1000;
+
   const stopPolling = () => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
@@ -63,7 +69,27 @@ export function StepGLHistory() {
 
   const startPolling = (id: string) => {
     stopPolling();
+    const startedAt = Date.now();
     pollRef.current = setInterval(async () => {
+      if (Date.now() - startedAt > POLLING_TIMEOUT_MS) {
+        stopPolling();
+        setProgress((p) => ({
+          ...(p ?? {
+            job_id: id,
+            job_type: 'gl_import',
+            pct_complete: 0,
+            current_step: null,
+            months_imported: 0,
+            lines_created: 0,
+            batches_created: 0,
+          }),
+          status: 'error',
+          error:
+            'Import is taking longer than expected (10 minutes). The worker may be stuck. Try a shorter date range, or skip this step and import later from Settings → Data.',
+        }));
+        toast.error('GL import timed out');
+        return;
+      }
       try {
         const p = await getGLHistoryProgress(id);
         setProgress(p);

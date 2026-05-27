@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useUser } from '@clerk/nextjs';
 import { useMutation, useQuery } from '@tanstack/react-query';
@@ -13,8 +13,15 @@ import {
   getOnboardingStatus,
   type CompleteOnboardingResponse,
 } from '@/lib/api/onboarding';
-import { CheckCircle2, Sparkles } from 'lucide-react';
-import { formatMoney } from '@/lib/utils';
+import { AlertTriangle, CheckCircle2, Sparkles } from 'lucide-react';
+import { formatMoney as _formatMoney } from '@/lib/utils';
+
+void _formatMoney; // currently unused — kept for future per-account totals on this screen
+
+// Cap how long we wait for /api/onboarding/complete before surfacing
+// an error UI with a retry button. Previously this view had only a
+// skeleton fallback — if the call hung the user was stuck.
+const COMPLETE_TIMEOUT_MS = 30_000;
 
 export function StepComplete() {
   const router = useRouter();
@@ -28,21 +35,82 @@ export function StepComplete() {
     queryFn: () => getOnboardingStatus(entityCode),
   });
 
-  // Auto-run /complete exactly once when the user lands on this step.
   const completeRan = useRef(false);
   const completeMutation = useMutation<CompleteOnboardingResponse>({
     mutationFn: () =>
       completeOnboarding({ entity_code: entityCode, actor_email: actor }),
   });
 
+  const [timedOut, setTimedOut] = useState(false);
+
   useEffect(() => {
-    if (!completeRan.current && entityCode && actor && !completeMutation.data && !completeMutation.isPending) {
+    if (
+      !completeRan.current &&
+      entityCode &&
+      actor &&
+      !completeMutation.data &&
+      !completeMutation.isPending
+    ) {
       completeRan.current = true;
+      setTimedOut(false);
       completeMutation.mutate();
     }
   }, [entityCode, actor, completeMutation]);
 
+  // Pending-state timeout. If /complete hangs, show the error UI
+  // instead of leaving the user on Skeleton tiles.
+  useEffect(() => {
+    if (!completeMutation.isPending) {
+      setTimedOut(false);
+      return;
+    }
+    const t = setTimeout(() => setTimedOut(true), COMPLETE_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [completeMutation.isPending]);
+
+  const retry = () => {
+    completeMutation.reset();
+    setTimedOut(false);
+    completeRan.current = true;
+    completeMutation.mutate();
+  };
+
   const summary = completeMutation.data;
+
+  // Error or timeout state — give the user a real exit path.
+  if (completeMutation.isError || (completeMutation.isPending && timedOut)) {
+    const message =
+      completeMutation.error instanceof Error
+        ? completeMutation.error.message
+        : 'The finishing-up step is taking longer than expected.';
+    return (
+      <div className="space-y-6">
+        <div className="flex items-start gap-3 rounded-xl border-2 border-amber-300 bg-amber-50 p-5">
+          <AlertTriangle className="h-6 w-6 text-amber-700 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <div className="font-semibold text-amber-900">
+              Couldn't finish setting up
+            </div>
+            <div className="text-sm text-amber-900/80 mt-1">{message}</div>
+          </div>
+        </div>
+        <div className="flex justify-between">
+          <Button
+            variant="outline"
+            onClick={() => {
+              reset();
+              router.push('/dashboard');
+            }}
+          >
+            Go to dashboard anyway
+          </Button>
+          <Button variant="accent" onClick={retry}>
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="text-center py-4 space-y-6">

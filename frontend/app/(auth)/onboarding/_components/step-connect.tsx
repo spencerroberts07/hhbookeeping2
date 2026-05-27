@@ -1,20 +1,36 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { useEntityStore } from '@/lib/store/entity';
 import { useOnboardingStore } from '@/lib/store/onboarding';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { getOnboardingStatus, startQboConnect } from '@/lib/api/onboarding';
-import { Database, Upload, CheckCircle2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Database,
+  Upload,
+} from 'lucide-react';
 import { toast } from 'sonner';
+
+// localStorage flag we set right before the OAuth redirect leaves the
+// tab, and check on return. Used to detect "user came back without
+// the ?qbo=connected query param" — meaning the OAuth flow didn't
+// complete successfully.
+const OAUTH_PENDING_KEY = 'bookwize.qbo_oauth_pending_until';
+// Window during which "missing ?qbo=connected" is treated as a failed
+// or cancelled OAuth attempt. Matches the spec's 60s timeout.
+const OAUTH_FOLLOWUP_WINDOW_MS = 60_000;
 
 export function StepConnect() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const setField = useOnboardingStore((s) => s.setField);
   const goTo = useOnboardingStore((s) => s.goTo);
   const prev = useOnboardingStore((s) => s.prev);
+  const searchParams = useSearchParams();
 
   const status = useQuery({
     queryKey: ['onboarding-status', entityCode],
@@ -23,6 +39,38 @@ export function StepConnect() {
   });
 
   const [busy, setBusy] = useState(false);
+  const [oauthFailed, setOauthFailed] = useState(false);
+
+  // Detect a failed or cancelled OAuth attempt. If we previously set
+  // OAUTH_PENDING_KEY before redirecting to Intuit but the user is now
+  // back on this step without ?qbo=connected and without an active
+  // QBO connection, the flow didn't complete.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const raw = window.localStorage.getItem(OAUTH_PENDING_KEY);
+    if (!raw) return;
+    const pendingUntil = Number(raw);
+    if (!pendingUntil || Date.now() > pendingUntil) {
+      window.localStorage.removeItem(OAUTH_PENDING_KEY);
+      return;
+    }
+    const qboParam = searchParams.get('qbo');
+    if (qboParam === 'connected') {
+      window.localStorage.removeItem(OAUTH_PENDING_KEY);
+      return;
+    }
+    if (qboParam === 'failed') {
+      window.localStorage.removeItem(OAUTH_PENDING_KEY);
+      setOauthFailed(true);
+      return;
+    }
+    // We came back to this page within the 60s window but with no
+    // success/failure marker — treat as cancelled / errored.
+    if (status.data && !status.data.has_qbo_connection) {
+      window.localStorage.removeItem(OAUTH_PENDING_KEY);
+      setOauthFailed(true);
+    }
+  }, [searchParams, status.data]);
 
   if (status.data?.has_qbo_connection) {
     return (
@@ -71,15 +119,32 @@ export function StepConnect() {
   const connectQbo = async () => {
     if (!entityCode) return;
     setBusy(true);
+    setOauthFailed(false);
     try {
-      const res = await startQboConnect(entityCode);
-      setField('connect_path', 'qbo');
-      // Redirect to Intuit's consent page in the same tab. Intuit's
-      // callback will land back on the backend's /api/auth/quickbooks/
-      // callback, which redirects to the frontend (handled elsewhere).
-      window.location.href = res.authorization_url;
+      // Surface a slow /connect call instead of letting the spinner sit
+      // forever. 15s is generous for a token-mint round-trip.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const res = await startQboConnect(entityCode);
+        clearTimeout(timer);
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(
+            OAUTH_PENDING_KEY,
+            String(Date.now() + OAUTH_FOLLOWUP_WINDOW_MS),
+          );
+        }
+        setField('connect_path', 'qbo');
+        window.location.href = res.authorization_url;
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
-      toast.error('Could not start QuickBooks connection');
+      const msg =
+        err instanceof DOMException && err.name === 'AbortError'
+          ? "QuickBooks didn't respond in time. Try again, or upload files instead."
+          : 'Could not start QuickBooks connection';
+      toast.error(msg);
       setBusy(false);
     }
   };
@@ -97,6 +162,21 @@ export function StepConnect() {
           Pick the easiest path. You can switch later.
         </p>
       </div>
+
+      {oauthFailed && (
+        <div className="rounded-xl border-2 border-amber-300 bg-amber-50 p-4 flex items-start gap-3">
+          <AlertTriangle className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <div className="font-semibold text-amber-900">
+              QuickBooks connection didn't complete
+            </div>
+            <div className="text-sm text-amber-900/80 mt-1">
+              It looks like authorization was cancelled or timed out. Try
+              again, or load your data from files instead.
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid md:grid-cols-2 gap-4">
         {/* QBO card */}
@@ -116,7 +196,11 @@ export function StepConnect() {
             <li>✓ Stays in sync going forward</li>
           </ul>
           <Button onClick={connectQbo} disabled={busy} className="w-full">
-            {busy ? 'Redirecting…' : 'Connect QuickBooks'}
+            {busy
+              ? 'Redirecting…'
+              : oauthFailed
+                ? 'Try connecting again'
+                : 'Connect QuickBooks'}
           </Button>
         </div>
 
@@ -136,7 +220,7 @@ export function StepConnect() {
             <li>✓ No software connection required</li>
           </ul>
           <Button onClick={pickFileUpload} variant="outline" className="w-full">
-            Upload files instead
+            {oauthFailed ? 'Skip — upload files instead' : 'Upload files instead'}
           </Button>
         </div>
       </div>
