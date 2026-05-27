@@ -13,7 +13,18 @@ export type AssistantActionType =
   | 'classify_transaction'
   | 'add_note'
   | 'post_to_pending'
+  | 'update_employee_rate'
+  | 'update_employee_salary'
+  | 'one_time_pay_override'
+  | 'add_bonus_line'
   | 'none';
+
+export type AssistantIntentExtended =
+  | AssistantIntent
+  | 'update_employee_rate'
+  | 'update_employee_salary'
+  | 'one_time_pay_override'
+  | 'add_bonus_line';
 
 export interface JournalPreview {
   debit_account_code: string | null;
@@ -31,11 +42,50 @@ export interface TransactionPreview {
   direction: string;
 }
 
+/**
+ * Before/after preview for payroll-changing actions
+ * (update_employee_rate, update_employee_salary,
+ * one_time_pay_override, add_bonus_line).
+ *
+ * All money values are dollar amounts; tax_delta_* are the per-period
+ * deltas in CPP / EI / Fed Tax between BEFORE and AFTER. annual_impact
+ * is the difference × 26 periods for rate/salary changes.
+ */
+export interface PayrollChangePreview {
+  employee_id: string;
+  employee_name: string;
+  change_type:
+    | 'hourly_rate'
+    | 'biweekly_salary'
+    | 'one_time_override'
+    | 'bonus_line';
+  payroll_run_id?: string | null;
+  run_period_label?: string | null;
+  before: {
+    hourly_rate?: number | null;
+    biweekly_salary?: number | null;
+    sample_biweekly_gross?: number | null;
+    net_est?: number | null;
+  };
+  after: {
+    hourly_rate?: number | null;
+    biweekly_salary?: number | null;
+    sample_biweekly_gross?: number | null;
+    net_est?: number | null;
+  };
+  cpp_delta_per_period?: number | null;
+  ei_delta_per_period?: number | null;
+  fed_tax_delta_per_period?: number | null;
+  annual_impact?: number | null;
+  note?: string | null;
+}
+
 export interface ProposedAction {
   action_type: AssistantActionType;
   transaction_id: string | null;
   transaction_preview: TransactionPreview | null;
   journal_preview: JournalPreview | null;
+  payroll_preview: PayrollChangePreview | null;
   pending_intent_id: string | null;
 }
 
@@ -63,6 +113,11 @@ export async function sendAssistantMessage(input: {
   entity_code: string;
   message: string;
   conversation_id?: string | null;
+  /** Current route the user is viewing — gives Claude context (e.g.
+   *  '/payroll/runs/ea2a8b4e-...' or '/bank'). Also written to
+   *  assistant_conversations.channel so we can analyse which pages
+   *  drive which questions. */
+  page_context?: string | null;
 }): Promise<MessageResponse> {
   const res = await api.post<MessageResponse>('/api/assistant/message', input);
   return res.data;

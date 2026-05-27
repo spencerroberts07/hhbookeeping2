@@ -58,6 +58,12 @@ class MessageRequest(BaseModel):
     entity_code: str
     message: str = Field(min_length=1, max_length=2000)
     conversation_id: str | None = None
+    # Pathname of the page the user is viewing when they sent this
+    # message (e.g. '/payroll/runs/ea2a8b4e-...'). Used to (1) tag the
+    # conversations.channel field for analytics, and (2) inject a
+    # PAGE CONTEXT block into Claude's system prompt so it can tailor
+    # the reply.
+    page_context: str | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -99,11 +105,18 @@ def post_message(
                     """
                     INSERT INTO assistant_conversations (
                         entity_code, clerk_user_id, channel
-                    ) VALUES (:ec, :uid, 'dashboard')
+                    ) VALUES (:ec, :uid, :channel)
                     RETURNING id
                     """
                 ),
-                {"ec": body.entity_code, "uid": clerk_user_id},
+                {
+                    "ec": body.entity_code,
+                    "uid": clerk_user_id,
+                    # Use page_context as the channel label so we can
+                    # see which pages drive which questions. Empty /
+                    # None falls back to 'global'.
+                    "channel": (body.page_context or "global")[:120],
+                },
             ).mappings().first()
             conv_id = str(row["id"]) if row else None
             if not conv_id:
@@ -159,6 +172,7 @@ def post_message(
             matches=matches,
             history=history,
             context=context,
+            page_context=body.page_context,
         )
 
         # 5a. Special-case the cash-balance query — always inject the
@@ -285,6 +299,12 @@ def post_confirm(
                 clerk_user_id=clerk_user_id,
                 conversation_id=str(msg["conversation_id"]),
                 original_message=msg["content"][:500],
+                # Payroll-specific fields. None for non-payroll
+                # actions; the executor ignores them in that case.
+                employee_id=proposal.get("employee_id"),
+                payroll_run_id=proposal.get("payroll_run_id"),
+                payroll_run_line_id=proposal.get("payroll_run_line_id"),
+                new_value=proposal.get("new_value"),
             )
             # Mark the assistant message resolved.
             session.execute(
@@ -512,5 +532,10 @@ def _action_to_dict(action: ProposedAction) -> dict[str, Any]:
         "transaction_id": action.transaction_id,
         "transaction_preview": action.transaction_preview,
         "journal_preview": action.journal_preview,
+        "payroll_preview": action.payroll_preview,
+        "employee_id": action.employee_id,
+        "payroll_run_id": action.payroll_run_id,
+        "payroll_run_line_id": action.payroll_run_line_id,
+        "new_value": action.new_value,
         "pending_intent_id": action.pending_intent_id,
     }

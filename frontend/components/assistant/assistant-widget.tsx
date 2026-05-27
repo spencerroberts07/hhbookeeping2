@@ -1,44 +1,58 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef } from 'react';
+import { usePathname } from 'next/navigation';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { Sparkles, X, Send, Minus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { useUserStore } from '@/lib/store/user';
+import { useAssistantStore } from '@/lib/store/assistant';
 import {
   sendAssistantMessage,
   confirmAssistantAction,
   getAssistantInsights,
   type MessageResponse,
 } from '@/lib/api/assistant';
-import { AssistantMessage, type AssistantMessageItem } from './assistant-message';
+import { AssistantMessage } from './assistant-message';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 
 /**
- * Floating chat panel anchored bottom-right of the dashboard. Two
- * states: collapsed circle + expanded 380×500 panel.
+ * Global floating chat panel. Mounted once in (app)/layout.tsx, so it
+ * survives every route navigation. Conversation state lives in
+ * useAssistantStore (Zustand) — closing the panel (X) clears the
+ * thread; minimizing (-) just hides the panel and preserves it.
  *
- * Conversation state lives in component memory for the session. We
- * pass conversation_id back to the backend on each turn so it stitches
- * the messages together server-side.
+ * Per-message page_context: the current pathname is included with
+ * every outbound message so the backend can tailor the system prompt
+ * and label the conversation channel (e.g. '/payroll/runs/abc').
  */
 export function AssistantWidget() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const entityName = useEntityStore((s) => s.activeEntityName);
   const userFullName = useUserStore((s) => s.fullName);
+  const pathname = usePathname() || '/';
 
-  const [open, setOpen] = useState(false);
-  const [conversationId, setConversationId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<AssistantMessageItem[]>([]);
-  const [input, setInput] = useState('');
+  const isOpen = useAssistantStore((s) => s.isOpen);
+  const conversationId = useAssistantStore((s) => s.conversationId);
+  const messages = useAssistantStore((s) => s.messages);
+  const open = useAssistantStore((s) => s.open);
+  const minimize = useAssistantStore((s) => s.minimize);
+  const closeAndReset = useAssistantStore((s) => s.closeAndReset);
+  const setConversationId = useAssistantStore((s) => s.setConversationId);
+  const setMessages = useAssistantStore((s) => s.setMessages);
+  const pushMessage = useAssistantStore((s) => s.pushMessage);
+  const patchMessage = useAssistantStore((s) => s.patchMessage);
+
+  // Use a ref-controlled textarea for input so typing doesn't churn
+  // the store on every keystroke.
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const qc = useQueryClient();
 
   // Greeting on first open of a session.
   useEffect(() => {
-    if (open && messages.length === 0 && entityCode) {
+    if (isOpen && messages.length === 0 && entityCode) {
       const greetingName = (userFullName ?? '').split(' ')[0] || 'there';
       const hour = new Date().getHours();
       const timeOfDay = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
@@ -48,18 +62,18 @@ export function AssistantWidget() {
           role: 'assistant',
           content:
             `Good ${timeOfDay}, ${greetingName}. I'm your BookWize assistant — ` +
-            `I can classify transactions, add notes, or answer questions about ` +
-            `${entityName ?? entityCode}. What would you like to do?`,
+            `I can classify transactions, change payroll, add notes, or answer ` +
+            `questions about ${entityName ?? entityCode}. What would you like to do?`,
         },
       ]);
     }
-  }, [open, entityCode, entityName, userFullName, messages.length]);
+  }, [isOpen, entityCode, entityName, userFullName, messages.length, setMessages]);
 
   useEffect(() => {
-    if (open && scrollRef.current) {
+    if (isOpen && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, open]);
+  }, [messages, isOpen]);
 
   const sendMutation = useMutation({
     mutationFn: (text: string) =>
@@ -67,77 +81,81 @@ export function AssistantWidget() {
         entity_code: entityCode!,
         message: text,
         conversation_id: conversationId,
+        page_context: pathname,
       }),
     onSuccess: (res: MessageResponse, sentText) => {
       setConversationId(res.conversation_id);
-      // Push the user's message (with the real id from server) + assistant reply.
-      setMessages((m) => [
-        ...m.filter((mm) => mm.id !== '__pending_user__'),
-        {
-          id: res.user_message_id ?? `user-${Date.now()}`,
-          role: 'user',
-          content: sentText,
-        },
-        {
-          id: res.message_id ?? `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: res.reply,
-          journal_preview: res.proposed_action?.journal_preview ?? null,
-          transaction_preview: res.proposed_action?.transaction_preview ?? null,
-          needs_confirmation: res.needs_confirmation,
-          isLatestActionable: res.needs_confirmation,
-          resolved: false,
-        },
-      ]);
+      const next = messages
+        .filter((mm) => mm.id !== '__pending_user__')
+        .map((mm) => ({ ...mm, isLatestActionable: false }));
+      next.push({
+        id: res.user_message_id ?? `user-${Date.now()}`,
+        role: 'user',
+        content: sentText,
+      });
+      next.push({
+        id: res.message_id ?? `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: res.reply,
+        journal_preview: res.proposed_action?.journal_preview ?? null,
+        transaction_preview: res.proposed_action?.transaction_preview ?? null,
+        payroll_preview: res.proposed_action?.payroll_preview ?? null,
+        needs_confirmation: res.needs_confirmation,
+        isLatestActionable: res.needs_confirmation,
+        resolved: false,
+      });
+      setMessages(next);
     },
     onError: () => {
-      setMessages((m) => [
-        ...m.filter((mm) => mm.id !== '__pending_user__'),
-        {
+      const next = messages
+        .filter((mm) => mm.id !== '__pending_user__')
+        .concat({
           id: `err-${Date.now()}`,
           role: 'assistant',
-          content: 'Something went wrong reaching the assistant. Try again in a moment.',
-        },
-      ]);
+          content:
+            'Something went wrong reaching the assistant. Try again in a moment.',
+        });
+      setMessages(next);
     },
   });
 
   const confirmMutation = useMutation({
-    mutationFn: (input: { message_id: string; confirmed: boolean; correction?: string }) =>
+    mutationFn: (input: {
+      message_id: string;
+      confirmed: boolean;
+      correction?: string;
+    }) =>
       confirmAssistantAction({
         entity_code: entityCode!,
         ...input,
       }),
     onSuccess: (res, vars) => {
       if (res.ok) {
-        toast.success(
-          res.action === 'classify_transaction' ? 'Transaction classified' : 'Done',
-        );
+        const verb =
+          res.action === 'classify_transaction'
+            ? 'Transaction classified'
+            : res.action?.startsWith('update_employee') ||
+                res.action?.includes('payroll')
+              ? 'Payroll updated'
+              : 'Done';
+        toast.success(verb);
       }
-      setMessages((m) =>
-        m.map((mm) =>
-          mm.id === vars.message_id
-            ? { ...mm, resolved: vars.confirmed, isLatestActionable: false }
-            : { ...mm, isLatestActionable: false },
-        ),
-      );
-      // Refresh anything downstream — bank list, dashboard counters, queue.
-      qc.invalidateQueries({ queryKey: ['bank-txns'] });
-      qc.invalidateQueries({ queryKey: ['unmatched-queue'] });
+      patchMessage(vars.message_id, {
+        resolved: vars.confirmed,
+        isLatestActionable: false,
+      });
     },
   });
 
   if (!entityCode) return null;
 
   const onSend = () => {
-    const text = input.trim();
+    const text = inputRef.current?.value.trim() ?? '';
     if (!text || sendMutation.isPending) return;
-    setInput('');
-    // Optimistic user bubble until the server returns.
-    setMessages((m) => [
-      ...m.map((mm) => ({ ...mm, isLatestActionable: false })),
-      { id: '__pending_user__', role: 'user', content: text },
-    ]);
+    if (inputRef.current) inputRef.current.value = '';
+    const next = messages.map((mm) => ({ ...mm, isLatestActionable: false }));
+    next.push({ id: '__pending_user__', role: 'user', content: text });
+    setMessages(next);
     sendMutation.mutate(text);
   };
 
@@ -148,16 +166,15 @@ export function AssistantWidget() {
     }
   };
 
-  // Count actionable items pending confirmation (for the badge).
   const pendingCount = messages.filter(
     (m) => m.isLatestActionable && !m.resolved,
   ).length;
 
-  if (!open) {
+  if (!isOpen) {
     return (
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={open}
         aria-label="Open BookWize assistant"
         className={cn(
           'fixed bottom-6 right-6 z-40 grid h-14 w-14 place-items-center rounded-full',
@@ -184,7 +201,6 @@ export function AssistantWidget() {
         'w-[380px] h-[500px] overflow-hidden',
       )}
     >
-      {/* Header */}
       <header className="flex items-center justify-between px-3 py-2 bg-deep-navy text-white">
         <div className="flex items-center gap-2 min-w-0">
           <Sparkles className="h-5 w-5 text-bw-teal shrink-0" strokeWidth={1.5} />
@@ -195,18 +211,14 @@ export function AssistantWidget() {
         </div>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setOpen(false)}
+            onClick={minimize}
             aria-label="Minimize"
             className="rounded-md p-1 hover:bg-white/10"
           >
             <Minus className="h-4 w-4" strokeWidth={1.5} />
           </button>
           <button
-            onClick={() => {
-              setOpen(false);
-              setConversationId(null);
-              setMessages([]);
-            }}
+            onClick={closeAndReset}
             aria-label="Close conversation"
             className="rounded-md p-1 hover:bg-white/10"
           >
@@ -215,7 +227,6 @@ export function AssistantWidget() {
         </div>
       </header>
 
-      {/* Messages */}
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto px-3 py-3 space-y-2 bg-cloud"
@@ -229,14 +240,7 @@ export function AssistantWidget() {
               confirmMutation.mutate({ message_id: m.id, confirmed: true })
             }
             onChange={() => {
-              // Open a follow-up prompt for the user to type their correction.
-              setInput(`Change to: `);
-              // Mark this one no longer actionable so the user sees a fresh proposal.
-              setMessages((all) =>
-                all.map((mm) =>
-                  mm.id === m.id ? { ...mm, isLatestActionable: false } : mm,
-                ),
-              );
+              patchMessage(m.id, { isLatestActionable: false });
               confirmMutation.mutate({
                 message_id: m.id,
                 confirmed: false,
@@ -253,16 +257,20 @@ export function AssistantWidget() {
         )}
       </div>
 
-      {/* Quick-action chips — contextual prompts based on period state.
-          Always visible; chips with no data signal collapse to nothing. */}
-      <QuickActionChips onPick={(prompt) => setInput(prompt)} />
+      <QuickActionChips
+        pathname={pathname}
+        onPick={(prompt) => {
+          if (inputRef.current) {
+            inputRef.current.value = prompt;
+            inputRef.current.focus();
+          }
+        }}
+      />
 
-      {/* Input */}
       <div className="border-t border-border bg-white p-2">
         <div className="flex items-end gap-2">
           <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
+            ref={inputRef}
             onKeyDown={onKeyDown}
             rows={1}
             placeholder="Ask anything or describe a transaction…"
@@ -275,7 +283,7 @@ export function AssistantWidget() {
             size="sm"
             variant="primary"
             onClick={onSend}
-            disabled={!input.trim() || sendMutation.isPending}
+            disabled={sendMutation.isPending}
             aria-label="Send"
           >
             <Send className="h-4 w-4" strokeWidth={1.5} />
@@ -286,41 +294,40 @@ export function AssistantWidget() {
   );
 }
 
-
 // --------------------------------------------------------------------------
-// Quick-action chips
+// QuickActionChips — page-aware suggestions
 //
-// Contextual prompts that pre-fill the chat input. The "always" chips
-// show every time; period-conditional ones surface based on insights
-// already on the page (we piggyback on the dashboard's existing
-// queries via React Query cache to avoid an extra fetch).
+// Switches the chip set based on the current pathname. Insights-driven
+// chips on the dashboard (the original behaviour) still light up when
+// the backend has surfaced them.
 // --------------------------------------------------------------------------
 
-
-function QuickActionChips({ onPick }: { onPick: (prompt: string) => void }) {
+function QuickActionChips({
+  pathname,
+  onPick,
+}: {
+  pathname: string;
+  onPick: (prompt: string) => void;
+}) {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
-  // Insights cache is shared with the dashboard insights card; if the
-  // dealer isn't on the dashboard it's a fresh fetch, but small.
   const insights = useQuery({
     queryKey: ['assistant-insights', entityCode],
-    enabled: !!entityCode,
+    enabled: !!entityCode && pathname.startsWith('/dashboard'),
     queryFn: () => getAssistantInsights(entityCode!),
     staleTime: 60_000,
   });
 
-  const chips: string[] = ["What's my cash balance?", "How's my gross margin?"];
-  const types = new Set((insights.data?.insights ?? []).map((i) => i.type));
-  if (types.has('unclassified_backlog')) {
-    chips.push('Review my unclassified transactions');
-  }
-  if (types.has('period_overdue')) {
-    chips.push("What's left for this month-end close?");
-  }
-  if (types.has('pending_intents')) {
-    chips.push('Check my pending notes');
-  }
-  if (types.has('anomaly')) {
-    chips.push('Explain my largest variance');
+  const chips = chipsForPath(pathname);
+
+  // On the dashboard, append insight-driven chips when they're available.
+  if (pathname.startsWith('/dashboard')) {
+    const types = new Set((insights.data?.insights ?? []).map((i) => i.type));
+    if (types.has('unclassified_backlog'))
+      chips.push('Review my unclassified transactions');
+    if (types.has('period_overdue'))
+      chips.push("What's left for this month-end close?");
+    if (types.has('pending_intents')) chips.push('Check my pending notes');
+    if (types.has('anomaly')) chips.push('Explain my largest variance');
   }
 
   return (
@@ -337,4 +344,26 @@ function QuickActionChips({ onPick }: { onPick: (prompt: string) => void }) {
       ))}
     </div>
   );
+}
+
+function chipsForPath(pathname: string): string[] {
+  if (pathname.startsWith('/payroll')) {
+    return [
+      "What's my next payroll date?",
+      'Show me CRA remittance summary',
+      'Change an employee rate',
+      'Review this pay run',
+    ];
+  }
+  if (pathname.startsWith('/bank')) {
+    return [
+      'Review my unclassified transactions',
+      'Show me uncategorized inflows',
+      "What's my cash balance?",
+    ];
+  }
+  if (pathname.startsWith('/dashboard')) {
+    return ["What's my cash balance?", "How's my gross margin?"];
+  }
+  return ['What needs my attention?', 'Help me with this page'];
 }

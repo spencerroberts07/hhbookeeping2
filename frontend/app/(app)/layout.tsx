@@ -2,6 +2,7 @@ import { ClerkTokenBridge } from '@/components/providers/clerk-token-bridge';
 import { Sidebar } from '@/components/layout/sidebar';
 import { DemoBanner } from '@/components/layout/demo-banner';
 import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
+import { AssistantWidget } from '@/components/assistant/assistant-widget';
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -17,6 +18,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </ErrorBoundary>
+      {/* Global assistant — mounted once here so conversation state in
+          useAssistantStore survives every route navigation. */}
+      <AssistantWidget />
     </ClerkTokenBridge>
   );
 }

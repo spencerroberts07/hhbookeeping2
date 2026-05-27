@@ -78,6 +78,11 @@ INTENT_TYPES = {
     "query_period",
     "correction",
     "general_question",
+    # Payroll intents (Part 2 — payroll action capability)
+    "update_employee_rate",
+    "update_employee_salary",
+    "one_time_pay_override",
+    "add_bonus_line",
     "other",
 }
 
@@ -86,8 +91,23 @@ ACTION_TYPES = {
     "classify_transaction",
     "add_note",
     "post_to_pending",
+    # Payroll actions
+    "update_employee_rate",
+    "update_employee_salary",
+    "one_time_pay_override",
+    "add_bonus_line",
     "none",
 }
+
+
+# 2026 CRA rates used for back-of-envelope tax delta in payroll
+# previews. Real numbers come from services_payroll_calc.py on
+# rebuild; these are only for the BEFORE/AFTER card.
+_CPP_RATE_2026 = Decimal("0.0595")
+_EI_RATE_2026 = Decimal("0.0166")
+_FED_MARGINAL_TAX_ESTIMATE = Decimal("0.205")    # 20.5% — middle bracket
+_PROV_ON_MARGINAL_TAX_ESTIMATE = Decimal("0.0915")  # 9.15% — ON middle
+_DEFAULT_BIWEEKLY_HOURS = Decimal("73")
 
 
 # --------------------------------------------------------------------------
@@ -108,6 +128,12 @@ class IntentResult:
     needs_clarification: bool = False
     clarification_question: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    # Payroll-intent extras. employee_name is a free-form string
+    # (fuzzy-matched downstream); new_value is the target rate /
+    # bi-weekly salary / one-off gross / bonus amount.
+    employee_name: str | None = None
+    new_value: Decimal | None = None
+    period_id: str | None = None
 
 
 @dataclass
@@ -122,10 +148,22 @@ class TransactionMatch:
 
 @dataclass
 class ProposedAction:
-    action_type: str  # 'classify_transaction', 'add_note', 'post_to_pending', 'none'
+    action_type: str  # see ACTION_TYPES
     transaction_id: str | None = None
     transaction_preview: dict[str, Any] | None = None
     journal_preview: dict[str, Any] | None = None
+    # Payroll-action preview (before/after snapshot). Populated only
+    # for action_type in {'update_employee_rate',
+    # 'update_employee_salary', 'one_time_pay_override',
+    # 'add_bonus_line'}.
+    payroll_preview: dict[str, Any] | None = None
+    # Cached references for the executor — kept here so the route
+    # can persist them in proposal_json without re-running the
+    # fuzzy match on confirm.
+    employee_id: str | None = None
+    payroll_run_id: str | None = None
+    payroll_run_line_id: str | None = None
+    new_value: float | None = None
     pending_intent_id: str | None = None
 
 
@@ -488,19 +526,32 @@ rent on May 12"), propose the appropriate journal — pick accounts
 ONLY from the chart provided. Use the dealer's learned terminology
 (e.g. if memory says "garbage tags" = 2150, respect that).
 
+When the message is about PAYROLL — changing an employee's rate,
+salary, giving a one-time pay bump, or adding a bonus — extract the
+employee name and the new value as numbers. Examples:
+  "Change Noah's hourly rate to $20"             → update_employee_rate, employee_name='Noah', new_value=20
+  "Bump Cynthia to $52000 annual"                → update_employee_salary, employee_name='Cynthia', new_value=52000 (annual; backend converts to bi-weekly)
+  "Give Alan a one-time $500 bonus on this run"  → add_bonus_line, employee_name='Alan', new_value=500
+  "One-time override Cynthia's pay to $2400"     → one_time_pay_override, employee_name='Cynthia', new_value=2400
+
 Respond with valid JSON ONLY. No code fences. No prose.
 
 Required shape:
 {
   "intent": one of [
     "classify_transaction", "query_balance", "add_note",
-    "query_period", "correction", "general_question", "other"
+    "query_period", "correction", "general_question",
+    "update_employee_rate", "update_employee_salary",
+    "one_time_pay_override", "add_bonus_line",
+    "other"
   ],
   "amount": number | null,
   "date": "YYYY-MM-DD" | null,
   "description": string | null,
   "suggested_debit_account": "<account_code>" | null,
   "suggested_credit_account": "<account_code>" | null,
+  "employee_name": string | null,
+  "new_value": number | null,
   "confidence": number 0..100,
   "reasoning": "one short sentence",
   "needs_clarification": boolean,
@@ -640,6 +691,8 @@ def _intent_result_from_json(parsed: dict[str, Any]) -> IntentResult:
         needs_clarification=bool(parsed.get("needs_clarification")),
         clarification_question=parsed.get("clarification_question") or None,
         raw=parsed,
+        employee_name=(parsed.get("employee_name") or None),
+        new_value=_coerce_decimal(parsed.get("new_value")),
     )
 
 
@@ -810,6 +863,7 @@ WHAT YOU KNOW:
 - Current month-end status and blockers
 - What you have learned about this entity over time (terminology, vendors, patterns)
 - Recent period observations
+- Which page of the app the user is currently viewing
 
 RULES:
 1. Never invent account codes. Only use accounts from the chart provided.
@@ -818,8 +872,17 @@ RULES:
 4. Speak like a bookkeeper, not a chatbot. Skip "Great question!" / "Certainly!".
 5. If you're not sure, say so and ask.
 6. Amounts are always in CAD.
-7. Always ask for confirmation before classifying anything.
+7. Always ask for confirmation before classifying anything or changing payroll.
 8. When you learn something new about this business, acknowledge it briefly.
+9. For payroll changes (rate, salary, one-time override, bonus), produce a
+   before/after preview. Never apply a payroll change without the user
+   confirming the preview.
+10. Use the PAGE CONTEXT hint below to tailor the reply (e.g. on
+    /payroll/runs/<id> the user is looking at a specific pay run, so
+    "this run" refers to that one).
+
+PAGE CONTEXT:
+{page_context}
 
 WHAT YOU HAVE LEARNED ABOUT THIS ENTITY:
 {memory_summary}
@@ -844,11 +907,18 @@ def generate_response(
     matches: list[TransactionMatch],
     history: list[dict[str, Any]],
     context: dict[str, Any],
+    page_context: str | None = None,
 ) -> AssistantReply:
     """Build the human-facing reply text + the machine-readable proposed
     action. Uses Claude when available; falls back to a deterministic
-    response otherwise."""
-    proposed_action = _propose_action(intent, matches, context)
+    response otherwise.
+
+    page_context is the route the user is currently viewing (e.g.
+    '/payroll/runs/abc...'). It's injected into the system prompt so
+    Claude can interpret deictic references like "this run" or "this
+    employee" correctly.
+    """
+    proposed_action = _propose_action(intent, matches, context, session=session)
 
     client = _claude_client()
     if not client:
@@ -866,6 +936,7 @@ def generate_response(
         entity_name=entity.get("entity_name") or entity_code,
         entity_code=entity_code,
         province=entity.get("province") or "Canada",
+        page_context=(page_context or "(unknown page)"),
         memory_summary=_memory_summary(context.get("memory") or []),
         period_status=(
             f"{current_period.get('period_label')} ({current_period.get('status')}) — "
@@ -938,13 +1009,32 @@ def generate_response(
     )
 
 
+_PAYROLL_INTENTS = frozenset({
+    "update_employee_rate",
+    "update_employee_salary",
+    "one_time_pay_override",
+    "add_bonus_line",
+})
+
+
 def _propose_action(
     intent: IntentResult,
     matches: list[TransactionMatch],
     context: dict[str, Any],
+    *,
+    session: Any = None,
 ) -> ProposedAction:
     """Map (intent, matches) -> a structured action the route layer can
-    persist and the frontend can render."""
+    persist and the frontend can render. Payroll intents take session
+    so we can do the fuzzy employee match + before/after calc inline."""
+    if intent.intent in _PAYROLL_INTENTS and session is not None:
+        entity_code = (context.get("entity") or {}).get("entity_code")
+        if entity_code:
+            try:
+                return _propose_payroll_action(intent, session, entity_code)
+            except Exception:
+                logger.exception("payroll proposal failed for intent=%s", intent.intent)
+                return ProposedAction(action_type="none")
     if intent.intent == "classify_transaction" and matches:
         top = matches[0]
         debit = intent.suggested_debit_account
@@ -976,6 +1066,405 @@ def _propose_action(
     if intent.intent == "add_note":
         return ProposedAction(action_type="add_note")
     return ProposedAction(action_type="none")
+
+
+# --------------------------------------------------------------------------
+# Payroll-action proposer
+# --------------------------------------------------------------------------
+
+
+def _fuzzy_match_employee(
+    session, *, entity_id: Any, name_query: str | None
+) -> list[dict[str, Any]]:
+    """Return active employees whose first/last/full name matches
+    name_query (ILIKE substring). Multiple results = caller must ask
+    for clarification."""
+    if not name_query:
+        return []
+    q = name_query.strip().lower()
+    if len(q) < 2:
+        return []
+    rows = session.execute(
+        text(
+            """
+            SELECT id, full_name, first_name, last_name, employment_type,
+                   hourly_rate, biweekly_salary, vacation_rate, is_active
+              FROM payroll_employees
+             WHERE entity_id = :eid
+               AND is_active = TRUE
+               AND (
+                 lower(full_name)  LIKE :pat OR
+                 lower(first_name) LIKE :pat OR
+                 lower(last_name)  LIKE :pat
+               )
+             ORDER BY full_name
+            """
+        ),
+        {"eid": entity_id, "pat": f"%{q}%"},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _find_active_draft_run(
+    session, *, entity_id: Any
+) -> dict[str, Any] | None:
+    """The most recent payroll_runs row that's still editable (not yet
+    approved/posted/voided). Used by one_time_pay_override and
+    add_bonus_line to identify which run to touch."""
+    row = session.execute(
+        text(
+            """
+            SELECT id, pay_run_number, period_start, period_end, pay_date,
+                   status, workflow_status, accounting_period_id
+              FROM payroll_runs
+             WHERE entity_id = :eid
+               AND COALESCE(workflow_status, status) NOT IN
+                   ('approved_to_post', 'posted', 'voided')
+             ORDER BY period_end DESC
+             LIMIT 1
+            """
+        ),
+        {"eid": entity_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _avg_recent_biweekly_hours(
+    session, *, entity_id: Any, employee_id: Any
+) -> Decimal:
+    """Average total_hours across the last 3 payroll_run_lines for this
+    employee. Falls back to _DEFAULT_BIWEEKLY_HOURS if no history."""
+    rows = session.execute(
+        text(
+            """
+            SELECT prl.total_hours
+              FROM payroll_run_lines prl
+              JOIN payroll_runs pr ON pr.id = prl.payroll_run_id
+             WHERE pr.entity_id = :eid AND prl.employee_id = :emp
+               AND prl.total_hours > 0
+             ORDER BY pr.period_end DESC
+             LIMIT 3
+            """
+        ),
+        {"eid": entity_id, "emp": employee_id},
+    ).mappings().all()
+    if not rows:
+        return _DEFAULT_BIWEEKLY_HOURS
+    total = sum((Decimal(str(r["total_hours"])) for r in rows), Decimal("0"))
+    return (total / Decimal(len(rows))).quantize(Decimal("0.01"))
+
+
+def _estimate_net_pay(gross: Decimal) -> Decimal:
+    """Quick deterministic net-pay estimate for the BEFORE/AFTER card.
+    Uses 2026 CRA rates × marginal-tax approximation. NOT a substitute
+    for services_payroll_calc on the actual run — purely for the
+    preview card the user sees BEFORE confirming."""
+    if gross <= 0:
+        return Decimal("0.00")
+    cpp = (gross * _CPP_RATE_2026).quantize(Decimal("0.01"))
+    ei = (gross * _EI_RATE_2026).quantize(Decimal("0.01"))
+    fed = (gross * _FED_MARGINAL_TAX_ESTIMATE).quantize(Decimal("0.01"))
+    prov = (gross * _PROV_ON_MARGINAL_TAX_ESTIMATE).quantize(Decimal("0.01"))
+    return (gross - cpp - ei - fed - prov).quantize(Decimal("0.01"))
+
+
+def _propose_payroll_action(
+    intent: IntentResult, session: Any, entity_code: str
+) -> ProposedAction:
+    """Construct a BEFORE/AFTER preview for a payroll change request.
+
+    Hard requirements:
+      - Entity match: every query is scoped by entity_id.
+      - Single-employee resolution: if name matches 2+, return a
+        clarification-style action (action_type='none' with a
+        clarification note in the payroll_preview).
+      - No DB mutations here — that happens only on confirm in
+        _execute_payroll_action.
+    """
+    entity_row = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :ec"),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not entity_row:
+        return ProposedAction(action_type="none")
+    entity_id = entity_row["id"]
+
+    if not intent.employee_name or intent.new_value is None:
+        return ProposedAction(
+            action_type="none",
+            payroll_preview={
+                "missing": True,
+                "note": (
+                    "I need both the employee name and the new amount. "
+                    "Try: 'Change Noah's rate to $20' or 'Give Cynthia a $500 bonus'."
+                ),
+            },
+        )
+
+    candidates = _fuzzy_match_employee(
+        session, entity_id=entity_id, name_query=intent.employee_name
+    )
+    if not candidates:
+        return ProposedAction(
+            action_type="none",
+            payroll_preview={
+                "missing": True,
+                "note": f"No active employee matches '{intent.employee_name}'.",
+            },
+        )
+    if len(candidates) > 1:
+        names = ", ".join(c["full_name"] for c in candidates[:4])
+        return ProposedAction(
+            action_type="none",
+            payroll_preview={
+                "ambiguous": True,
+                "note": (
+                    f"'{intent.employee_name}' matches multiple: {names}. "
+                    "Which one — first + last name?"
+                ),
+            },
+        )
+
+    emp = candidates[0]
+    new_val = Decimal(str(intent.new_value))
+
+    if intent.intent == "update_employee_rate":
+        return _propose_rate_change(emp, new_val, session, entity_id)
+    if intent.intent == "update_employee_salary":
+        return _propose_salary_change(emp, new_val, session, entity_id)
+    if intent.intent in ("one_time_pay_override", "add_bonus_line"):
+        run = _find_active_draft_run(session, entity_id=entity_id)
+        if not run:
+            return ProposedAction(
+                action_type="none",
+                payroll_preview={
+                    "missing": True,
+                    "note": (
+                        "No draft pay run is open. Create one from "
+                        "Payroll → New pay run before applying this change."
+                    ),
+                },
+            )
+        # Locked-period guard.
+        if run.get("accounting_period_id"):
+            period = session.execute(
+                text(
+                    "SELECT status FROM accounting_periods WHERE id = :id"
+                ),
+                {"id": run["accounting_period_id"]},
+            ).mappings().first()
+            if period and period["status"] in (
+                "closed_locked", "approved_to_close"
+            ):
+                return ProposedAction(
+                    action_type="none",
+                    payroll_preview={
+                        "blocked": True,
+                        "note": (
+                            "That pay run sits in a locked accounting period "
+                            "and can't be edited."
+                        ),
+                    },
+                )
+        if intent.intent == "one_time_pay_override":
+            return _propose_one_time_override(emp, new_val, run, session)
+        return _propose_bonus_line(emp, new_val, run, session)
+    return ProposedAction(action_type="none")
+
+
+def _propose_rate_change(
+    emp: dict[str, Any], new_rate: Decimal, session: Any, entity_id: Any,
+) -> ProposedAction:
+    old_rate = Decimal(str(emp["hourly_rate"] or "0"))
+    avg_hours = _avg_recent_biweekly_hours(
+        session, entity_id=entity_id, employee_id=emp["id"]
+    )
+    sample_before = (old_rate * avg_hours).quantize(Decimal("0.01"))
+    sample_after = (new_rate * avg_hours).quantize(Decimal("0.01"))
+    net_before = _estimate_net_pay(sample_before)
+    net_after = _estimate_net_pay(sample_after)
+    delta = sample_after - sample_before
+    annual_impact = (delta * Decimal("26")).quantize(Decimal("0.01"))
+    cpp_delta = (delta * _CPP_RATE_2026).quantize(Decimal("0.01"))
+    ei_delta = (delta * _EI_RATE_2026).quantize(Decimal("0.01"))
+    fed_delta = (delta * (_FED_MARGINAL_TAX_ESTIMATE + _PROV_ON_MARGINAL_TAX_ESTIMATE)).quantize(Decimal("0.01"))
+    return ProposedAction(
+        action_type="update_employee_rate",
+        employee_id=str(emp["id"]),
+        new_value=float(new_rate),
+        payroll_preview={
+            "employee_id": str(emp["id"]),
+            "employee_name": emp["full_name"],
+            "change_type": "hourly_rate",
+            "before": {
+                "hourly_rate": float(old_rate),
+                "sample_biweekly_gross": float(sample_before),
+                "net_est": float(net_before),
+            },
+            "after": {
+                "hourly_rate": float(new_rate),
+                "sample_biweekly_gross": float(sample_after),
+                "net_est": float(net_after),
+            },
+            "cpp_delta_per_period": float(cpp_delta),
+            "ei_delta_per_period": float(ei_delta),
+            "fed_tax_delta_per_period": float(fed_delta),
+            "annual_impact": float(annual_impact),
+            "note": (
+                f"Based on avg {avg_hours} hrs/period over the last 3 runs. "
+                "Net pay is an estimate using 2026 CRA rates."
+            ),
+        },
+    )
+
+
+def _propose_salary_change(
+    emp: dict[str, Any], new_annual: Decimal, session: Any, entity_id: Any,
+) -> ProposedAction:
+    # Caller speaks in annual dollars; storage is bi-weekly.
+    new_biweekly = (new_annual / Decimal("26")).quantize(Decimal("0.01"))
+    old_biweekly = Decimal(str(emp["biweekly_salary"] or "0"))
+    old_annual = (old_biweekly * Decimal("26")).quantize(Decimal("0.01"))
+    net_before = _estimate_net_pay(old_biweekly)
+    net_after = _estimate_net_pay(new_biweekly)
+    delta = new_biweekly - old_biweekly
+    annual_impact = (new_annual - old_annual).quantize(Decimal("0.01"))
+    return ProposedAction(
+        action_type="update_employee_salary",
+        employee_id=str(emp["id"]),
+        new_value=float(new_biweekly),  # stored as biweekly
+        payroll_preview={
+            "employee_id": str(emp["id"]),
+            "employee_name": emp["full_name"],
+            "change_type": "biweekly_salary",
+            "before": {
+                "biweekly_salary": float(old_biweekly),
+                "sample_biweekly_gross": float(old_biweekly),
+                "net_est": float(net_before),
+            },
+            "after": {
+                "biweekly_salary": float(new_biweekly),
+                "sample_biweekly_gross": float(new_biweekly),
+                "net_est": float(net_after),
+            },
+            "cpp_delta_per_period": float(
+                (delta * _CPP_RATE_2026).quantize(Decimal("0.01"))
+            ),
+            "ei_delta_per_period": float(
+                (delta * _EI_RATE_2026).quantize(Decimal("0.01"))
+            ),
+            "fed_tax_delta_per_period": float(
+                (delta * (_FED_MARGINAL_TAX_ESTIMATE + _PROV_ON_MARGINAL_TAX_ESTIMATE)).quantize(Decimal("0.01"))
+            ),
+            "annual_impact": float(annual_impact),
+            "note": (
+                f"Annual goes ${old_annual:,.2f} → ${new_annual:,.2f}. "
+                "Stored as bi-weekly = annual / 26."
+            ),
+        },
+    )
+
+
+def _propose_one_time_override(
+    emp: dict[str, Any], new_gross: Decimal, run: dict[str, Any], session: Any,
+) -> ProposedAction:
+    line = session.execute(
+        text(
+            """
+            SELECT id, gross_pay, net_pay FROM payroll_run_lines
+             WHERE payroll_run_id = :rid AND employee_id = :emp
+             LIMIT 1
+            """
+        ),
+        {"rid": run["id"], "emp": emp["id"]},
+    ).mappings().first()
+    old_gross = Decimal(str(line["gross_pay"] or "0")) if line else Decimal("0")
+    old_net = Decimal(str(line["net_pay"] or "0")) if line else Decimal("0")
+    new_net = _estimate_net_pay(new_gross)
+    period_label = (
+        f"{run['period_start']} – {run['period_end']}"
+        if run.get("period_start") and run.get("period_end")
+        else run.get("pay_run_number") or "(current run)"
+    )
+    return ProposedAction(
+        action_type="one_time_pay_override",
+        employee_id=str(emp["id"]),
+        payroll_run_id=str(run["id"]),
+        payroll_run_line_id=str(line["id"]) if line else None,
+        new_value=float(new_gross),
+        payroll_preview={
+            "employee_id": str(emp["id"]),
+            "employee_name": emp["full_name"],
+            "payroll_run_id": str(run["id"]),
+            "run_period_label": period_label,
+            "change_type": "one_time_override",
+            "before": {
+                "sample_biweekly_gross": float(old_gross),
+                "net_est": float(old_net) if old_net > 0 else float(_estimate_net_pay(old_gross)),
+            },
+            "after": {
+                "sample_biweekly_gross": float(new_gross),
+                "net_est": float(new_net),
+            },
+            "note": (
+                "One-time only — permanent rate/salary unchanged. "
+                "Tax recalc happens on the next /build-journal."
+            ),
+        },
+    )
+
+
+def _propose_bonus_line(
+    emp: dict[str, Any], bonus: Decimal, run: dict[str, Any], session: Any,
+) -> ProposedAction:
+    line = session.execute(
+        text(
+            """
+            SELECT id, gross_pay, net_pay FROM payroll_run_lines
+             WHERE payroll_run_id = :rid AND employee_id = :emp
+             LIMIT 1
+            """
+        ),
+        {"rid": run["id"], "emp": emp["id"]},
+    ).mappings().first()
+    old_gross = Decimal(str(line["gross_pay"] or "0")) if line else Decimal("0")
+    new_gross = (old_gross + bonus).quantize(Decimal("0.01"))
+    # Bonus tax: federal-source-deduction bonus method approximates
+    # marginal rate; we use the same combined ON+Fed for simplicity.
+    bonus_tax = (
+        bonus
+        * (_CPP_RATE_2026 + _EI_RATE_2026 + _FED_MARGINAL_TAX_ESTIMATE + _PROV_ON_MARGINAL_TAX_ESTIMATE)
+    ).quantize(Decimal("0.01"))
+    bonus_net = (bonus - bonus_tax).quantize(Decimal("0.01"))
+    period_label = (
+        f"{run['period_start']} – {run['period_end']}"
+        if run.get("period_start") and run.get("period_end")
+        else run.get("pay_run_number") or "(current run)"
+    )
+    return ProposedAction(
+        action_type="add_bonus_line",
+        employee_id=str(emp["id"]),
+        payroll_run_id=str(run["id"]),
+        payroll_run_line_id=str(line["id"]) if line else None,
+        new_value=float(bonus),
+        payroll_preview={
+            "employee_id": str(emp["id"]),
+            "employee_name": emp["full_name"],
+            "payroll_run_id": str(run["id"]),
+            "run_period_label": period_label,
+            "change_type": "bonus_line",
+            "before": {"sample_biweekly_gross": float(old_gross)},
+            "after": {
+                "sample_biweekly_gross": float(new_gross),
+                "net_est": float(_estimate_net_pay(new_gross)),
+            },
+            "annual_impact": float(bonus_net),
+            "note": (
+                f"Bonus ${bonus} → est. take-home ${bonus_net} after CPP/EI/tax. "
+                "Tax recalc happens on the next /build-journal."
+            ),
+        },
+    )
 
 
 def _fallback_reply(
@@ -1037,6 +1526,11 @@ def execute_action(
     clerk_user_id: str | None = None,
     original_message: str | None = None,
     conversation_id: str | None = None,
+    # Payroll-action params (used only when action_type ∈ _PAYROLL_INTENTS)
+    employee_id: str | None = None,
+    payroll_run_id: str | None = None,
+    payroll_run_line_id: str | None = None,
+    new_value: Any = None,
 ) -> dict[str, Any]:
     """Apply a confirmed proposed_action. Returns a summary dict the
     route layer can echo back to the frontend. Never raises through;
@@ -1070,6 +1564,17 @@ def execute_action(
                 target_date=target_date,
                 description=note,
                 suggested_account=debit_account or credit_account,
+            )
+        if action_type in _PAYROLL_INTENTS:
+            return _execute_payroll_action(
+                session,
+                entity_code=entity_code,
+                action_type=action_type,
+                employee_id=employee_id,
+                payroll_run_id=payroll_run_id,
+                payroll_run_line_id=payroll_run_line_id,
+                new_value=new_value,
+                clerk_user_id=clerk_user_id,
             )
         return {"ok": False, "error": f"unknown action_type {action_type!r}"}
     except Exception:
@@ -1241,6 +1746,334 @@ def _execute_post_pending(
         "ok": True,
         "action": "post_to_pending",
         "pending_intent_id": str(row["id"]) if row else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# Payroll executors
+#
+# Every executor:
+#   1. Scopes the lookup by entity_id (we re-resolve from entity_code
+#      every time — no trusting the proposal_json blindly).
+#   2. Refuses to mutate when the affected pay run sits in a
+#      closed_locked / approved_to_close accounting period.
+#   3. Returns a JSON-safe dict. Errors are caught and reported as
+#      {"ok": false, ...} — the outer try/except in execute_action
+#      provides one more safety net.
+#   4. Writes a learning entry capturing the old → new transition.
+# --------------------------------------------------------------------------
+
+
+def _payroll_run_is_locked(session, *, payroll_run_id: str) -> bool:
+    row = session.execute(
+        text(
+            """
+            SELECT ap.status FROM payroll_runs pr
+            LEFT JOIN accounting_periods ap ON ap.id = pr.accounting_period_id
+             WHERE pr.id = :rid
+            """
+        ),
+        {"rid": payroll_run_id},
+    ).mappings().first()
+    if not row:
+        return False
+    return (row.get("status") or "") in ("closed_locked", "approved_to_close")
+
+
+def _execute_payroll_action(
+    session,
+    *,
+    entity_code: str,
+    action_type: str,
+    employee_id: str | None,
+    payroll_run_id: str | None,
+    payroll_run_line_id: str | None,
+    new_value: Any,
+    clerk_user_id: str | None,
+) -> dict[str, Any]:
+    if not employee_id or new_value is None:
+        return {"ok": False, "error": "employee_id and new_value are required"}
+
+    # Verify employee belongs to this entity — cross-entity guard.
+    entity_row = session.execute(
+        text("SELECT id FROM entities WHERE entity_code = :ec"),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not entity_row:
+        return {"ok": False, "error": f"unknown entity {entity_code!r}"}
+    emp = session.execute(
+        text(
+            "SELECT id, entity_id, full_name, hourly_rate, biweekly_salary "
+            "  FROM payroll_employees WHERE id = :id AND entity_id = :eid"
+        ),
+        {"id": employee_id, "eid": entity_row["id"]},
+    ).mappings().first()
+    if not emp:
+        return {
+            "ok": False,
+            "error": "employee not found for this entity (cross-entity refused)",
+        }
+
+    new_val = Decimal(str(new_value))
+
+    if action_type == "update_employee_rate":
+        return _execute_update_rate(session, emp=emp, new_rate=new_val,
+                                    clerk_user_id=clerk_user_id,
+                                    entity_code=entity_code)
+    if action_type == "update_employee_salary":
+        return _execute_update_salary(session, emp=emp, new_biweekly=new_val,
+                                      clerk_user_id=clerk_user_id,
+                                      entity_code=entity_code)
+    if action_type == "one_time_pay_override":
+        if not payroll_run_id:
+            return {"ok": False, "error": "payroll_run_id required"}
+        if _payroll_run_is_locked(session, payroll_run_id=payroll_run_id):
+            return {"ok": False, "error": "pay run sits in a locked period"}
+        return _execute_one_time_override(
+            session,
+            emp=emp,
+            payroll_run_id=payroll_run_id,
+            payroll_run_line_id=payroll_run_line_id,
+            new_gross=new_val,
+            clerk_user_id=clerk_user_id,
+            entity_code=entity_code,
+        )
+    if action_type == "add_bonus_line":
+        if not payroll_run_id:
+            return {"ok": False, "error": "payroll_run_id required"}
+        if _payroll_run_is_locked(session, payroll_run_id=payroll_run_id):
+            return {"ok": False, "error": "pay run sits in a locked period"}
+        return _execute_add_bonus(
+            session,
+            emp=emp,
+            payroll_run_id=payroll_run_id,
+            payroll_run_line_id=payroll_run_line_id,
+            bonus_amount=new_val,
+            clerk_user_id=clerk_user_id,
+            entity_code=entity_code,
+        )
+    return {"ok": False, "error": f"unknown payroll action_type {action_type!r}"}
+
+
+def _learn_payroll_change(
+    session, *, entity_code: str, key: str, summary: str
+) -> None:
+    """Single-place learning sink for payroll edits. Tolerant —
+    failures here are non-fatal."""
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO assistant_entity_memory (
+                    id, entity_code, memory_type, memory_key, memory_value,
+                    confidence, times_confirmed, times_corrected,
+                    last_seen_at, created_at
+                ) VALUES (
+                    gen_random_uuid(), :ec, 'correction', :k, :v,
+                    100, 1, 0, NOW(), NOW()
+                )
+                ON CONFLICT (entity_code, memory_type, memory_key) DO UPDATE
+                   SET memory_value = EXCLUDED.memory_value,
+                       times_confirmed = assistant_entity_memory.times_confirmed + 1,
+                       last_seen_at = NOW()
+                """
+            ),
+            {"ec": entity_code, "k": key, "v": summary},
+        )
+    except Exception:
+        logger.warning("payroll learning sink failed", exc_info=True)
+
+
+def _execute_update_rate(
+    session, *, emp, new_rate, clerk_user_id, entity_code,
+) -> dict[str, Any]:
+    old = Decimal(str(emp["hourly_rate"] or "0"))
+    session.execute(
+        text(
+            """
+            UPDATE payroll_employees
+               SET hourly_rate = :rate, updated_at = NOW()
+             WHERE id = :id AND entity_id = :eid
+            """
+        ),
+        {"rate": new_rate, "id": emp["id"], "eid": emp["entity_id"]},
+    )
+    _learn_payroll_change(
+        session,
+        entity_code=entity_code,
+        key=f"employee_rate_change:{emp['full_name']}",
+        summary=f"{emp['full_name']}: ${old} → ${new_rate} hourly (by {clerk_user_id or 'assistant'})",
+    )
+    return {
+        "ok": True,
+        "action": "update_employee_rate",
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "old_value": float(old),
+        "new_value": float(new_rate),
+    }
+
+
+def _execute_update_salary(
+    session, *, emp, new_biweekly, clerk_user_id, entity_code,
+) -> dict[str, Any]:
+    old = Decimal(str(emp["biweekly_salary"] or "0"))
+    session.execute(
+        text(
+            """
+            UPDATE payroll_employees
+               SET biweekly_salary = :sal, updated_at = NOW()
+             WHERE id = :id AND entity_id = :eid
+            """
+        ),
+        {"sal": new_biweekly, "id": emp["id"], "eid": emp["entity_id"]},
+    )
+    _learn_payroll_change(
+        session,
+        entity_code=entity_code,
+        key=f"employee_salary_change:{emp['full_name']}",
+        summary=(
+            f"{emp['full_name']}: ${old} → ${new_biweekly} bi-weekly "
+            f"(annual ${(new_biweekly * Decimal('26')).quantize(Decimal('0.01'))}) "
+            f"(by {clerk_user_id or 'assistant'})"
+        ),
+    )
+    return {
+        "ok": True,
+        "action": "update_employee_salary",
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "old_value": float(old),
+        "new_value": float(new_biweekly),
+    }
+
+
+def _execute_one_time_override(
+    session, *, emp, payroll_run_id, payroll_run_line_id, new_gross,
+    clerk_user_id, entity_code,
+) -> dict[str, Any]:
+    """Set the gross_pay on the existing payroll_run_lines row and
+    flag the run for recalc. Doesn't recompute tax — that's the next
+    /build-journal's job (the bookkeeper triggers it explicitly)."""
+    if not payroll_run_line_id:
+        # The line may not exist yet (employee wasn't on the run as
+        # built). For now refuse — the bookkeeper should add the
+        # employee to the run first.
+        return {
+            "ok": False,
+            "error": "no payroll_run_lines row for this employee on this run",
+        }
+    res = session.execute(
+        text(
+            """
+            UPDATE payroll_run_lines
+               SET gross_pay = :gross,
+                   notes = COALESCE(notes, '') ||
+                           CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END ||
+                           :tag
+             WHERE id = :lid AND payroll_run_id = :rid
+            """
+        ),
+        {
+            "gross": new_gross,
+            "tag": f"manual_override by assistant ({clerk_user_id or 'unknown'}): ${new_gross}",
+            "lid": payroll_run_line_id,
+            "rid": payroll_run_id,
+        },
+    )
+    if res.rowcount == 0:
+        return {"ok": False, "error": "payroll_run_lines row not found"}
+    # Flag the run for recalc via summary_json.
+    session.execute(
+        text(
+            """
+            UPDATE payroll_runs
+               SET summary_json = COALESCE(summary_json, '{}'::jsonb) ||
+                                  '{"pending_recalc": true}'::jsonb,
+                   updated_at = NOW()
+             WHERE id = :rid
+            """
+        ),
+        {"rid": payroll_run_id},
+    )
+    _learn_payroll_change(
+        session,
+        entity_code=entity_code,
+        key=f"one_time_pay_override:{emp['full_name']}:{payroll_run_id}",
+        summary=f"{emp['full_name']}: gross_pay override to ${new_gross} on run {payroll_run_id}",
+    )
+    return {
+        "ok": True,
+        "action": "one_time_pay_override",
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "payroll_run_id": payroll_run_id,
+        "payroll_run_line_id": payroll_run_line_id,
+        "new_gross": float(new_gross),
+        "pending_recalc": True,
+    }
+
+
+def _execute_add_bonus(
+    session, *, emp, payroll_run_id, payroll_run_line_id, bonus_amount,
+    clerk_user_id, entity_code,
+) -> dict[str, Any]:
+    """Add a bonus to the line's gross_pay. No separate "bonus" column
+    exists on payroll_run_lines today — we fold the bonus into gross
+    and tag the notes field so the bookkeeper can audit. Recalc flag
+    set on the run."""
+    if not payroll_run_line_id:
+        return {
+            "ok": False,
+            "error": "no payroll_run_lines row for this employee on this run",
+        }
+    res = session.execute(
+        text(
+            """
+            UPDATE payroll_run_lines
+               SET gross_pay = gross_pay + :bonus,
+                   notes = COALESCE(notes, '') ||
+                           CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END ||
+                           :tag
+             WHERE id = :lid AND payroll_run_id = :rid
+            """
+        ),
+        {
+            "bonus": bonus_amount,
+            "tag": f"bonus by assistant ({clerk_user_id or 'unknown'}): +${bonus_amount}",
+            "lid": payroll_run_line_id,
+            "rid": payroll_run_id,
+        },
+    )
+    if res.rowcount == 0:
+        return {"ok": False, "error": "payroll_run_lines row not found"}
+    session.execute(
+        text(
+            """
+            UPDATE payroll_runs
+               SET summary_json = COALESCE(summary_json, '{}'::jsonb) ||
+                                  '{"pending_recalc": true}'::jsonb,
+                   updated_at = NOW()
+             WHERE id = :rid
+            """
+        ),
+        {"rid": payroll_run_id},
+    )
+    _learn_payroll_change(
+        session,
+        entity_code=entity_code,
+        key=f"add_bonus_line:{emp['full_name']}:{payroll_run_id}",
+        summary=f"{emp['full_name']}: +${bonus_amount} bonus on run {payroll_run_id}",
+    )
+    return {
+        "ok": True,
+        "action": "add_bonus_line",
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "payroll_run_id": payroll_run_id,
+        "payroll_run_line_id": payroll_run_line_id,
+        "bonus_amount": float(bonus_amount),
+        "pending_recalc": True,
     }
 
 

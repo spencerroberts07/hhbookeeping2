@@ -2,10 +2,12 @@
 
 import { JournalPreview } from './journal-preview';
 import { TransactionMatch } from './transaction-match';
+import { PayrollChangePreview } from './payroll-change-preview';
 import { cn } from '@/lib/utils';
 import type {
   JournalPreview as JournalPreviewType,
   TransactionPreview,
+  PayrollChangePreview as PayrollChangePreviewType,
 } from '@/lib/api/assistant';
 
 export interface AssistantMessageItem {
@@ -14,6 +16,7 @@ export interface AssistantMessageItem {
   content: string;
   transaction_preview?: TransactionPreview | null;
   journal_preview?: JournalPreviewType | null;
+  payroll_preview?: PayrollChangePreviewType | null;
   needs_confirmation?: boolean;
   resolved?: boolean;
   /** Only the most recent assistant message that still needs confirmation
@@ -30,6 +33,7 @@ interface Props {
 
 export function AssistantMessage({ message, onConfirm, onChange, busy }: Props) {
   const isUser = message.role === 'user';
+  const frozen = message.resolved || !message.isLatestActionable;
   return (
     <div className={cn('flex', isUser ? 'justify-end' : 'justify-start')}>
       <div
@@ -54,7 +58,16 @@ export function AssistantMessage({ message, onConfirm, onChange, busy }: Props) 
             onConfirm={() => onConfirm?.()}
             onChange={() => onChange?.()}
             busy={busy}
-            resolved={message.resolved || !message.isLatestActionable}
+            resolved={frozen}
+          />
+        )}
+        {!isUser && message.payroll_preview && (
+          <PayrollChangePreview
+            preview={message.payroll_preview}
+            onConfirm={() => onConfirm?.()}
+            onCancel={() => onChange?.()}
+            busy={busy}
+            resolved={frozen}
           />
         )}
       </div>
