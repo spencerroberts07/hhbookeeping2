@@ -558,7 +558,7 @@ function VacationBalanceCard({
         </div>
         {overAccrued && (
           <span className="text-[10px] rounded-full bg-amber-100 text-amber-900 px-2 py-0.5 inline-flex items-center gap-1">
-            <AlertTriangle className="h-3 w-3" /> Excessive accrual (>80h)
+            <AlertTriangle className="h-3 w-3" /> Excessive accrual (&gt;80h)
           </span>
         )}
         <button
