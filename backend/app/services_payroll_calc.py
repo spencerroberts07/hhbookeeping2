@@ -16,6 +16,30 @@ enough to drive the journal; the bookkeeper can override fed_tax on
 the run line if a specific employee's actual differs materially.
 
 CPP and EI are exact — those are flat-rate calculations.
+
+# ============================================================
+# TODO_CRA_2026_RATES — verify-and-update pass needed
+#
+# The constants below carry "2026" in their names but the actual
+# numbers were pulled from CRA's 2025 publications. The Feb 2026
+# payroll closed against ENetEmployer's register so no posted
+# journal depends on these numbers, but every future preview /
+# estimate / cap calculation does.
+#
+# Discrepancies vs CRA 2026 (per spec audit, 2026-05-26):
+#   CPP_MAX_EARNINGS_ANNUAL    code: 71300  CRA 2026: 68500
+#   CPP_MAX_CONTRIB_ANNUAL     code: 4034.10  CRA 2026: 3867.50
+#   EI_RATE_EE                 code: 0.01657  CRA 2026: 0.0166
+#   EI_MAX_INSURABLE_ANNUAL    code: 65700  CRA 2026: 63200
+#   EI_MAX_CONTRIB_EE_ANNUAL   code: 1088.65  CRA 2026: 1049.12
+#   FEDERAL_BPA_2026           code: 16129  CRA 2026: 15705
+#   CPP2 (4% on 68500-73200)   not implemented
+#
+# Resolution: a separate audit commit will replace these constants
+# after Spencer verifies against the CRA T4127 PDF. Do NOT update
+# them in feature builds — sneak-rate-changes are how payroll bugs
+# happen.
+# ============================================================
 """
 from __future__ import annotations
 
@@ -44,6 +68,17 @@ EI_MAX_INSURABLE_ANNUAL = Decimal("65700.00")
 EI_MAX_CONTRIB_EE_ANNUAL = (
     EI_MAX_INSURABLE_ANNUAL * EI_RATE_EE
 ).quantize(Decimal("0.01"))  # = 1,088.65
+
+# CPP2 (CPP enhancement, tier 2 — above the first earnings ceiling).
+# See TODO_CRA_2026_RATES block: these are placeholder values and
+# need verification against CRA T4127 in the rate-audit commit.
+CPP2_RATE_EE = Decimal("0.04")
+CPP2_RATE_ER = Decimal("0.04")
+CPP2_LOWER_CEILING = CPP_MAX_EARNINGS_ANNUAL          # tier-1 cap (YMPE)
+CPP2_UPPER_CEILING = Decimal("73200.00")              # YAMPE — placeholder
+CPP2_MAX_CONTRIB_ANNUAL = (
+    (CPP2_UPPER_CEILING - CPP2_LOWER_CEILING) * CPP2_RATE_EE
+).quantize(Decimal("0.01"))
 
 VACATION_RATE_DEFAULT = Decimal("0.04")
 BIWEEKLY_PERIODS = 26
@@ -120,6 +155,63 @@ def _claim_amount(
 # ----------------------------------------------------------------------
 # CPP
 # ----------------------------------------------------------------------
+
+
+def calculate_cpp2(
+    ytd_gross: Decimal,
+    period_gross: Decimal,
+    *,
+    ytd_cpp2_ee: Decimal | None = None,
+    cpp_exempt: bool = False,
+) -> dict[str, Decimal]:
+    """Tier-2 CPP enhancement. Kicks in once YTD pensionable earnings
+    exceed the YMPE (CPP2_LOWER_CEILING). Rate is 4% of earnings in
+    the YMPE..YAMPE range, capped at CPP2_MAX_CONTRIB_ANNUAL.
+
+    Inputs:
+      ytd_gross      — pensionable earnings YTD *before* this period.
+                       Used to determine how much of `period_gross`
+                       falls above the lower ceiling.
+      period_gross   — this period's pensionable earnings.
+      ytd_cpp2_ee    — CPP2 already withheld YTD. Caps the result.
+
+    Returns {"cpp2_ee": Decimal, "cpp2_er": Decimal}. Both zero when
+    cpp_exempt is True or the ytd_gross still hasn't crossed the
+    YMPE."""
+    ytd_gross = _money(ytd_gross or 0)
+    period_gross = _money(period_gross or 0)
+    ytd_cpp2 = _money(ytd_cpp2_ee or 0)
+    if cpp_exempt or period_gross <= 0:
+        return {"cpp2_ee": Decimal("0.00"), "cpp2_er": Decimal("0.00")}
+
+    # Portion of this period's gross that falls in the YMPE..YAMPE band.
+    new_ytd = ytd_gross + period_gross
+    above_ymp_start = max(Decimal("0.00"), new_ytd - CPP2_LOWER_CEILING)
+    if above_ymp_start <= 0:
+        return {"cpp2_ee": Decimal("0.00"), "cpp2_er": Decimal("0.00")}
+    above_yampe = max(Decimal("0.00"), new_ytd - CPP2_UPPER_CEILING)
+    band = above_ymp_start - above_yampe
+    # Subtract whatever was already in the band before this period.
+    prior_in_band = max(
+        Decimal("0.00"),
+        min(ytd_gross, CPP2_UPPER_CEILING) - CPP2_LOWER_CEILING,
+    )
+    new_in_band = band - prior_in_band
+    if new_in_band <= 0:
+        return {"cpp2_ee": Decimal("0.00"), "cpp2_er": Decimal("0.00")}
+
+    cpp2_ee = (new_in_band * CPP2_RATE_EE).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    remaining_cap = CPP2_MAX_CONTRIB_ANNUAL - ytd_cpp2
+    if remaining_cap < 0:
+        remaining_cap = Decimal("0.00")
+    if cpp2_ee > remaining_cap:
+        cpp2_ee = remaining_cap
+    cpp2_er = (cpp2_ee * (CPP2_RATE_ER / CPP2_RATE_EE)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return {"cpp2_ee": cpp2_ee, "cpp2_er": cpp2_er}
 
 
 def calculate_cpp(
@@ -210,6 +302,9 @@ def calculate_federal_tax(
     provincial_td1_claim_code: int = 1,
     pay_periods: int = BIWEEKLY_PERIODS,
     province: str = "ON",
+    additional_fed_tax: Decimal | None = None,
+    additional_prov_tax: Decimal | None = None,
+    ytd_fed_tax: Decimal | None = None,
 ) -> dict[str, Decimal]:
     """
     Combined federal + provincial tax for a biweekly period.
@@ -219,15 +314,25 @@ def calculate_federal_tax(
     tax, subtract the TD1 personal-amount credit valued at the lowest-
     bracket rate (CRA convention), then divide by pay_periods.
 
-    Returns a dict with fed_only and provincial_only for transparency,
-    plus the combined fed_tax that the journal posts.
+    additional_fed_tax / additional_prov_tax: per-period extra
+    withholding the employee has requested via TD1. ADDED on top of
+    the standard calculation. Total fed_tax is capped at the period's
+    taxable_gross — we can't withhold more than the employee earns.
+
+    Returns a dict with fed_only / provincial_only / additional_*
+    broken out for the pay stub, plus combined fed_tax for the
+    journal posting.
     """
     biweekly = _money(taxable_gross)
+    addl_fed = _money(additional_fed_tax or 0)
+    addl_prov = _money(additional_prov_tax or 0)
     if biweekly <= 0:
         return {
             "fed_tax": Decimal("0.00"),
             "federal_only": Decimal("0.00"),
             "provincial_only": Decimal("0.00"),
+            "additional_fed_tax": Decimal("0.00"),
+            "additional_prov_tax": Decimal("0.00"),
         }
 
     annual_taxable = biweekly * Decimal(pay_periods)
@@ -253,12 +358,38 @@ def calculate_federal_tax(
     else:
         prov_periodic = Decimal("0.00")
 
+    total_before_cap = fed_periodic + prov_periodic + addl_fed + addl_prov
+    # Hard cap: never withhold more than gross.
+    capped = min(total_before_cap, biweekly)
+    # If the cap bit, scale the additional portions down first
+    # (standard withholding always takes precedence over voluntary).
+    if capped < total_before_cap:
+        standard = fed_periodic + prov_periodic
+        if standard >= biweekly:
+            addl_fed_eff = Decimal("0.00")
+            addl_prov_eff = Decimal("0.00")
+        else:
+            room = biweekly - standard
+            requested_addl = addl_fed + addl_prov
+            if requested_addl <= 0:
+                addl_fed_eff = Decimal("0.00")
+                addl_prov_eff = Decimal("0.00")
+            else:
+                share_fed = (addl_fed / requested_addl) if requested_addl else Decimal("0.00")
+                addl_fed_eff = (room * share_fed).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                addl_prov_eff = (room - addl_fed_eff).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    else:
+        addl_fed_eff = addl_fed
+        addl_prov_eff = addl_prov
+
     return {
-        "fed_tax": (fed_periodic + prov_periodic).quantize(
+        "fed_tax": (fed_periodic + prov_periodic + addl_fed_eff + addl_prov_eff).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         ),
         "federal_only": fed_periodic,
         "provincial_only": prov_periodic,
+        "additional_fed_tax": addl_fed_eff,
+        "additional_prov_tax": addl_prov_eff,
     }
 
 

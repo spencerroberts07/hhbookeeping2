@@ -3,15 +3,18 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { useQuery } from '@tanstack/react-query';
 import { Topbar } from '@/components/layout/topbar';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ChevronRight } from 'lucide-react';
+import { CalendarDays, ChevronRight } from 'lucide-react';
 import { useEntityStore } from '@/lib/store/entity';
 import { MultiFileUpload } from '@/components/shared/multi-file-upload';
 import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
+import { getStatDays } from '@/lib/api/payroll';
+import { formatDate } from '@/lib/utils';
 
 const STEPS = ['Period details', 'Hours (optional)', 'Register', 'Done'] as const;
 
@@ -76,6 +79,10 @@ export default function NewPayRunPage() {
             </div>
           ))}
         </div>
+
+        {periodStart && periodEnd && (
+          <StatHolidayBanner periodStart={periodStart} periodEnd={periodEnd} />
+        )}
 
         {step === 0 && (
           <Card>
@@ -242,5 +249,58 @@ export default function NewPayRunPage() {
         )}
       </main>
     </>
+  );
+}
+
+function StatHolidayBanner({
+  periodStart,
+  periodEnd,
+}: {
+  periodStart: string;
+  periodEnd: string;
+}) {
+  // Pick the year of the period start. Cross-year periods are unusual
+  // for bi-weekly payroll and we can ask the backend for both years if
+  // needed later; for the common case one year is enough.
+  const year = Number(periodStart.slice(0, 4));
+  const q = useQuery({
+    queryKey: ['stat-days', year],
+    enabled: Number.isFinite(year),
+    queryFn: () => getStatDays(year, 'ON'),
+    staleTime: 24 * 60 * 60 * 1000,
+  });
+  const start = new Date(periodStart);
+  const end = new Date(periodEnd);
+  const matches = (q.data?.stat_days ?? []).filter((d) => {
+    const od = new Date(d.observed_date);
+    return od >= start && od <= end;
+  });
+  if (matches.length === 0) {
+    return (
+      <div className="rounded-md border border-border bg-cloud/40 px-3 py-2 text-xs text-slate flex items-center gap-2">
+        <CalendarDays className="h-3 w-3" />
+        No Ontario statutory holidays fall in this period.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 flex items-start gap-2">
+      <CalendarDays className="h-3 w-3 mt-0.5" />
+      <div className="flex-1">
+        <div className="font-semibold">
+          {matches.length} stat day{matches.length === 1 ? '' : 's'} in this period:
+        </div>
+        <ul className="mt-1 space-y-0.5">
+          {matches.map((d) => (
+            <li key={d.observed_date} className="tabular-nums">
+              {formatDate(d.observed_date)} — {d.holiday_name}
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1 text-[10px] text-amber-900/80">
+          Verify stat pay amounts in the register before approving.
+        </p>
+      </div>
+    </div>
   );
 }

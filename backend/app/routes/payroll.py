@@ -683,6 +683,11 @@ class UpdateEmployeeRequest(BaseModel):
     bank_institution: str | None = None
     bank_account: str | None = None
     notes: str | None = None
+    # Feature 1 — additional withholding
+    additional_fed_tax: float | None = None
+    additional_prov_tax: float | None = None
+    additional_tax_effective_date: str | None = None
+    additional_tax_td1_on_file: bool | None = None
 
 
 @router.get("/employees/{employee_id}")
@@ -717,7 +722,13 @@ def get_employee_detail(
                        provincial_td1_claim_code, cpp_exempt, ei_exempt,
                        has_life_insurance, life_insurance_biweekly, is_active,
                        start_date, address, bank_transit, bank_institution,
-                       bank_account, ods_name_key, notes, created_at, updated_at
+                       bank_account, ods_name_key, notes,
+                       additional_fed_tax, additional_prov_tax,
+                       additional_tax_effective_date, additional_tax_td1_on_file,
+                       vacation_hours_balance, vacation_dollars_balance,
+                       ytd_gross, ytd_cpp_employee, ytd_cpp2_employee,
+                       ytd_ei_employee, ytd_fed_tax, ytd_reset_date,
+                       created_at, updated_at
                   FROM payroll_employees
                  WHERE id = :id AND entity_id = :eid
                 """
@@ -1207,3 +1218,489 @@ def section_payroll(session, entity_code, period_start, period_end):  # noqa: AR
         session, entity_id=entity["id"],
         period_start=period_start, period_end=period_end,
     )
+
+
+# ======================================================================
+# Tier-1 additions — Features 2, 3, 4, 5
+# ======================================================================
+
+
+# ----------------------------------------------------------------------
+# Vacation ledger (Feature 2)
+# ----------------------------------------------------------------------
+
+
+@router.get("/employees/{employee_id}/vacation-ledger")
+def get_vacation_ledger(
+    employee_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Full ledger history for an employee + current denormalized balances.
+
+    Scoped by entity_id — refuses cross-entity reads."""
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        emp = session.execute(
+            _text(
+                "SELECT id, full_name, vacation_rate, "
+                "       vacation_hours_balance, vacation_dollars_balance "
+                "  FROM payroll_employees "
+                " WHERE id = :id AND entity_id = :eid"
+            ),
+            {"id": employee_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not emp:
+            raise HTTPException(404, "Employee not found for this entity")
+        entries = session.execute(
+            _text(
+                """
+                SELECT pvl.id, pvl.payroll_run_id, pvl.entry_type,
+                       pvl.hours_delta, pvl.dollars_delta,
+                       pvl.balance_hours_after, pvl.balance_dollars_after,
+                       pvl.notes, pvl.created_at, pvl.created_by,
+                       pr.pay_run_number, pr.period_end
+                  FROM payroll_vacation_ledger pvl
+                  LEFT JOIN payroll_runs pr ON pr.id = pvl.payroll_run_id
+                 WHERE pvl.employee_id = :emp
+                 ORDER BY pvl.created_at DESC
+                """
+            ),
+            {"emp": employee_id},
+        ).mappings().all()
+    return {
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "vacation_rate": float(emp["vacation_rate"] or 0),
+        "balance_hours": float(emp["vacation_hours_balance"] or 0),
+        "balance_dollars": float(emp["vacation_dollars_balance"] or 0),
+        "entries": [
+            {
+                "id": str(e["id"]),
+                "payroll_run_id": str(e["payroll_run_id"]) if e["payroll_run_id"] else None,
+                "pay_run_number": e["pay_run_number"],
+                "period_end": e["period_end"].isoformat() if e["period_end"] else None,
+                "entry_type": e["entry_type"],
+                "hours_delta": float(e["hours_delta"] or 0),
+                "dollars_delta": float(e["dollars_delta"] or 0),
+                "balance_hours_after": float(e["balance_hours_after"] or 0),
+                "balance_dollars_after": float(e["balance_dollars_after"] or 0),
+                "notes": e["notes"],
+                "created_at": e["created_at"].isoformat() if e["created_at"] else None,
+                "created_by": e["created_by"],
+            }
+            for e in entries
+        ],
+    }
+
+
+# ----------------------------------------------------------------------
+# YTD reset (Feature 3) — admin trigger, runs once a fiscal year
+# ----------------------------------------------------------------------
+
+
+class YtdResetRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+    confirm: bool = False
+
+
+@router.post("/ytd/reset")
+def post_ytd_reset(
+    body: YtdResetRequest,
+    _user: dict = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Zero every employee's YTD totals for the entity. Admin-only —
+    this is the start-of-fiscal-year reset.
+
+    Requires `confirm: true` in the body — a stray double-click on the
+    UI won't blow away YTD by accident."""
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+    if not body.confirm:
+        raise HTTPException(
+            400,
+            "YTD reset is irreversible — set confirm=true to proceed.",
+        )
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        res = session.execute(
+            _text(
+                """
+                UPDATE payroll_employees
+                   SET ytd_gross = 0,
+                       ytd_cpp_employee = 0,
+                       ytd_cpp2_employee = 0,
+                       ytd_ei_employee = 0,
+                       ytd_fed_tax = 0,
+                       ytd_reset_date = CURRENT_DATE,
+                       updated_at = NOW()
+                 WHERE entity_id = :eid
+                """
+            ),
+            {"eid": entity["id"]},
+        )
+    return {
+        "ok": True,
+        "entity_code": body.entity_code,
+        "employees_reset": res.rowcount,
+        "reset_date": DateType.today().isoformat(),
+    }
+
+
+# ----------------------------------------------------------------------
+# Stat-day calendar (Feature 4)
+# ----------------------------------------------------------------------
+
+
+@router.get("/stat-days")
+def get_stat_days_endpoint(
+    year: int = Query(...),
+    province: str = Query(default="ON"),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Return statutory holidays for a year + province. Pure
+    calculation — no DB read, no entity scoping needed (stat dates
+    are the same for every employer in the province)."""
+    from ..services_payroll_stats import get_stat_days
+    days = get_stat_days(year, province)
+    return {
+        "year": year,
+        "province": province.upper(),
+        "stat_days": [
+            {
+                "holiday_name": s.holiday_name,
+                "holiday_date": s.holiday_date.isoformat(),
+                "observed_date": s.observed_date.isoformat(),
+            }
+            for s in days
+        ],
+        "count": len(days),
+    }
+
+
+# ----------------------------------------------------------------------
+# Pay stubs (Feature 5)
+# ----------------------------------------------------------------------
+
+
+class GeneratePaystubsRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/runs/{payroll_run_id}/generate-paystubs")
+def post_generate_paystubs(
+    body: GeneratePaystubsRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Generate a PDF pay stub for every employee on the run.
+
+    Only valid for runs in workflow_status in
+    ('approved','approved_to_post','posted','paid'). R2 is
+    fail-tolerant — payroll_paystubs rows are written even if the
+    upload fails, with r2_object_key NULL."""
+    from sqlalchemy import text as _text
+    from ..services_payroll_paystub import generate_pay_stub
+    from ..services_storage import storage_service as _r2
+
+    enforce_entity_code(_user, body.entity_code)
+
+    with db_session() as session:
+        entity = session.execute(
+            _text(
+                "SELECT id, entity_code, entity_name "
+                "  FROM entities WHERE entity_code = :ec"
+            ),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+
+        run = session.execute(
+            _text(
+                """
+                SELECT id, pay_run_number, period_start, period_end, pay_date,
+                       status, workflow_status
+                  FROM payroll_runs
+                 WHERE id = :rid AND entity_id = :eid
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not run:
+            raise HTTPException(404, "Payroll run not found")
+        wf = (run["workflow_status"] or run["status"] or "").lower()
+        if wf not in {"approved", "approved_to_post", "posted", "paid"}:
+            raise HTTPException(
+                409,
+                f"Pay stubs can only be generated on approved runs (current: {wf!r}).",
+            )
+
+        lines = session.execute(
+            _text(
+                """
+                SELECT prl.*, pe.full_name, pe.employee_number,
+                       pe.employment_type AS emp_employment_type,
+                       pe.province AS emp_province,
+                       pe.bank_account, pe.vacation_dollars_balance,
+                       pe.ytd_gross, pe.ytd_fed_tax, pe.ytd_cpp_employee,
+                       pe.ytd_ei_employee
+                  FROM payroll_run_lines prl
+                  JOIN payroll_employees pe ON pe.id = prl.employee_id
+                 WHERE prl.payroll_run_id = :rid
+                 ORDER BY pe.employee_number
+                """
+            ),
+            {"rid": payroll_run_id},
+        ).mappings().all()
+        if not lines:
+            raise HTTPException(400, "No employees on this run — nothing to stub.")
+
+        generated = 0
+        r2_failed = 0
+        results: list[dict[str, Any]] = []
+        for line in lines:
+            employee = {
+                "id": line["employee_id"],
+                "full_name": line["full_name"],
+                "employee_number": line["employee_number"],
+                "employment_type": line["emp_employment_type"],
+                "province": line["emp_province"],
+                "bank_account": line["bank_account"],
+                "vacation_dollars_balance": line["vacation_dollars_balance"],
+            }
+            ytd_snapshot = {
+                "gross": line["ytd_gross"],
+                "fed_tax": line["ytd_fed_tax"],
+                "cpp_employee": line["ytd_cpp_employee"],
+                "ei_employee": line["ytd_ei_employee"],
+            }
+            try:
+                pdf_bytes = generate_pay_stub(
+                    run_line=dict(line),
+                    employee=employee,
+                    run=dict(run),
+                    entity=dict(entity),
+                    ytd=ytd_snapshot,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).exception(
+                    "pay stub gen failed for emp %s", line["employee_id"]
+                )
+                results.append({
+                    "employee_name": line["full_name"],
+                    "ok": False,
+                    "error": str(exc)[:120],
+                })
+                continue
+
+            file_name = (
+                f"paystub-{run['pay_run_number']}-"
+                f"{line['employee_number']:03d}-{(line['full_name'] or '').replace(' ','_')}.pdf"
+            )
+            r2_key = _r2.upload_file(
+                file_bytes=pdf_bytes,
+                original_filename=file_name,
+                entity_code=entity["entity_code"],
+                document_type=f"paystubs/{run['period_end'].year}/{payroll_run_id}",
+                content_type="application/pdf",
+            )
+            if not r2_key:
+                r2_failed += 1
+
+            paystub_row = session.execute(
+                _text(
+                    """
+                    INSERT INTO payroll_paystubs (
+                        entity_id, employee_id, payroll_run_id,
+                        r2_object_key, file_name, generated_by
+                    ) VALUES (
+                        :eid, :emp, :rid, :key, :fn, :who
+                    )
+                    ON CONFLICT (payroll_run_id, employee_id) DO UPDATE
+                       SET r2_object_key = EXCLUDED.r2_object_key,
+                           file_name = EXCLUDED.file_name,
+                           generated_at = NOW(),
+                           generated_by = EXCLUDED.generated_by
+                    RETURNING id
+                    """
+                ),
+                {
+                    "eid": entity["id"],
+                    "emp": line["employee_id"],
+                    "rid": payroll_run_id,
+                    "key": r2_key,
+                    "fn": file_name,
+                    "who": body.actor_email,
+                },
+            ).mappings().first()
+            generated += 1
+            results.append({
+                "paystub_id": str(paystub_row["id"]) if paystub_row else None,
+                "employee_name": line["full_name"],
+                "file_name": file_name,
+                "r2_uploaded": bool(r2_key),
+                "ok": True,
+            })
+
+    return {
+        "ok": True,
+        "payroll_run_id": payroll_run_id,
+        "generated": generated,
+        "r2_upload_failures": r2_failed,
+        "results": results,
+    }
+
+
+@router.get("/runs/{payroll_run_id}/paystubs")
+def list_run_paystubs(
+    payroll_run_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        rows = session.execute(
+            _text(
+                """
+                SELECT ps.id, ps.employee_id, ps.file_name, ps.r2_object_key,
+                       ps.generated_at, ps.generated_by,
+                       pe.full_name, pe.employee_number
+                  FROM payroll_paystubs ps
+                  JOIN payroll_employees pe ON pe.id = ps.employee_id
+                 WHERE ps.payroll_run_id = :rid AND ps.entity_id = :eid
+                 ORDER BY pe.employee_number
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().all()
+    return {
+        "payroll_run_id": payroll_run_id,
+        "paystubs": [
+            {
+                "id": str(r["id"]),
+                "employee_id": str(r["employee_id"]),
+                "employee_name": r["full_name"],
+                "employee_number": r["employee_number"],
+                "file_name": r["file_name"],
+                "r2_uploaded": bool(r["r2_object_key"]),
+                "generated_at": r["generated_at"].isoformat() if r["generated_at"] else None,
+                "generated_by": r["generated_by"],
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/employees/{employee_id}/paystubs")
+def list_employee_paystubs(
+    employee_id: str = Path(...),
+    entity_code: str = Query(...),
+    limit: int = Query(default=12, ge=1, le=100),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        rows = session.execute(
+            _text(
+                """
+                SELECT ps.id, ps.payroll_run_id, ps.file_name,
+                       ps.r2_object_key, ps.generated_at,
+                       pr.pay_run_number, pr.period_start, pr.period_end,
+                       pr.pay_date
+                  FROM payroll_paystubs ps
+                  JOIN payroll_runs pr ON pr.id = ps.payroll_run_id
+                 WHERE ps.employee_id = :emp AND ps.entity_id = :eid
+                 ORDER BY pr.pay_date DESC
+                 LIMIT :limit
+                """
+            ),
+            {"emp": employee_id, "eid": entity["id"], "limit": limit},
+        ).mappings().all()
+    return {
+        "employee_id": employee_id,
+        "paystubs": [
+            {
+                "id": str(r["id"]),
+                "payroll_run_id": str(r["payroll_run_id"]),
+                "pay_run_number": r["pay_run_number"],
+                "period_start": r["period_start"].isoformat() if r["period_start"] else None,
+                "period_end": r["period_end"].isoformat() if r["period_end"] else None,
+                "pay_date": r["pay_date"].isoformat() if r["pay_date"] else None,
+                "file_name": r["file_name"],
+                "r2_uploaded": bool(r["r2_object_key"]),
+                "generated_at": r["generated_at"].isoformat() if r["generated_at"] else None,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/paystubs/{paystub_id}/download")
+def get_paystub_download(
+    paystub_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    from ..services_storage import storage_service as _r2
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        row = session.execute(
+            _text(
+                """
+                SELECT id, file_name, r2_object_key, generated_at
+                  FROM payroll_paystubs
+                 WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": paystub_id, "eid": entity["id"]},
+        ).mappings().first()
+    if not row:
+        raise HTTPException(404, "Paystub not found")
+    if not row["r2_object_key"]:
+        raise HTTPException(
+            409,
+            "Paystub metadata exists but the PDF isn't in R2 — re-run generate-paystubs.",
+        )
+    url = _r2.get_presigned_url(row["r2_object_key"], expires_in=3600)
+    if not url:
+        raise HTTPException(503, "R2 presign failed; try again in a moment.")
+    return {
+        "file_name": row["file_name"],
+        "download_url": url,
+        "expires_in_seconds": 3600,
+        "generated_at": row["generated_at"].isoformat() if row["generated_at"] else None,
+    }

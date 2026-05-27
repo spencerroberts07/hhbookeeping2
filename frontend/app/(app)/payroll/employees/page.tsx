@@ -24,11 +24,14 @@ import {
   listEmployees,
   getEmployeeDetail,
   updateEmployee,
+  getVacationLedger,
+  listEmployeePaystubs,
+  getPaystubDownload,
   type Employee,
   type UpdateEmployeeInput,
 } from '@/lib/api/payroll';
-import { formatMoney } from '@/lib/utils';
-import { ArrowLeft, Pencil } from 'lucide-react';
+import { formatMoney, formatDate } from '@/lib/utils';
+import { AlertTriangle, ArrowLeft, Pencil } from 'lucide-react';
 
 export const dynamic = 'force-dynamic';
 
@@ -152,15 +155,31 @@ function EmployeeRow({
       : employee.hourly_rate
         ? `${formatMoney(employee.hourly_rate)} / hr`
         : '—';
+  const hasAddlTax =
+    Number(employee.additional_fed_tax ?? 0) > 0 ||
+    Number(employee.additional_prov_tax ?? 0) > 0;
   return (
     <tr className="hover:bg-cloud">
       <td className="px-4 py-2 text-ink font-mono text-xs">
         {employee.employee_number}
       </td>
       <td className="px-4 py-2 text-ink">
-        {employee.first_name && employee.last_name
-          ? `${employee.first_name} ${employee.last_name}`
-          : (employee as { full_name?: string }).full_name ?? '—'}
+        <div className="flex items-center gap-2">
+          <span>
+            {employee.first_name && employee.last_name
+              ? `${employee.first_name} ${employee.last_name}`
+              : employee.full_name ?? '—'}
+          </span>
+          {hasAddlTax && (
+            <span
+              title="Additional tax withholding on file"
+              className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-900 text-[10px] px-2 py-0.5"
+            >
+              <AlertTriangle className="h-3 w-3" />
+              +Tax
+            </span>
+          )}
+        </div>
       </td>
       <td className="px-4 py-2 text-slate text-xs uppercase">
         {employee.employment_type ?? '—'}
@@ -431,6 +450,67 @@ function EmployeeEditor({
               </Row>
             </Section>
 
+            {/* Feature 1 — Additional withholding */}
+            <Section title="Additional withholding">
+              <Row>
+                <Field label="Additional Federal Tax / period">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    value={String(v('additional_fed_tax') ?? '')}
+                    onChange={(ev) =>
+                      set('additional_fed_tax', Number(ev.target.value))
+                    }
+                  />
+                </Field>
+                <Field label="Additional Provincial Tax / period">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    value={String(v('additional_prov_tax') ?? '')}
+                    onChange={(ev) =>
+                      set('additional_prov_tax', Number(ev.target.value))
+                    }
+                  />
+                </Field>
+              </Row>
+              <Row>
+                <Field label="Effective date">
+                  <Input
+                    type="date"
+                    value={(v('additional_tax_effective_date') ?? '') as string}
+                    onChange={(ev) =>
+                      set('additional_tax_effective_date', ev.target.value)
+                    }
+                  />
+                </Field>
+                <label className="flex items-end gap-2 text-sm pb-2">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(v('additional_tax_td1_on_file'))}
+                    onChange={(ev) =>
+                      set('additional_tax_td1_on_file', ev.target.checked)
+                    }
+                  />
+                  TD1 form on file
+                </label>
+              </Row>
+              <p className="text-xs text-slate">
+                Employee must submit a signed TD1 form requesting
+                additional withholding before this takes effect.
+              </p>
+            </Section>
+
+            {/* Feature 2 — Vacation balance */}
+            <Section title="Vacation balance">
+              <VacationBalanceCard entityCode={entityCode} employeeId={employeeId} />
+            </Section>
+
+            {/* Feature 5 — Pay stub history */}
+            <Section title="Pay stubs (most recent 6)">
+              <EmployeePaystubsCard entityCode={entityCode} employeeId={employeeId} />
+            </Section>
+
             <div className="flex justify-end gap-2 pt-2 border-t border-border">
               <Button variant="ghost" onClick={onClose}>
                 Cancel
@@ -443,6 +523,181 @@ function EmployeeEditor({
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function VacationBalanceCard({
+  entityCode,
+  employeeId,
+}: {
+  entityCode: string;
+  employeeId: string;
+}) {
+  const q = useQuery({
+    queryKey: ['vac-ledger', entityCode, employeeId],
+    queryFn: () => getVacationLedger(entityCode, employeeId),
+  });
+  const [showHistory, setShowHistory] = useState(false);
+  if (q.isLoading) return <Skeleton className="h-12 w-full" />;
+  if (!q.data) return <p className="text-xs text-slate">No ledger.</p>;
+  const overAccrued = q.data.balance_hours > 80;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <div className="text-sm">
+          <span className="text-slate">Hours: </span>
+          <strong className="text-ink tabular-nums">
+            {q.data.balance_hours.toFixed(2)}
+          </strong>
+        </div>
+        <div className="text-sm">
+          <span className="text-slate">Dollars: </span>
+          <strong className="text-ink tabular-nums">
+            {formatMoney(q.data.balance_dollars)}
+          </strong>
+        </div>
+        {overAccrued && (
+          <span className="text-[10px] rounded-full bg-amber-100 text-amber-900 px-2 py-0.5 inline-flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" /> Excessive accrual (>80h)
+          </span>
+        )}
+        <button
+          type="button"
+          className="text-xs text-ledger-blue hover:underline ml-auto"
+          onClick={() => setShowHistory((s) => !s)}
+        >
+          {showHistory ? 'Hide history' : 'View history'}
+        </button>
+      </div>
+      {showHistory && (
+        <div className="border border-border rounded-md overflow-x-auto">
+          {q.data.entries.length === 0 ? (
+            <p className="p-3 text-xs text-slate text-center">No entries yet.</p>
+          ) : (
+            <table className="min-w-full text-xs">
+              <thead className="bg-cloud">
+                <tr>
+                  <th className="text-left px-2 py-1">Date</th>
+                  <th className="text-left px-2 py-1">Run</th>
+                  <th className="text-left px-2 py-1">Type</th>
+                  <th className="text-right px-2 py-1">Hours</th>
+                  <th className="text-right px-2 py-1">Dollars</th>
+                  <th className="text-right px-2 py-1">Bal $</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {q.data.entries.map((e) => (
+                  <tr key={e.id}>
+                    <td className="px-2 py-1 text-slate">
+                      {e.created_at ? formatDate(e.created_at) : '—'}
+                    </td>
+                    <td className="px-2 py-1 text-slate">
+                      {e.pay_run_number ?? '—'}
+                    </td>
+                    <td className="px-2 py-1 text-ink">{e.entry_type}</td>
+                    <td className="px-2 py-1 tabular-nums text-right">
+                      {e.hours_delta.toFixed(2)}
+                    </td>
+                    <td className="px-2 py-1 tabular-nums text-right">
+                      {formatMoney(e.dollars_delta, { signed: true })}
+                    </td>
+                    <td className="px-2 py-1 tabular-nums text-right">
+                      {formatMoney(e.balance_dollars_after)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmployeePaystubsCard({
+  entityCode,
+  employeeId,
+}: {
+  entityCode: string;
+  employeeId: string;
+}) {
+  const q = useQuery({
+    queryKey: ['emp-paystubs', entityCode, employeeId],
+    queryFn: () => listEmployeePaystubs(entityCode, employeeId, 6),
+  });
+  if (q.isLoading) return <Skeleton className="h-12 w-full" />;
+  if (!q.data || q.data.paystubs.length === 0) {
+    return (
+      <p className="text-xs text-slate">No pay stubs generated yet.</p>
+    );
+  }
+  return (
+    <div className="border border-border rounded-md overflow-x-auto">
+      <table className="min-w-full text-xs">
+        <thead className="bg-cloud">
+          <tr>
+            <th className="text-left px-2 py-1">Pay date</th>
+            <th className="text-left px-2 py-1">Period</th>
+            <th className="px-2 py-1"></th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border">
+          {q.data.paystubs.map((p) => (
+            <tr key={p.id}>
+              <td className="px-2 py-1 text-ink">
+                {p.pay_date ? formatDate(p.pay_date) : '—'}
+              </td>
+              <td className="px-2 py-1 text-slate">
+                {p.period_start && p.period_end
+                  ? `${formatDate(p.period_start)} – ${formatDate(p.period_end)}`
+                  : '—'}
+              </td>
+              <td className="px-2 py-1 text-right">
+                <PaystubDownloadLink
+                  entityCode={entityCode}
+                  paystubId={p.id}
+                  available={p.r2_uploaded}
+                />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PaystubDownloadLink({
+  entityCode,
+  paystubId,
+  available,
+}: {
+  entityCode: string;
+  paystubId: string;
+  available: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  if (!available) {
+    return <span className="text-slate text-[10px]">Not in R2</span>;
+  }
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      className="text-ledger-blue hover:underline disabled:opacity-50"
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const res = await getPaystubDownload(entityCode, paystubId);
+          window.open(res.download_url, '_blank', 'noopener');
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      {busy ? 'Opening…' : 'Download PDF'}
+    </button>
   );
 }
 

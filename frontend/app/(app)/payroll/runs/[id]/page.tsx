@@ -19,6 +19,9 @@ import {
   approvePayrollRun,
   generatePayrollEft,
   getPayrollEftDownload,
+  generatePaystubs,
+  listRunPaystubs,
+  getPaystubDownload,
   type PayrollRunDetail,
 } from '@/lib/api/payroll';
 import { formatMoney, formatDate } from '@/lib/utils';
@@ -165,10 +168,166 @@ export default function PayrollRunDetailPage() {
               onGenerate={() => generateEft.mutate()}
               generatePending={generateEft.isPending}
             />
+
+            <PaystubsStep
+              entityCode={entityCode}
+              runId={runId}
+              eligible={['approved', 'approved_to_post', 'posted', 'paid'].includes(
+                q.data.run.workflow_status || q.data.run.status,
+              )}
+              actorEmail={actorEmail}
+            />
           </>
         )}
       </main>
     </>
+  );
+}
+
+function PaystubsStep({
+  entityCode,
+  runId,
+  eligible,
+  actorEmail,
+}: {
+  entityCode: string;
+  runId: string;
+  eligible: boolean;
+  actorEmail: string;
+}) {
+  const qc = useQueryClient();
+  const list = useQuery({
+    queryKey: ['run-paystubs', entityCode, runId],
+    enabled: !!entityCode && !!runId && eligible,
+    retry: false,
+    queryFn: () => listRunPaystubs(entityCode, runId),
+  });
+  const generate = useMutation({
+    mutationFn: () =>
+      generatePaystubs(runId, { entity_code: entityCode, actor_email: actorEmail }),
+    onSuccess: (res) => {
+      toast.success(
+        `Generated ${res.generated} stub${res.generated === 1 ? '' : 's'}` +
+          (res.r2_upload_failures > 0
+            ? ` (${res.r2_upload_failures} R2 upload failed)`
+            : ''),
+      );
+      qc.invalidateQueries({ queryKey: ['run-paystubs'] });
+    },
+    onError: (err) => {
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
+      toast.error(detail ?? 'Pay stub generation failed');
+    },
+  });
+
+  return (
+    <Card className="border-bw-teal/30">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <FileCheck2 className="h-4 w-4 text-bw-teal" />
+          Pay Stubs
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!eligible ? (
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            Pay stubs are generated after the run is approved.
+          </div>
+        ) : (
+          <>
+            <p className="text-sm text-slate">
+              Generates a PDF pay stub for every employee on this run and
+              archives them in R2. Each stub shows current period + YTD
+              earnings and deductions, plus the vacation balance.
+            </p>
+            <div className="flex gap-2 items-center">
+              <Button onClick={() => generate.mutate()} disabled={generate.isPending}>
+                {generate.isPending && (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                )}
+                {list.data && list.data.count > 0 ? 'Regenerate all stubs' : 'Generate pay stubs'}
+              </Button>
+              {list.data && list.data.count > 0 && (
+                <span className="text-xs text-slate">
+                  {list.data.count} stub{list.data.count === 1 ? '' : 's'} on file
+                </span>
+              )}
+            </div>
+            {list.data && list.data.paystubs.length > 0 && (
+              <div className="border border-border rounded-md overflow-x-auto">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-cloud">
+                    <tr>
+                      <th className="text-left px-2 py-1">#</th>
+                      <th className="text-left px-2 py-1">Employee</th>
+                      <th className="text-left px-2 py-1">Generated</th>
+                      <th className="px-2 py-1"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {list.data.paystubs.map((p) => (
+                      <tr key={p.id}>
+                        <td className="px-2 py-1 text-slate font-mono">
+                          {p.employee_number}
+                        </td>
+                        <td className="px-2 py-1 text-ink">{p.employee_name}</td>
+                        <td className="px-2 py-1 text-slate">
+                          {p.generated_at
+                            ? formatDate(p.generated_at, 'MMM dd, HH:mm')
+                            : '—'}
+                        </td>
+                        <td className="px-2 py-1 text-right">
+                          {p.r2_uploaded ? (
+                            <PaystubDownloadInlineLink
+                              entityCode={entityCode}
+                              paystubId={p.id}
+                            />
+                          ) : (
+                            <span className="text-amber-700 text-[10px]">
+                              R2 upload failed
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PaystubDownloadInlineLink({
+  entityCode,
+  paystubId,
+}: {
+  entityCode: string;
+  paystubId: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      className="text-ledger-blue hover:underline disabled:opacity-50 inline-flex items-center gap-1"
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const res = await getPaystubDownload(entityCode, paystubId);
+          window.open(res.download_url, '_blank', 'noopener');
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <Download className="h-3 w-3" />
+      {busy ? 'Opening…' : 'PDF'}
+    </button>
   );
 }
 

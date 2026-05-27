@@ -13,6 +13,7 @@ export interface Employee {
   employee_number: number;
   first_name: string | null;
   last_name: string | null;
+  full_name?: string | null;
   employment_type: string | null;
   hourly_rate: number | null;
   biweekly_salary: number | null;
@@ -34,6 +35,21 @@ export interface Employee {
   bank_transit?: string | null;
   bank_institution?: string | null;
   bank_account?: string | null;
+  // Feature 1 — additional withholding
+  additional_fed_tax?: number | null;
+  additional_prov_tax?: number | null;
+  additional_tax_effective_date?: string | null;
+  additional_tax_td1_on_file?: boolean | null;
+  // Feature 2 — vacation balances (denormalized)
+  vacation_hours_balance?: number | null;
+  vacation_dollars_balance?: number | null;
+  // Feature 3 — YTD totals
+  ytd_gross?: number | null;
+  ytd_cpp_employee?: number | null;
+  ytd_cpp2_employee?: number | null;
+  ytd_ei_employee?: number | null;
+  ytd_fed_tax?: number | null;
+  ytd_reset_date?: string | null;
 }
 
 export interface UpdateEmployeeInput {
@@ -59,6 +75,11 @@ export interface UpdateEmployeeInput {
   bank_institution?: string;
   bank_account?: string;
   notes?: string;
+  // Feature 1 — additional withholding
+  additional_fed_tax?: number;
+  additional_prov_tax?: number;
+  additional_tax_effective_date?: string;
+  additional_tax_td1_on_file?: boolean;
 }
 
 export async function updateEmployee(
@@ -77,6 +98,151 @@ export async function getEmployeeDetail(
     `/api/payroll/employees/${employeeId}`,
     { params: { entity_code: entityCode } },
   );
+  return res.data;
+}
+
+// ---------- Vacation ledger (Feature 2) ----------
+
+export interface VacationLedgerEntry {
+  id: string;
+  payroll_run_id: string | null;
+  pay_run_number: string | null;
+  period_end: string | null;
+  entry_type: 'accrual' | 'payout' | 'adjustment' | 'opening_balance';
+  hours_delta: number;
+  dollars_delta: number;
+  balance_hours_after: number;
+  balance_dollars_after: number;
+  notes: string | null;
+  created_at: string | null;
+  created_by: string | null;
+}
+
+export interface VacationLedgerResponse {
+  employee_id: string;
+  employee_name: string;
+  vacation_rate: number;
+  balance_hours: number;
+  balance_dollars: number;
+  entries: VacationLedgerEntry[];
+}
+
+export async function getVacationLedger(
+  entityCode: string,
+  employeeId: string,
+): Promise<VacationLedgerResponse> {
+  const res = await api.get<VacationLedgerResponse>(
+    `/api/payroll/employees/${employeeId}/vacation-ledger`,
+    { params: { entity_code: entityCode } },
+  );
+  return res.data;
+}
+
+// ---------- Stat-day calendar (Feature 4) ----------
+
+export interface StatDay {
+  holiday_name: string;
+  holiday_date: string;
+  observed_date: string;
+}
+
+export async function getStatDays(
+  year: number,
+  province = 'ON',
+): Promise<{ year: number; province: string; stat_days: StatDay[]; count: number }> {
+  const res = await api.get('/api/payroll/stat-days', {
+    params: { year, province },
+  });
+  return res.data;
+}
+
+// ---------- YTD reset (Feature 3) ----------
+
+export async function resetYtd(input: {
+  entity_code: string;
+  actor_email: string;
+  confirm: boolean;
+}): Promise<{ ok: boolean; entity_code: string; employees_reset: number; reset_date: string }> {
+  const res = await api.post('/api/payroll/ytd/reset', input);
+  return res.data;
+}
+
+// ---------- Pay stubs (Feature 5) ----------
+
+export interface PaystubSummary {
+  id: string;
+  employee_id?: string;
+  employee_name?: string;
+  employee_number?: number;
+  payroll_run_id?: string;
+  pay_run_number?: string;
+  period_start?: string | null;
+  period_end?: string | null;
+  pay_date?: string | null;
+  file_name: string;
+  r2_uploaded: boolean;
+  generated_at: string | null;
+  generated_by?: string | null;
+}
+
+export async function generatePaystubs(
+  payrollRunId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{
+  ok: boolean;
+  generated: number;
+  r2_upload_failures: number;
+  results: Array<{
+    employee_name: string;
+    file_name?: string;
+    ok: boolean;
+    error?: string;
+    paystub_id?: string;
+    r2_uploaded?: boolean;
+  }>;
+}> {
+  const res = await api.post(
+    `/api/payroll/runs/${payrollRunId}/generate-paystubs`,
+    body,
+  );
+  return res.data;
+}
+
+export async function listRunPaystubs(
+  entityCode: string,
+  payrollRunId: string,
+): Promise<{ payroll_run_id: string; paystubs: PaystubSummary[]; count: number }> {
+  const res = await api.get(
+    `/api/payroll/runs/${payrollRunId}/paystubs`,
+    { params: { entity_code: entityCode } },
+  );
+  return res.data;
+}
+
+export async function listEmployeePaystubs(
+  entityCode: string,
+  employeeId: string,
+  limit = 12,
+): Promise<{ employee_id: string; paystubs: PaystubSummary[]; count: number }> {
+  const res = await api.get(
+    `/api/payroll/employees/${employeeId}/paystubs`,
+    { params: { entity_code: entityCode, limit } },
+  );
+  return res.data;
+}
+
+export async function getPaystubDownload(
+  entityCode: string,
+  paystubId: string,
+): Promise<{
+  file_name: string;
+  download_url: string;
+  expires_in_seconds: number;
+  generated_at: string | null;
+}> {
+  const res = await api.get(`/api/payroll/paystubs/${paystubId}/download`, {
+    params: { entity_code: entityCode },
+  });
   return res.data;
 }
 
