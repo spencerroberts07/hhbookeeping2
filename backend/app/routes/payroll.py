@@ -220,6 +220,9 @@ def post_upsert_employee(
 # ----------------------------------------------------------------------
 
 
+_HOURS_ACCEPTED_EXTS = (".ods", ".xlsx", ".xlsm", ".xls")
+
+
 @router.post("/runs/upload-hours")
 async def post_upload_hours(
     entity_code: str = Form(...),
@@ -238,6 +241,20 @@ async def post_upload_hours(
     period_start_d = _parse_date("period_start", period_start)
     period_end_d = _parse_date("period_end", period_end)
     pay_date_d = _parse_date("pay_date", pay_date)
+
+    # File-type gate — check by extension, not Content-Type. Browsers
+    # send inconsistent Content-Type for .ods (sometimes
+    # application/octet-stream, sometimes the proper OASIS type) and
+    # we'd rather be explicit about what we parse.
+    filename = (file.filename or "").lower()
+    if not filename.endswith(_HOURS_ACCEPTED_EXTS):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported hours file type: {file.filename!r}. "
+                f"Accepted: {', '.join(_HOURS_ACCEPTED_EXTS)}."
+            ),
+        )
 
     def _parse_override(name: str, raw: str | None) -> dict[str, Any]:
         if not raw:

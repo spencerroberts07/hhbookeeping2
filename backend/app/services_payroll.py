@@ -486,18 +486,20 @@ def _parse_ods_period_end(value: str | None) -> date | None:
     return None
 
 
-def parse_hours_ods(file_bytes: bytes) -> ParsedHoursResult:
+def _extract_rows_ods(file_bytes: bytes) -> list[list[str]]:
+    """Read first sheet of an .ods file into list[list[str]] — same
+    shape as `_extract_rows_xlsx` so the structural parser can be
+    format-agnostic."""
     from odf.opendocument import load  # noqa: WPS433
     from odf.table import Table, TableRow, TableCell  # noqa: WPS433
 
     doc = load(io.BytesIO(file_bytes))
     sheets = doc.spreadsheet.getElementsByType(Table)
     if not sheets:
-        return ParsedHoursResult(period_end=None, warnings=["No sheets in ODS"])
+        return []
 
     sheet = sheets[0]
     rows = sheet.getElementsByType(TableRow)
-
     raw_rows: list[list[str]] = []
     for r in rows:
         cells = r.getElementsByType(TableCell)
@@ -511,7 +513,66 @@ def parse_hours_ods(file_bytes: bytes) -> ParsedHoursResult:
         while row_vals and row_vals[-1] == "":
             row_vals.pop()
         raw_rows.append(row_vals)
+    return raw_rows
 
+
+def _extract_rows_xlsx(file_bytes: bytes) -> list[list[str]]:
+    """Read first sheet of an .xlsx (or .xlsm) file into list[list[str]].
+
+    openpyxl returns native cell values (str, int, float, datetime,
+    None). We coerce everything to a string so the downstream parser
+    treats both formats identically. Date values in the period-end
+    header cell are formatted MM/DD/YY to match the ODS shape that
+    `_parse_period_end` already handles.
+
+    Note: .xls (legacy BIFF) is NOT supported by openpyxl. Callers
+    pass .xls through too — load_workbook will raise InvalidFileException
+    which we surface as a clearer error in `parse_hours_file`.
+    """
+    import openpyxl  # noqa: WPS433
+    from datetime import date as _Date, datetime as _DateTime
+
+    wb = openpyxl.load_workbook(
+        io.BytesIO(file_bytes),
+        data_only=True,    # read evaluated values, not formulas
+        read_only=True,    # streamed reader, no edits needed
+    )
+    sheet = wb.worksheets[0]
+    raw_rows: list[list[str]] = []
+    for row in sheet.iter_rows(values_only=True):
+        row_vals: list[str] = []
+        for cell in row:
+            if cell is None:
+                row_vals.append("")
+            elif isinstance(cell, _DateTime):
+                row_vals.append(cell.strftime("%m/%d/%y"))
+            elif isinstance(cell, _Date):
+                row_vals.append(cell.strftime("%m/%d/%y"))
+            elif isinstance(cell, float) and cell.is_integer():
+                # 14.0 → "14" so _to_decimal doesn't think it's "14.0"
+                # (it'd parse fine either way, but matches the ODS
+                # string-only shape).
+                row_vals.append(str(int(cell)))
+            else:
+                row_vals.append(str(cell))
+        while row_vals and row_vals[-1] == "":
+            row_vals.pop()
+        raw_rows.append(row_vals)
+    return raw_rows
+
+
+def _parse_hours_rows(raw_rows: list[list[str]]) -> ParsedHoursResult:
+    """Format-agnostic structural parser. Both _extract_rows_ods and
+    _extract_rows_xlsx produce list[list[str]] in the same shape; this
+    function walks them and produces ParsedHoursResult.
+
+    Expected layout (from the audit):
+      Row 0: company-name header
+      Row 1: 'Payroll Period ending' + date in col D (MM/DD/YY)
+      Row 3: headers — EMPLOYEE | WEEK 1 | WEEK 2 | Total Hours
+      Row 4: 'FULL TIME' section header
+      Then data rows, 'PART TIME' header, more data, 'TOTALS' rows.
+    """
     result = ParsedHoursResult(period_end=None)
 
     # Header — period ending date typically in row 1, col 3
@@ -521,7 +582,7 @@ def parse_hours_ods(file_bytes: bytes) -> ParsedHoursResult:
 
     if result.period_end is None:
         result.warnings.append(
-            "Could not parse period_end from ODS row 1 col 3 — "
+            "Could not parse period_end from row 1 col 3 — "
             "supply period_end via the upload form."
         )
 
@@ -581,6 +642,63 @@ def parse_hours_ods(file_bytes: bytes) -> ParsedHoursResult:
         result.rows.append(row)
 
     return result
+
+
+_HOURS_ACCEPTED_EXTENSIONS = (".ods", ".xlsx", ".xlsm", ".xls")
+
+
+def parse_hours_file(file_bytes: bytes, file_name: str) -> ParsedHoursResult:
+    """Format dispatcher. Selects the row extractor by file extension
+    (case-insensitive) and routes both paths through the shared
+    structural parser. Raises ValueError with a clear message if the
+    extension isn't recognized or the file fails to read."""
+    name = (file_name or "").lower()
+    try:
+        if name.endswith(".ods"):
+            raw_rows = _extract_rows_ods(file_bytes)
+        elif name.endswith((".xlsx", ".xlsm")):
+            raw_rows = _extract_rows_xlsx(file_bytes)
+        elif name.endswith(".xls"):
+            # openpyxl rejects legacy BIFF .xls with InvalidFileException.
+            # Try anyway — some modern tools save .xls as a renamed .xlsx
+            # — but surface a clean error if the read fails.
+            try:
+                raw_rows = _extract_rows_xlsx(file_bytes)
+            except Exception as exc:
+                raise ValueError(
+                    "Legacy .xls (Excel 97-2003) is not supported. "
+                    "Re-save the file as .xlsx or .ods and re-upload."
+                ) from exc
+        else:
+            raise ValueError(
+                f"Unsupported file extension on {file_name!r}. "
+                "Supported: .ods, .xlsx, .xlsm, .xls."
+            )
+    except ValueError:
+        raise
+    except Exception as exc:
+        # openpyxl / odfpy parse failures land here. Surface as ValueError
+        # so the route returns 400 instead of 500.
+        raise ValueError(
+            f"Could not read hours file {file_name!r}: {exc}"
+        ) from exc
+
+    if not raw_rows:
+        return ParsedHoursResult(
+            period_end=None,
+            warnings=[f"No sheets / rows found in {file_name!r}"],
+        )
+    return _parse_hours_rows(raw_rows)
+
+
+def parse_hours_ods(file_bytes: bytes) -> ParsedHoursResult:
+    """Backward-compat shim. New callers should use parse_hours_file
+    (which dispatches by extension). Existing code that pre-dates the
+    Excel support keeps working through this entry point."""
+    raw_rows = _extract_rows_ods(file_bytes)
+    if not raw_rows:
+        return ParsedHoursResult(period_end=None, warnings=["No sheets in ODS"])
+    return _parse_hours_rows(raw_rows)
 
 
 # ----------------------------------------------------------------------
@@ -771,7 +889,8 @@ def build_payroll_run(
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
 
-    parsed = parse_hours_ods(file_bytes)
+    # Dispatch on extension — accepts .ods, .xlsx, .xlsm, .xls.
+    parsed = parse_hours_file(file_bytes, file_name)
     return _build_payroll_run_from_parsed(
         session,
         entity=dict(entity),
