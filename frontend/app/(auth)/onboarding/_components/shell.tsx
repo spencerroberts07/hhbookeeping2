@@ -18,6 +18,7 @@ const STEP_LABELS: Record<OnboardingStep, string> = {
 
 export function OnboardingShell({ children }: { children: React.ReactNode }) {
   const current = useOnboardingStore((s) => s.currentStep);
+  const goTo = useOnboardingStore((s) => s.goTo);
   const currentIdx = STEP_ORDER.indexOf(current);
   const pct =
     currentIdx >= 0 ? Math.round((currentIdx / (STEP_ORDER.length - 1)) * 100) : 0;
@@ -46,28 +47,37 @@ export function OnboardingShell({ children }: { children: React.ReactNode }) {
         />
       </div>
 
-      {/* Step pills */}
+      {/* Step pills — completed steps are clickable; future steps locked.
+          Horizontal scroll on narrow screens so the row never wraps. */}
       <div className="mx-auto max-w-3xl px-4 pt-8">
-        <ol className="grid grid-cols-4 md:grid-cols-8 gap-2 mb-8">
+        <ol className="flex md:grid md:grid-cols-8 gap-2 mb-8 overflow-x-auto pb-2 md:overflow-visible">
           {STEP_ORDER.map((s, idx) => {
             const done = idx < currentIdx;
             const active = idx === currentIdx;
+            const clickable = done;
             return (
-              <li key={s} className="flex flex-col items-center gap-1">
-                <div
+              <li
+                key={s}
+                className="flex flex-col items-center gap-1 shrink-0 min-w-[64px] md:min-w-0"
+              >
+                <button
+                  type="button"
+                  onClick={clickable ? () => goTo(s) : undefined}
+                  disabled={!clickable && !active}
+                  aria-current={active ? 'step' : undefined}
+                  aria-label={`Step ${idx + 1}: ${STEP_LABELS[s]}${done ? ' (completed — click to revisit)' : active ? ' (current)' : ' (locked)'}`}
                   className={cn(
                     'grid h-7 w-7 place-items-center rounded-full border text-xs font-semibold transition-colors',
-                    done && 'bg-bw-teal border-bw-teal text-white',
-                    active && 'bg-white border-white text-deep-navy',
-                    !done && !active && 'border-white/30 bg-transparent text-white/60',
+                    done && 'bg-bw-teal border-bw-teal text-white cursor-pointer hover:ring-2 hover:ring-bw-teal/40',
+                    active && 'bg-white border-white text-deep-navy cursor-default',
+                    !done && !active && 'border-white/30 bg-transparent text-white/60 cursor-not-allowed',
                   )}
-                  aria-current={active ? 'step' : undefined}
                 >
                   {done ? <Check className="h-4 w-4" strokeWidth={2.5} /> : idx + 1}
-                </div>
+                </button>
                 <div
                   className={cn(
-                    'text-[10px] text-center hidden md:block',
+                    'text-[10px] text-center',
                     active ? 'text-white font-medium' : 'text-white/50',
                   )}
                 >
