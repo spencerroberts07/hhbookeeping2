@@ -1,0 +1,35 @@
+# Render Blueprint — defines build/deploy config for the BookWize
+# monorepo. Speeds up deploys by:
+#   1. Pinning Node 20.20.2 so the runtime isn't re-downloaded each build.
+#   2. Routing npm's cache to frontend/.npm-cache (paired with .npmrc)
+#      so package downloads can be reused between builds.
+#   3. Using buildFilter so backend-only changes don't rebuild the
+#      Next.js frontend, and frontend-only changes don't rebuild the
+#      FastAPI backend.
+#
+# NOTE: If services were created via the Render dashboard (not via this
+# Blueprint), adding this file alone does NOT auto-apply the config.
+# Either run "Sync" on the Blueprint from the dashboard, or migrate the
+# services to Blueprint-managed in Render's UI. The backend service stub
+# below intentionally omits buildCommand/startCommand so existing
+# dashboard config isn't overwritten until you explicitly opt in.
+
+services:
+  - type: web
+    name: bookwize-web
+    env: node
+    buildCommand: cd frontend && npm install --legacy-peer-deps && npm run build
+    startCommand: cd frontend && npm start
+    buildFilter:
+      paths:
+        - frontend/**
+    envVars:
+      - key: NODE_VERSION
+        value: 20.20.2
+
+  - type: web
+    name: hhbookeeping2
+    env: python
+    buildFilter:
+      paths:
+        - backend/**
