@@ -815,10 +815,31 @@ def _try_qbo_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
         if amount == 0 and not description and not ref:
             continue
 
-        if amount >= 0:
-            dr, cr = amount, Decimal("0")
+        # Sign convention. QBO's Amount column is signed by account
+        # type, not by debit/credit nature:
+        #   * Asset / COGS / Expense (1xxx, 5xxx, 6xxx, 7xxx) —
+        #     debit-normal. Positive Amount = debit increases balance,
+        #     negative = credit reduces balance.
+        #   * Liability / Equity / Revenue (2xxx, 3xxx, 4xxx) —
+        #     credit-normal. Positive Amount = credit increases balance,
+        #     negative = debit reduces balance.
+        # Treating positive=debit for every account turned revenue
+        # postings into debits and made the dashboard render
+        # negative sales / >100% margin. Classification by first
+        # digit matches reports.py and accounts._type_from_code.
+        first_digit = code[0] if code else "1"
+        credit_normal = first_digit in ("2", "3", "4")
+
+        if credit_normal:
+            if amount >= 0:
+                dr, cr = Decimal("0"), amount
+            else:
+                dr, cr = -amount, Decimal("0")
         else:
-            dr, cr = Decimal("0"), -amount
+            if amount >= 0:
+                dr, cr = amount, Decimal("0")
+            else:
+                dr, cr = Decimal("0"), -amount
 
         out.append({
             "transaction_date": txn_date,
