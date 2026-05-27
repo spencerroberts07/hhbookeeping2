@@ -1158,8 +1158,12 @@ def import_opening_balances(
 def _ensure_opening_period(session, entity_id: str, as_of_date: DateType):
     """Find or create the accounting period that contains as_of_date.
 
-    Onboarding's opening-balance period is marked closed (historical) so
-    nothing else can post into it.
+    Onboarding's opening-balance period is marked closed_locked
+    (historical) so nothing else can post into it. The status value
+    must be 'closed_locked' — that's the canonical terminal state per
+    services_period_close.STATUS_CLOSED_LOCKED, and the value strict
+    consumers (is_period_locked, assistant queries, period_close routes)
+    check for. The bare string 'closed' is not recognized.
     """
     period_start = DateType(as_of_date.year, as_of_date.month, 1)
     last_day = calendar.monthrange(period_start.year, period_start.month)[1]
@@ -1184,7 +1188,7 @@ def _ensure_opening_period(session, entity_id: str, as_of_date: DateType):
             INSERT INTO accounting_periods (
                 entity_id, period_label, period_start, period_end, status
             ) VALUES (
-                :eid, :label, :ps, :pe, 'closed'
+                :eid, :label, :ps, :pe, 'closed_locked'
             )
             RETURNING id
             """
@@ -1518,6 +1522,12 @@ def import_gl_history_from_lines(
 
 
 def _ensure_historical_period(session, entity_id: str, period_end: DateType):
+    """Find or create the accounting period for a historical-import
+    month. New periods are inserted as 'closed_locked' — the canonical
+    terminal status per services_period_close — because pre-cutover
+    history shouldn't be editable. 'closed' (without _locked) is not
+    recognized by strict consumers and must not be used.
+    """
     period_start = DateType(period_end.year, period_end.month, 1)
     row = session.execute(
         text(
@@ -1537,7 +1547,7 @@ def _ensure_historical_period(session, entity_id: str, period_end: DateType):
             INSERT INTO accounting_periods (
                 entity_id, period_label, period_start, period_end, status
             ) VALUES (
-                :eid, :label, :ps, :pe, 'closed'
+                :eid, :label, :ps, :pe, 'closed_locked'
             )
             RETURNING id
             """
