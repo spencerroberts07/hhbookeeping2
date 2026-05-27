@@ -82,6 +82,7 @@ export function StepGLHistory() {
             months_imported: 0,
             lines_created: 0,
             batches_created: 0,
+            suspense_entries: [],
           }),
           status: 'error',
           error:

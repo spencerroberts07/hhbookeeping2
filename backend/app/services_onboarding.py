@@ -1410,6 +1410,26 @@ def parse_gl_file(file_bytes: bytes, filename: str) -> list[dict[str, Any]]:
     return cleaned
 
 
+def _load_valid_account_codes(session, entity_id: str) -> set[str]:
+    """Return the set of active account codes for an entity. Used to
+    detect unknown codes during GL import so they can be rerouted to
+    suspense rather than silently posting to a non-existent code."""
+    rows = session.execute(
+        text(
+            "SELECT account_code FROM accounts "
+            "WHERE entity_id = :eid AND is_active = TRUE"
+        ),
+        {"eid": entity_id},
+    ).all()
+    return {r.account_code for r in rows}
+
+
+# Suspense account used when a parsed GL line references an
+# account_code that isn't in the entity's chart. Matches the existing
+# per-bucket balancing suspense convention (also 9999).
+SUSPENSE_ACCOUNT_CODE = "9999"
+
+
 def import_gl_history_from_lines(
     session,
     *,
@@ -1424,6 +1444,12 @@ def import_gl_history_from_lines(
 
     Each unique reference within a month becomes one journal_batch.
     Lines with no reference are bundled per-day.
+
+    Unknown-code handling: any line whose account_code isn't in the
+    entity's active chart of accounts is rewritten to SUSPENSE_ACCOUNT_CODE
+    (9999) before bucketing. The original code is stashed in source_json
+    so it can be reclassified later, and an aggregate summary is returned
+    in the result's `suspense_entries` key for the UI to surface.
     """
     if not lines:
         return {
@@ -1432,7 +1458,34 @@ def import_gl_history_from_lines(
             "months_imported": 0,
             "date_from": None,
             "date_to": None,
+            "suspense_entries": [],
         }
+
+    # Pre-flight: rewrite unknown codes to 9999 and track per-code
+    # totals so the importer's caller can warn the user about codes
+    # they need to add to their chart. We rewrite (rather than skip)
+    # so no data is lost — the lines still post, just to suspense.
+    valid_codes = _load_valid_account_codes(session, entity_id)
+    unmatched: dict[str, dict[str, Any]] = {}
+    if valid_codes:
+        for line in lines:
+            code = str(line.get("account_code") or "").strip()
+            if not code or code in valid_codes:
+                continue
+            entry = unmatched.setdefault(
+                code,
+                {"count": 0, "total_amount": Decimal("0"), "sample_name": ""},
+            )
+            entry["count"] += 1
+            entry["total_amount"] += (
+                _to_decimal(line.get("debit_amount"))
+                + _to_decimal(line.get("credit_amount"))
+            )
+            if not entry["sample_name"]:
+                entry["sample_name"] = str(line.get("account_name") or "")
+            line["_original_account_code"] = code
+            line["account_code"] = SUSPENSE_ACCOUNT_CODE
+            line["account_name"] = f"Suspense — was {code}"
 
     # Group by (month_end, reference). Lines with no reference get
     # synthesized refs keyed off the date so each day rolls up to one
@@ -1560,6 +1613,13 @@ def import_gl_history_from_lines(
                         "account_name": line.get("account_name"),
                         "counterparty_name": line.get("counterparty_name"),
                         "reference_number": line.get("reference_number"),
+                        # When a line was rerouted to 9999 because its
+                        # original code isn't in the chart, record what
+                        # the original code was. Lets the suspense
+                        # cleanup screen show "was originally 6510".
+                        "original_account_code": line.get(
+                            "_original_account_code"
+                        ),
                     }),
                 },
             )
@@ -1573,12 +1633,29 @@ def import_gl_history_from_lines(
             pct = int(idx / total_keys * 100)
             progress_callback(f"Importing {month_end.strftime('%b %Y')}", pct)
 
+    # Sort unmatched codes by count descending so the warning UI shows
+    # the most problematic codes first. Cap the list so we don't pump
+    # huge result blobs into background_jobs.result for files that
+    # touched hundreds of unknown codes.
+    suspense_entries = [
+        {
+            "account_code": code,
+            "transaction_count": int(meta["count"]),
+            "total_amount": float(meta["total_amount"]),
+            "sample_name": meta["sample_name"],
+        }
+        for code, meta in sorted(
+            unmatched.items(), key=lambda kv: kv[1]["count"], reverse=True
+        )
+    ][:200]
+
     return {
         "batches_created": batches_created,
         "lines_created": lines_created,
         "months_imported": len(months),
         "date_from": earliest.isoformat() if earliest else None,
         "date_to": latest.isoformat() if latest else None,
+        "suspense_entries": suspense_entries,
     }
 
 

@@ -18,6 +18,7 @@ from .routes.cash_balancing import router as cash_balancing_router
 from .routes.clerk_webhook import router as clerk_webhook_router
 from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
+from .routes.data_import import router as data_import_router
 from .routes.depreciation import router as depreciation_router
 from .routes.documents import router as documents_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
@@ -146,6 +147,7 @@ app.include_router(assistant_router)
 # Dealer onboarding — 8-step wizard backend (chart, opening balances,
 # GL history pull via QBO or file upload).
 app.include_router(onboarding_router)
+app.include_router(data_import_router)
 
 # Chart of accounts CRUD — app-native admin for /settings/accounts.
 app.include_router(accounts_router)

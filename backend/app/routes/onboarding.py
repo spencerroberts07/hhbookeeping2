@@ -210,17 +210,63 @@ async def pull_chart_qbo(
     _user: Any = Depends(require_role("admin")),
 ) -> dict[str, Any]:
     """Pull chart of accounts from QBO. Thin wrapper over the existing
-    import_chart_of_accounts service (reuse, don't duplicate)."""
+    import_chart_of_accounts service (reuse, don't duplicate).
+
+    Records the sync to quickbooks_sync_runs so the data-import surface
+    can show "last synced" persistently across sessions.
+    """
     enforce_entity_code(_user, request.entity_code)
     try:
         with db_session() as session:
+            entity = get_entity_by_code(session, request.entity_code)
+            if not entity:
+                raise HTTPException(404, f"Unknown entity: {request.entity_code}")
             result = await import_chart_of_accounts(session, request.entity_code)
+
+            # Log to quickbooks_sync_runs. The active QBO connection is
+            # the one import_chart_of_accounts just used; we re-query
+            # rather than thread it through the service signature.
+            conn = session.execute(
+                text(
+                    """
+                    SELECT id FROM quickbooks_connections
+                     WHERE entity_id = :eid AND is_active = TRUE
+                     ORDER BY connected_at DESC LIMIT 1
+                    """
+                ),
+                {"eid": entity["id"]},
+            ).mappings().first()
+            if conn:
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO quickbooks_sync_runs (
+                            entity_id, quickbooks_connection_id, sync_type,
+                            status, summary_json, started_at, finished_at
+                        ) VALUES (
+                            :eid, :cid, 'chart_of_accounts', 'complete',
+                            :sj, NOW(), NOW()
+                        )
+                        """
+                    ),
+                    {
+                        "eid": entity["id"],
+                        "cid": conn["id"],
+                        "sj": json.dumps({
+                            "imported_count": int(result["imported_count"]),
+                            "bank_account_count": int(result["bank_account_count"]),
+                        }),
+                    },
+                )
+
             return {
                 "entity_code": request.entity_code,
                 "account_count": result["imported_count"],
                 "bank_account_count": result["bank_account_count"],
                 "source": "qbo",
             }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -480,6 +526,108 @@ def pull_gl_history_qbo(
         raise HTTPException(400, str(exc)) from exc
 
 
+@router.post("/gl-history/preview")
+async def preview_gl_history(
+    entity_code: str = Form(...),
+    actor_email: str = Form(...),
+    file: UploadFile = File(...),
+    _user: Any = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Parse a GL file and return a summary WITHOUT writing anything.
+    Used by /settings/data-import to show the dealer what they're about
+    to import before they commit to it.
+
+    Returns:
+      - periods_detected: [{month, transaction_count}, ...]
+      - total_transactions, date_range
+      - accounts_found, unmatched_accounts, unmatched_codes
+    """
+    enforce_entity_code(_user, entity_code)
+    del actor_email  # accepted for symmetry with /upload, not used in preview
+    try:
+        file_bytes = await file.read()
+        filename = file.filename or ""
+
+        from .. import services_onboarding as _svc
+
+        # parse_gl_file already tries the regex/CSV fallback first and
+        # falls through to Claude. Synchronous — preview is one round
+        # trip, no job polling. Big files may be slow but the upload
+        # path has the same constraint.
+        lines = _svc.parse_gl_file(file_bytes, filename)
+
+        if not lines:
+            return {
+                "entity_code": entity_code,
+                "periods_detected": [],
+                "total_transactions": 0,
+                "date_range": None,
+                "accounts_found": 0,
+                "unmatched_accounts": 0,
+                "unmatched_codes": [],
+            }
+
+        # Periods — bucket by (year, month) and count.
+        from collections import Counter
+        month_counts: Counter[tuple[int, int]] = Counter()
+        codes_seen: set[str] = set()
+        earliest = None
+        latest = None
+        for line in lines:
+            d = line["transaction_date"]
+            month_counts[(d.year, d.month)] += 1
+            code = str(line.get("account_code") or "").strip()
+            if code:
+                codes_seen.add(code)
+            if earliest is None or d < earliest:
+                earliest = d
+            if latest is None or d > latest:
+                latest = d
+
+        import calendar as _cal
+        periods_detected = [
+            {
+                "month": f"{_cal.month_abbr[m]} {y}",
+                "year": y,
+                "month_num": m,
+                "transaction_count": int(n),
+            }
+            for (y, m), n in sorted(month_counts.items())
+        ]
+
+        # Compare against the entity's active chart so we can warn
+        # about codes that'll route to suspense at import time.
+        with db_session() as session:
+            entity = get_entity_by_code(session, entity_code)
+            if not entity:
+                raise HTTPException(404, f"Unknown entity: {entity_code}")
+            valid_codes = _svc._load_valid_account_codes(
+                session, str(entity["id"])
+            )
+
+        unmatched_codes = sorted(c for c in codes_seen if c not in valid_codes)
+
+        return {
+            "entity_code": entity_code,
+            "periods_detected": periods_detected,
+            "total_transactions": len(lines),
+            "date_range": {
+                "start": earliest.isoformat() if earliest else None,
+                "end": latest.isoformat() if latest else None,
+            },
+            "accounts_found": len(codes_seen),
+            "unmatched_accounts": len(unmatched_codes),
+            "unmatched_codes": unmatched_codes[:50],
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("preview_gl_history failed")
+        raise HTTPException(400, str(exc)) from exc
+
+
 @router.get("/gl-history/progress/{job_id}")
 def gl_history_progress(
     job_id: str = Path(...),
@@ -501,6 +649,11 @@ def gl_history_progress(
         if not row:
             raise HTTPException(404, f"Unknown job: {job_id}")
         result = dict(row.get("result") or {})
+        # suspense_entries is written by import_gl_history_from_lines
+        # when account codes from the file aren't in the entity's
+        # chart of accounts. Surfaces in the post-import warning card
+        # so the dealer knows which codes to add or reclassify.
+        suspense = result.get("suspense_entries") or []
         return {
             "job_id": str(row["id"]),
             "job_type": row["job_type"],
@@ -510,6 +663,7 @@ def gl_history_progress(
             "months_imported": int(result.get("months_imported") or 0),
             "lines_created": int(result.get("lines_created") or 0),
             "batches_created": int(result.get("batches_created") or 0),
+            "suspense_entries": suspense if isinstance(suspense, list) else [],
             "error": row.get("error_message"),
         }
 

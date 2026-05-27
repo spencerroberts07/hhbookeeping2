@@ -1,6 +1,5 @@
 'use client';
 
-import { useState } from 'react';
 import Link from 'next/link';
 import { useUser } from '@clerk/nextjs';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -24,10 +23,8 @@ import {
   getQuickbooksStatus,
   startQuickbooksConnect,
 } from '@/lib/api/dashboard';
-import {
-  getOnboardingStatus,
-  pullChartFromQbo,
-} from '@/lib/api/onboarding';
+import { pullChartFromQbo } from '@/lib/api/onboarding';
+import { getChartSyncStatus } from '@/lib/api/data_import';
 import { formatDate } from '@/lib/utils';
 
 // Force dynamic so Next.js doesn't try to prerender this page at
@@ -254,12 +251,14 @@ function ChartOfAccountsSection({ isAdmin }: { isAdmin: boolean }) {
   const { user } = useUser();
   const actor = user?.primaryEmailAddress?.emailAddress ?? '';
   const qc = useQueryClient();
-  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
 
+  // Persisted across browser sessions via quickbooks_sync_runs.
+  // Replaces the per-session "Never (this session)" placeholder the
+  // earlier version had.
   const status = useQuery({
-    queryKey: ['onboarding-status', entityCode],
+    queryKey: ['chart-sync-status', entityCode],
     enabled: !!entityCode,
-    queryFn: () => getOnboardingStatus(entityCode!),
+    queryFn: () => getChartSyncStatus(entityCode!),
   });
 
   const sync = useMutation({
@@ -268,17 +267,19 @@ function ChartOfAccountsSection({ isAdmin }: { isAdmin: boolean }) {
       return pullChartFromQbo({ entity_code: entityCode, actor_email: actor });
     },
     onSuccess: (res) => {
-      setLastSyncedAt(new Date());
       toast.success(
         `Synced ${res.account_count} account${res.account_count === 1 ? '' : 's'} from QuickBooks`,
       );
+      qc.invalidateQueries({ queryKey: ['chart-sync-status', entityCode] });
       qc.invalidateQueries({ queryKey: ['onboarding-status', entityCode] });
     },
     onError: (err: Error) =>
       toast.error(err.message || 'Could not sync chart of accounts'),
   });
 
-  const currentCount = status.data?.account_count ?? 0;
+  const currentCount = status.data?.accounts_count ?? 0;
+  const qboMapped = status.data?.qbo_mapped_count ?? 0;
+  const lastSyncedAt = status.data?.last_synced_at ?? null;
 
   return (
     <div className="border-t border-border pt-4 mt-4 space-y-3">
@@ -293,14 +294,17 @@ function ChartOfAccountsSection({ isAdmin }: { isAdmin: boolean }) {
       </p>
       <dl className="text-sm grid grid-cols-[120px_1fr] gap-x-3 gap-y-1 text-slate">
         <dt>Accounts loaded</dt>
-        <dd className="text-ink">{currentCount}</dd>
+        <dd className="text-ink">
+          {currentCount}
+          {qboMapped > 0 && (
+            <span className="text-slate"> · {qboMapped} mapped to QBO</span>
+          )}
+        </dd>
         <dt>Last synced</dt>
         <dd className="text-ink">
           {lastSyncedAt
-            ? formatDate(lastSyncedAt.toISOString(), 'MMM dd, yyyy HH:mm')
-            : sync.data
-              ? 'Just now'
-              : 'Never (this session)'}
+            ? formatDate(lastSyncedAt, 'MMM dd, yyyy HH:mm')
+            : 'Never'}
         </dd>
       </dl>
       <div className="flex flex-wrap items-center gap-2 pt-1">

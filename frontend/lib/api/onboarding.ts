@@ -123,6 +123,13 @@ export interface GLJobResponse {
   status: 'pending' | 'running' | 'complete' | 'error';
 }
 
+export interface SuspenseEntry {
+  account_code: string;
+  transaction_count: number;
+  total_amount: number;
+  sample_name: string;
+}
+
 export interface GLProgressResponse {
   job_id: string;
   job_type: string;
@@ -132,7 +139,25 @@ export interface GLProgressResponse {
   months_imported: number;
   lines_created: number;
   batches_created: number;
+  suspense_entries: SuspenseEntry[];
   error: string | null;
+}
+
+export interface GLPreviewPeriod {
+  month: string;
+  year: number;
+  month_num: number;
+  transaction_count: number;
+}
+
+export interface GLPreviewResponse {
+  entity_code: string;
+  periods_detected: GLPreviewPeriod[];
+  total_transactions: number;
+  date_range: { start: string | null; end: string | null } | null;
+  accounts_found: number;
+  unmatched_accounts: number;
+  unmatched_codes: string[];
 }
 
 export interface CompleteOnboardingResponse {
@@ -256,6 +281,24 @@ export async function pullOpeningBalancesFromQbo(input: {
   const res = await api.post<OpeningConfirmResponse>(
     '/api/onboarding/opening-balances/qbo',
     input,
+  );
+  return res.data;
+}
+
+export async function previewGLHistoryFile(input: {
+  entity_code: string;
+  actor_email: string;
+  file: File;
+}): Promise<GLPreviewResponse> {
+  const fd = new FormData();
+  fd.append('entity_code', input.entity_code);
+  fd.append('actor_email', input.actor_email);
+  fd.append('file', input.file);
+  // Synchronous parse — no job polling. The endpoint reads, parses,
+  // returns the period + unmatched summary, and writes nothing.
+  const res = await api.post<GLPreviewResponse>(
+    '/api/onboarding/gl-history/preview',
+    fd,
   );
   return res.data;
 }

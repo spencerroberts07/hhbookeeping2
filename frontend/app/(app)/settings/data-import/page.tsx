@@ -7,7 +7,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Topbar } from '@/components/layout/topbar';
 import {
@@ -21,14 +20,18 @@ import {
 import { toast } from 'sonner';
 import { useEntityStore } from '@/lib/store/entity';
 import { useIsAdmin } from '@/lib/store/user';
+import Link from 'next/link';
 import {
   confirmOpeningBalances,
   getGLHistoryProgress,
   getOnboardingStatus,
   getOpeningBalancesParseProgress,
+  previewGLHistoryFile,
   startGLHistoryFromFile,
   uploadOpeningBalancesFile,
+  type GLPreviewResponse,
   type GLProgressResponse,
+  type SuspenseEntry,
   type TbPreviewLine,
 } from '@/lib/api/onboarding';
 import { formatMoney } from '@/lib/utils';
@@ -531,7 +534,6 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
   useEffect(() => {
-    // Seed defaults: 1 year window ending today.
     if (!dateFrom) {
       const d = new Date();
       d.setFullYear(d.getFullYear() - 1);
@@ -542,6 +544,11 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
     }
   }, [dateFrom, dateTo]);
 
+  // Two-step flow: file -> preview (parse only, no write) -> confirm
+  // -> background job + polling. The File reference has to survive
+  // the preview round-trip so the same bytes drive both endpoints.
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<GLPreviewResponse | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [progress, setProgress] = useState<GLProgressResponse | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -570,6 +577,7 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
             months_imported: 0,
             lines_created: 0,
             batches_created: 0,
+            suspense_entries: [],
           }),
           status: 'error',
           error:
@@ -598,7 +606,18 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
     }, 3000);
   };
 
-  const upload = useMutation({
+  const previewMutation = useMutation({
+    mutationFn: (file: File) =>
+      previewGLHistoryFile({
+        entity_code: entityCode,
+        actor_email: actor,
+        file,
+      }),
+    onSuccess: (res) => setPreview(res),
+    onError: (err: Error) => toast.error(err.message || 'Preview failed'),
+  });
+
+  const importMutation = useMutation({
     mutationFn: (file: File) =>
       startGLHistoryFromFile({
         entity_code: entityCode,
@@ -610,15 +629,38 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
     onSuccess: (res) => {
       setJobId(res.job_id);
       startPolling(res.job_id);
-      toast.info('GL parse started — this can take a few minutes');
+      setPreview(null);
+      setPendingFile(null);
+      toast.info('GL import started — this can take a few minutes');
     },
     onError: (err: Error) => toast.error(err.message || 'Upload failed'),
   });
+
+  const onFilePicked = (file: File) => {
+    setPendingFile(file);
+    setPreview(null);
+    previewMutation.mutate(file);
+  };
+
+  const cancelPreview = () => {
+    setPreview(null);
+    setPendingFile(null);
+    previewMutation.reset();
+  };
+
+  const confirmImport = () => {
+    if (!pendingFile) return;
+    importMutation.mutate(pendingFile);
+  };
 
   const reset = () => {
     stopPolling();
     setJobId(null);
     setProgress(null);
+    setPreview(null);
+    setPendingFile(null);
+    previewMutation.reset();
+    importMutation.reset();
   };
 
   return (
@@ -633,8 +675,7 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
         <p className="text-sm text-slate">
           Import historical GL transactions from QBO. In QBO:{' '}
           <strong>Reports → General Ledger</strong>, set the date range, then
-          export as CSV. The importer groups transactions by month and
-          period — each month becomes its own journal batch.
+          export as CSV. We'll show you a preview before anything is written.
         </p>
 
         {status.data?.has_gl_history && status.data.gl_history_from && (
@@ -661,7 +702,7 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
               type="date"
               value={dateFrom}
               onChange={(e) => setDateFrom(e.target.value)}
-              disabled={!!jobId}
+              disabled={!!jobId || !!preview}
             />
           </div>
           <div>
@@ -671,12 +712,12 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
               type="date"
               value={dateTo}
               onChange={(e) => setDateTo(e.target.value)}
-              disabled={!!jobId}
+              disabled={!!jobId || !!preview}
             />
           </div>
         </div>
 
-        {!jobId && (
+        {!jobId && !preview && (
           <div>
             <input
               ref={fileRef}
@@ -685,16 +726,21 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
-                if (f) upload.mutate(f);
+                if (f) onFilePicked(f);
                 e.target.value = '';
               }}
             />
             <Button
               variant="outline"
               onClick={() => fileRef.current?.click()}
-              disabled={!isAdmin || upload.isPending || !dateFrom || !dateTo}
+              disabled={
+                !isAdmin ||
+                previewMutation.isPending ||
+                !dateFrom ||
+                !dateTo
+              }
             >
-              {upload.isPending ? (
+              {previewMutation.isPending ? (
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
               ) : (
                 <Upload className="h-4 w-4 mr-2" />
@@ -702,9 +748,19 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
               Upload GL CSV
             </Button>
             <p className="text-xs text-slate mt-1">
-              Accepts: .csv, .xlsx, .xls, .txt
+              Accepts: .csv, .xlsx, .xls, .txt. We'll parse and preview
+              before writing anything.
             </p>
           </div>
+        )}
+
+        {preview && !jobId && (
+          <PreviewPanel
+            preview={preview}
+            confirming={importMutation.isPending}
+            onCancel={cancelPreview}
+            onConfirm={confirmImport}
+          />
         )}
 
         {jobId && progress && progress.status !== 'complete' && progress.status !== 'error' && (
@@ -731,21 +787,26 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
         )}
 
         {jobId && progress?.status === 'complete' && (
-          <div className="rounded-md border border-bw-teal/30 bg-bw-teal/5 p-4 space-y-1 text-sm">
-            <div className="flex items-center gap-2 font-semibold text-deep-navy">
-              <CheckCircle2 className="h-4 w-4 text-bw-teal" />
-              Import complete
+          <>
+            <div className="rounded-md border border-bw-teal/30 bg-bw-teal/5 p-4 space-y-1 text-sm">
+              <div className="flex items-center gap-2 font-semibold text-deep-navy">
+                <CheckCircle2 className="h-4 w-4 text-bw-teal" />
+                Import complete
+              </div>
+              <div className="text-xs text-slate ml-6">
+                {progress.months_imported} months · {progress.lines_created} lines ·{' '}
+                {progress.batches_created} batches
+              </div>
+              <div className="ml-6 pt-1">
+                <Button variant="outline" size="sm" onClick={reset}>
+                  Import another range
+                </Button>
+              </div>
             </div>
-            <div className="text-xs text-slate ml-6">
-              {progress.months_imported} months · {progress.lines_created} lines ·{' '}
-              {progress.batches_created} batches
-            </div>
-            <div className="ml-6 pt-1">
-              <Button variant="outline" size="sm" onClick={reset}>
-                Import another range
-              </Button>
-            </div>
-          </div>
+            {progress.suspense_entries.length > 0 && (
+              <SuspenseBreakdown entries={progress.suspense_entries} />
+            )}
+          </>
         )}
 
         {jobId && progress?.status === 'error' && (
@@ -768,13 +829,166 @@ function GLImportSection({ entityCode }: { entityCode: string }) {
             Admin role required to run GL imports.
           </p>
         )}
-
-        <Badge variant="secondary" className="font-normal">
-          Tip: the importer reuses {entityCode}'s existing chart of accounts.
-          Unrecognized codes get an auto-balancing line in account 9999 so
-          imports always post; clean those up from the suspense report later.
-        </Badge>
       </CardContent>
     </Card>
+  );
+}
+
+function PreviewPanel({
+  preview,
+  confirming,
+  onCancel,
+  onConfirm,
+}: {
+  preview: GLPreviewResponse;
+  confirming: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const hasUnmatched = preview.unmatched_accounts > 0;
+  return (
+    <div className="rounded-md border border-border p-4 space-y-3 text-sm">
+      <div className="font-semibold text-deep-navy">File ready to import</div>
+
+      {preview.periods_detected.length > 0 ? (
+        <div>
+          <div className="text-xs text-slate mb-1">Periods detected:</div>
+          <ul className="space-y-0.5">
+            {preview.periods_detected.map((p) => (
+              <li key={`${p.year}-${p.month_num}`} className="text-ink">
+                {p.month} — {p.transaction_count.toLocaleString()} transaction
+                {p.transaction_count === 1 ? '' : 's'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <p className="text-slate">
+          No transactions detected in the file. Check the format and try again.
+        </p>
+      )}
+
+      <dl className="grid grid-cols-[140px_1fr] gap-x-3 gap-y-1 text-xs">
+        <dt className="text-slate">Total transactions</dt>
+        <dd className="text-ink font-semibold">
+          {preview.total_transactions.toLocaleString()}
+        </dd>
+        {preview.date_range?.start && preview.date_range?.end && (
+          <>
+            <dt className="text-slate">Date range</dt>
+            <dd className="text-ink">
+              {preview.date_range.start} → {preview.date_range.end}
+            </dd>
+          </>
+        )}
+        <dt className="text-slate">Accounts found</dt>
+        <dd className="text-ink">{preview.accounts_found}</dd>
+      </dl>
+
+      {hasUnmatched && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold">
+                {preview.unmatched_accounts} unmatched account code
+                {preview.unmatched_accounts === 1 ? '' : 's'}:{' '}
+                <span className="font-mono">
+                  {preview.unmatched_codes.slice(0, 6).join(', ')}
+                  {preview.unmatched_codes.length > 6 ? '…' : ''}
+                </span>
+              </div>
+              <div className="mt-1">
+                These codes don't exist in your chart of accounts. Importing
+                will route them to suspense (account 9999). You can add them
+                to your chart via Sync chart of accounts on the Integrations
+                page, then re-import.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2 pt-1">
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={confirming}>
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          onClick={onConfirm}
+          disabled={confirming || preview.total_transactions === 0}
+        >
+          {confirming ? (
+            <>
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              Starting…
+            </>
+          ) : (
+            <>Import {preview.total_transactions.toLocaleString()} transactions</>
+          )}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function SuspenseBreakdown({ entries }: { entries: SuspenseEntry[] }) {
+  return (
+    <div className="rounded-md border-2 border-amber-300 bg-amber-50 p-4 text-sm">
+      <div className="flex items-center gap-2 font-semibold text-amber-900">
+        <AlertTriangle className="h-4 w-4" />
+        {entries.length} account code{entries.length === 1 ? '' : 's'} routed
+        to suspense (9999)
+      </div>
+      <div className="mt-3 overflow-x-auto rounded-md border border-amber-200 bg-white">
+        <table className="min-w-full text-xs">
+          <thead className="bg-amber-100/60">
+            <tr>
+              <th className="text-left px-2 py-1.5 font-semibold text-amber-900">
+                Code
+              </th>
+              <th className="text-left px-2 py-1.5 font-semibold text-amber-900">
+                Name (sample)
+              </th>
+              <th className="text-right px-2 py-1.5 font-semibold text-amber-900">
+                Transactions
+              </th>
+              <th className="text-right px-2 py-1.5 font-semibold text-amber-900">
+                Amount
+              </th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-amber-100">
+            {entries.map((e) => (
+              <tr key={e.account_code}>
+                <td className="px-2 py-1 font-mono text-ink">{e.account_code}</td>
+                <td className="px-2 py-1 text-ink truncate max-w-[200px]">
+                  {e.sample_name || '—'}
+                </td>
+                <td className="px-2 py-1 text-right tabular-nums text-ink">
+                  {e.transaction_count.toLocaleString()}
+                </td>
+                <td className="px-2 py-1 text-right tabular-nums text-ink">
+                  {formatMoney(e.total_amount)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-3 text-xs text-amber-900/80">
+        These codes don't exist in your chart of accounts. Add them and
+        re-import to land the transactions on the right accounts, or
+        manually reclassify the suspense entries.
+      </p>
+      <div className="mt-2">
+        <Link
+          href="/settings/integrations"
+          className="inline-flex items-center gap-1 text-xs font-semibold text-ledger-blue hover:underline"
+        >
+          Go to chart of accounts →
+        </Link>
+      </div>
+    </div>
   );
 }
