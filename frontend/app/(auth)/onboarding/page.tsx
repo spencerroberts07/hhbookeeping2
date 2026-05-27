@@ -47,6 +47,14 @@ function OnboardingContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const force = searchParams.get('force') === 'true';
+  // QBO OAuth callback marker. The backend redirects here with this
+  // query param after a successful authorize-and-exchange round-trip.
+  // We have to suppress the onboarding_complete dashboard-redirect
+  // while it's present, otherwise dealers who are reconnecting QBO
+  // post-onboarding get bounced away before step-connect can clean
+  // up its OAUTH_PENDING_KEY localStorage marker.
+  const qboCallback = searchParams.get('qbo');
+  const isQboCallback = qboCallback === 'connected' || qboCallback === 'failed';
   const { isLoaded, isSignedIn } = useUser();
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const currentStep = useOnboardingStore((s) => s.currentStep);
@@ -64,8 +72,19 @@ function OnboardingContent() {
 
   useEffect(() => {
     if (!status.data) return;
-    if (status.data.onboarding_complete && !force) {
+    // Skip the dashboard redirect when:
+    //   - ?force=true is set (explicit re-entry), or
+    //   - ?qbo=connected|failed is set (we just came back from Intuit
+    //     and step-connect needs to render its success/failure state).
+    if (status.data.onboarding_complete && !force && !isQboCallback) {
       router.replace('/dashboard');
+      return;
+    }
+    // If we're returning from the OAuth flow, land on the Connect
+    // step so the user sees the success/failure feedback rather than
+    // wherever they were previously parked in the wizard.
+    if (isQboCallback && currentStep !== 'connect') {
+      goTo('connect');
       return;
     }
     const hasAnyData =
@@ -77,7 +96,7 @@ function OnboardingContent() {
       else if (!status.data.has_gl_history) goTo('gl-history');
       else goTo('hh-ap');
     }
-  }, [status.data, currentStep, goTo, router, force]);
+  }, [status.data, currentStep, goTo, router, force, isQboCallback]);
 
   // Surface an explicit error / timeout UI when the status query
   // can't resolve — otherwise users sit on the page-level skeleton
