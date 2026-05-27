@@ -246,6 +246,270 @@ export async function getPaystubDownload(
   return res.data;
 }
 
+// ===== Tier-2 additions =====
+
+// ---------- F1 variance alerts ----------
+
+export type VarianceSeverity = 'block' | 'warn' | 'info';
+
+export interface PayrollRunVariance {
+  id: string;
+  employee_id: string;
+  employee_name: string;
+  variance_type: string;
+  severity: VarianceSeverity;
+  previous_value: number | null;
+  current_value: number | null;
+  change_pct: number | null;
+  message: string;
+  acknowledged: boolean;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  created_at: string | null;
+}
+
+export async function analyzeRunVariances(
+  payrollRunId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{
+  payroll_run_id: string;
+  variances: Array<Omit<PayrollRunVariance, 'id' | 'acknowledged' | 'acknowledged_by' | 'acknowledged_at' | 'created_at'>>;
+  counts: { block: number; warn: number; info: number };
+}> {
+  const res = await api.post(`/api/payroll/runs/${payrollRunId}/analyze-variances`, body);
+  return res.data;
+}
+
+export async function listRunVariances(
+  entityCode: string,
+  payrollRunId: string,
+): Promise<{ payroll_run_id: string; variances: PayrollRunVariance[]; count: number }> {
+  const res = await api.get(`/api/payroll/runs/${payrollRunId}/variances`, {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}
+
+export async function acknowledgeVariance(
+  payrollRunId: string,
+  varianceId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{ ok: boolean; variance_id: string }> {
+  const res = await api.post(
+    `/api/payroll/runs/${payrollRunId}/variances/${varianceId}/acknowledge`,
+    body,
+  );
+  return res.data;
+}
+
+// ---------- F2 EFT-sent confirmation ----------
+
+export async function markEftSent(
+  payrollRunId: string,
+  body: { entity_code: string; actor_email: string; notes?: string | null },
+): Promise<{ ok: boolean }> {
+  const res = await api.post(`/api/payroll/runs/${payrollRunId}/mark-eft-sent`, body);
+  return res.data;
+}
+
+export async function markEmployeesPaid(
+  payrollRunId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{ ok: boolean }> {
+  const res = await api.post(`/api/payroll/runs/${payrollRunId}/mark-employees-paid`, body);
+  return res.data;
+}
+
+// ---------- F3 retro + correction runs ----------
+
+export interface RetroPeriod {
+  payroll_run_id: string;
+  period_start: string;
+  period_end: string;
+  pay_date: string;
+  hours: number;
+  old_gross: number;
+  new_gross: number;
+  delta: number;
+}
+
+export interface RetroCalcResponse {
+  employee_id: string;
+  employee_name: string;
+  old_rate: number;
+  new_rate: number;
+  effective_date: string;
+  retro_amount_gross: number;
+  estimated_cpp: number;
+  estimated_ei: number;
+  estimated_fed_tax: number;
+  estimated_net: number;
+  note: string;
+  periods: RetroPeriod[];
+}
+
+export async function calculateRetro(input: {
+  entity_code: string;
+  employee_id: string;
+  old_rate: number;
+  new_rate: number;
+  effective_date: string;
+}): Promise<RetroCalcResponse> {
+  const res = await api.post('/api/payroll/calculate-retro', input);
+  return res.data;
+}
+
+export interface CorrectionEmployeeSpec {
+  employee_id: string;
+  override_gross?: number;
+  retro_old_rate?: number;
+  retro_new_rate?: number;
+  retro_periods?: number;
+  hours_per_period?: number;
+}
+
+export async function createCorrectionRun(input: {
+  entity_code: string;
+  actor_email: string;
+  run_type: 'correction' | 'bonus' | 'retroactive' | 'offcycle';
+  description: string;
+  period_start: string;
+  period_end: string;
+  pay_date: string;
+  parent_run_id?: string | null;
+  employees: CorrectionEmployeeSpec[];
+}): Promise<{
+  ok: boolean;
+  payroll_run_id: string;
+  pay_run_number: string;
+  run_type: string;
+  total_gross: number;
+  total_net: number;
+}> {
+  const res = await api.post('/api/payroll/runs/create-correction', input);
+  return res.data;
+}
+
+// ---------- F4 employee history + employment record ----------
+
+export interface PayHistoryLine {
+  payroll_run_id: string;
+  pay_run_number: string;
+  run_type: string;
+  period_start: string | null;
+  period_end: string | null;
+  pay_date: string | null;
+  total_hours: number;
+  gross_pay: number;
+  net_pay: number;
+  cpp_ee: number;
+  ei_ee: number;
+  fed_tax: number;
+  vacation_earned: number;
+  vacation_paid: number;
+  stat_pay: number;
+}
+
+export async function getEmployeeHistory(
+  entityCode: string,
+  employeeId: string,
+): Promise<{ employee_id: string; employee_name: string; history: PayHistoryLine[]; count: number }> {
+  const res = await api.get(`/api/payroll/employees/${employeeId}/history`, {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}
+
+export async function generateEmploymentRecord(
+  employeeId: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{
+  ok: boolean;
+  file_name: string;
+  r2_uploaded: boolean;
+  download_url: string | null;
+  pdf_base64: string | null;
+}> {
+  const res = await api.post(
+    `/api/payroll/employees/${employeeId}/employment-record`,
+    body,
+  );
+  return res.data;
+}
+
+// ---------- F5 T4 generation ----------
+
+export interface T4Row {
+  id: string;
+  employee_id: string;
+  employee_name: string;
+  employee_number: number | null;
+  calendar_year: number;
+  box_14: number;
+  box_16: number;
+  box_18: number;
+  box_22: number;
+  box_24: number;
+  box_26: number;
+  box_40: number;
+  file_name: string | null;
+  r2_uploaded: boolean;
+  generated_at: string | null;
+  filed_with_cra: boolean;
+  filed_at: string | null;
+}
+
+export async function generateT4s(body: {
+  entity_code: string;
+  actor_email: string;
+  calendar_year: number;
+}): Promise<{
+  ok: boolean;
+  calendar_year: number;
+  employees_count: number;
+  r2_upload_failures: number;
+  totals: { employment_income: number; cpp: number; ei: number; tax: number };
+  results: Array<{
+    t4_id: string | null;
+    employee_id: string;
+    employee_name: string;
+    file_name: string;
+    r2_uploaded: boolean;
+    box_14: number;
+  }>;
+}> {
+  const res = await api.post('/api/payroll/t4s/generate', body);
+  return res.data;
+}
+
+export async function listT4s(
+  entityCode: string,
+  calendarYear: number,
+): Promise<{ calendar_year: number; t4s: T4Row[]; count: number }> {
+  const res = await api.get('/api/payroll/t4s', {
+    params: { entity_code: entityCode, calendar_year: calendarYear },
+  });
+  return res.data;
+}
+
+export async function getT4Download(
+  entityCode: string,
+  t4Id: string,
+): Promise<{ file_name: string; download_url: string; expires_in_seconds: number }> {
+  const res = await api.get(`/api/payroll/t4s/${t4Id}/download`, {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}
+
+export async function markT4Filed(
+  t4Id: string,
+  body: { entity_code: string; actor_email: string },
+): Promise<{ ok: boolean }> {
+  const res = await api.post(`/api/payroll/t4s/${t4Id}/mark-filed`, body);
+  return res.data;
+}
+
 export interface PayrollRun {
   id: string;
   pay_run_number: string;

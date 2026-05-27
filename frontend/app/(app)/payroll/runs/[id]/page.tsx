@@ -22,9 +22,16 @@ import {
   generatePaystubs,
   listRunPaystubs,
   getPaystubDownload,
+  analyzeRunVariances,
+  listRunVariances,
+  acknowledgeVariance,
+  markEftSent,
+  markEmployeesPaid,
   type PayrollRunDetail,
+  type PayrollRunVariance,
+  type VarianceSeverity,
 } from '@/lib/api/payroll';
-import { formatMoney, formatDate } from '@/lib/utils';
+import { formatMoney, formatDate, cn } from '@/lib/utils';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -148,12 +155,20 @@ export default function PayrollRunDetailPage() {
           <>
             <RunHeader detail={q.data} />
 
+            <VarianceBanner
+              entityCode={entityCode}
+              runId={runId}
+              actorEmail={actorEmail}
+            />
+
             <RegisterTable detail={q.data} />
 
             <CraSummary detail={q.data} />
 
             <Workflow
               detail={q.data}
+              entityCode={entityCode}
+              runId={runId}
               onBuildJournal={() => buildJournal.mutate()}
               onSubmit={() => submit.mutate()}
               onApprove={() => approve.mutate()}
@@ -169,10 +184,17 @@ export default function PayrollRunDetailPage() {
               generatePending={generateEft.isPending}
             />
 
+            <EftSendStep
+              entityCode={entityCode}
+              runId={runId}
+              actorEmail={actorEmail}
+              detail={q.data}
+            />
+
             <PaystubsStep
               entityCode={entityCode}
               runId={runId}
-              eligible={['approved', 'approved_to_post', 'posted', 'paid'].includes(
+              eligible={['approved', 'approved_to_post', 'posted', 'eft_sent', 'paid'].includes(
                 q.data.run.workflow_status || q.data.run.status,
               )}
               actorEmail={actorEmail}
@@ -472,6 +494,8 @@ function CraSummary({ detail }: { detail: PayrollRunDetail }) {
 
 function Workflow({
   detail,
+  entityCode,
+  runId,
   onBuildJournal,
   onSubmit,
   onApprove,
@@ -480,6 +504,8 @@ function Workflow({
   approvePending,
 }: {
   detail: PayrollRunDetail;
+  entityCode: string;
+  runId: string;
   onBuildJournal: () => void;
   onSubmit: () => void;
   onApprove: () => void;
@@ -489,6 +515,17 @@ function Workflow({
 }) {
   const wf = detail.run.workflow_status || detail.run.status;
   const hasJournal = !!detail.run.journal_batch_id;
+  // Approve is locked while any 'block' variance is unacknowledged.
+  const variances = useQuery({
+    queryKey: ['run-variances', entityCode, runId],
+    enabled: !!entityCode && !!runId,
+    queryFn: () => listRunVariances(entityCode, runId),
+    retry: false,
+  });
+  const blockingCount = (variances.data?.variances ?? []).filter(
+    (v) => v.severity === 'block' && !v.acknowledged,
+  ).length;
+  const approveLocked = blockingCount > 0;
   return (
     <Card>
       <CardHeader>
@@ -514,16 +551,280 @@ function Workflow({
           </Button>
           <Button
             onClick={onApprove}
-            disabled={approvePending || wf !== 'submitted_for_review'}
+            disabled={approvePending || wf !== 'submitted_for_review' || approveLocked}
+            title={approveLocked ? `${blockingCount} blocking variance(s) — acknowledge first` : ''}
           >
             {approvePending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-            Approve
+            {approveLocked ? `🔒 Approve (${blockingCount} blocks)` : 'Approve'}
           </Button>
         </div>
         {!hasJournal && (
           <p className="text-xs text-slate">
             Build the journal first — submit and EFT generation both require it.
           </p>
+        )}
+        {approveLocked && (
+          <p className="text-xs text-amber-700">
+            {blockingCount} blocking variance{blockingCount === 1 ? '' : 's'} above — acknowledge each before approving.
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ----------------------------------------------------------------------
+// F1 — Variance alert banner
+// ----------------------------------------------------------------------
+
+function VarianceBanner({
+  entityCode,
+  runId,
+  actorEmail,
+}: {
+  entityCode: string;
+  runId: string;
+  actorEmail: string;
+}) {
+  const qc = useQueryClient();
+  const list = useQuery({
+    queryKey: ['run-variances', entityCode, runId],
+    enabled: !!entityCode && !!runId,
+    queryFn: () => listRunVariances(entityCode, runId),
+    retry: false,
+  });
+  const analyze = useMutation({
+    mutationFn: () =>
+      analyzeRunVariances(runId, { entity_code: entityCode, actor_email: actorEmail }),
+    onSuccess: (res) => {
+      toast.success(
+        `Variance analysis: ${res.counts.block} block · ${res.counts.warn} warn · ${res.counts.info} info`,
+      );
+      qc.invalidateQueries({ queryKey: ['run-variances', entityCode, runId] });
+    },
+    onError: () => toast.error('Variance analysis failed'),
+  });
+  const ack = useMutation({
+    mutationFn: (varianceId: string) =>
+      acknowledgeVariance(runId, varianceId, {
+        entity_code: entityCode,
+        actor_email: actorEmail,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['run-variances', entityCode, runId] });
+    },
+  });
+
+  const variances = list.data?.variances ?? [];
+  const grouped: Record<VarianceSeverity, PayrollRunVariance[]> = {
+    block: variances.filter((v) => v.severity === 'block'),
+    warn: variances.filter((v) => v.severity === 'warn'),
+    info: variances.filter((v) => v.severity === 'info'),
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center justify-between text-base">
+          <span>Variance alerts</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => analyze.mutate()}
+            disabled={analyze.isPending}
+          >
+            {analyze.isPending && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+            {variances.length === 0 ? 'Analyze' : 'Re-analyze'}
+          </Button>
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {variances.length === 0 ? (
+          <p className="text-xs text-slate">
+            No analysis yet — click "Analyze" to scan this run against the previous one.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {(['block', 'warn', 'info'] as const).map((sev) =>
+              grouped[sev].length === 0 ? null : (
+                <VarianceGroup
+                  key={sev}
+                  severity={sev}
+                  rows={grouped[sev]}
+                  onAck={(id) => ack.mutate(id)}
+                  ackPending={ack.isPending}
+                />
+              ),
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function VarianceGroup({
+  severity,
+  rows,
+  onAck,
+  ackPending,
+}: {
+  severity: VarianceSeverity;
+  rows: PayrollRunVariance[];
+  onAck: (id: string) => void;
+  ackPending: boolean;
+}) {
+  const styles =
+    severity === 'block'
+      ? 'border-red-300 bg-red-50 text-red-900'
+      : severity === 'warn'
+        ? 'border-amber-300 bg-amber-50 text-amber-900'
+        : 'border-ledger-blue/30 bg-ledger-blue/5 text-deep-navy';
+  const label =
+    severity === 'block'
+      ? '🔴 Block — must acknowledge'
+      : severity === 'warn'
+        ? '🟡 Warn — review before approving'
+        : 'ℹ️ Info';
+  return (
+    <div className={cn('rounded-md border p-2 space-y-1', styles)}>
+      <div className="text-xs font-semibold">{label}</div>
+      <ul className="space-y-1">
+        {rows.map((r) => (
+          <li
+            key={r.id}
+            className="flex items-start justify-between gap-2 text-xs"
+          >
+            <span className="flex-1">{r.message}</span>
+            {r.acknowledged ? (
+              <span className="text-bw-teal whitespace-nowrap">
+                ✓ {r.acknowledged_by ?? ''}
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onAck(r.id)}
+                disabled={ackPending}
+                className="text-ledger-blue underline disabled:opacity-50 whitespace-nowrap"
+              >
+                Acknowledge
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------
+// F2 — Mark EFT sent + Mark employees paid
+// ----------------------------------------------------------------------
+
+function EftSendStep({
+  entityCode,
+  runId,
+  actorEmail,
+  detail,
+}: {
+  entityCode: string;
+  runId: string;
+  actorEmail: string;
+  detail: PayrollRunDetail;
+}) {
+  const qc = useQueryClient();
+  const [notes, setNotes] = useState('');
+  // We need eft_sent_at / employees_paid_at — not on PayrollRunDetail
+  // type yet. Re-fetch the run via the existing query and read from
+  // summary_json if backend mirrors it; otherwise we just optimistically
+  // toggle on success.
+  const sent = useMutation({
+    mutationFn: () =>
+      markEftSent(runId, { entity_code: entityCode, actor_email: actorEmail, notes }),
+    onSuccess: () => {
+      toast.success('EFT marked as sent to TD');
+      qc.invalidateQueries({ queryKey: ['payroll-run', entityCode, runId] });
+    },
+    onError: (err) => {
+      const detailMsg = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
+      toast.error(detailMsg ?? 'Mark sent failed');
+    },
+  });
+  const paid = useMutation({
+    mutationFn: () =>
+      markEmployeesPaid(runId, { entity_code: entityCode, actor_email: actorEmail }),
+    onSuccess: () => {
+      toast.success('Employees marked as paid');
+      qc.invalidateQueries({ queryKey: ['payroll-run', entityCode, runId] });
+    },
+    onError: (err) => {
+      const detailMsg = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
+      toast.error(detailMsg ?? 'Mark paid failed');
+    },
+  });
+
+  const wf = detail.run.workflow_status || detail.run.status;
+  const isEftSent = wf === 'eft_sent' || wf === 'paid';
+  const isPaid = wf === 'paid';
+  const eligible = ['approved', 'approved_to_post', 'posted', 'eft_sent', 'paid'].includes(wf);
+
+  if (!eligible) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Step 5 — TD upload + payment confirmation</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        {!isEftSent ? (
+          <>
+            <ol className="space-y-1 text-xs text-slate list-decimal list-inside">
+              <li>Download the EFT file from Step 4 above.</li>
+              <li>Log into TD Commercial Banking.</li>
+              <li>File Transfer → upload the .txt file.</li>
+              <li>Authorize payments in the TD portal.</li>
+              <li>Come back here and click "Mark EFT as Sent".</li>
+            </ol>
+            <div>
+              <label className="text-xs text-slate block mb-1">
+                Notes (optional)
+              </label>
+              <input
+                type="text"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g. uploaded to TD Web Business Banking 9:15am"
+                className="w-full text-xs rounded-md border border-input px-2 py-1.5"
+              />
+            </div>
+            <Button onClick={() => sent.mutate()} disabled={sent.isPending}>
+              {sent.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Mark EFT as Sent to TD
+            </Button>
+          </>
+        ) : (
+          <div className="rounded-md border border-bw-teal/30 bg-bw-teal/5 p-3 text-xs space-y-1">
+            <div className="flex items-center gap-2 text-bw-teal font-semibold">
+              <CheckCircle2 className="h-4 w-4" /> EFT sent to TD
+            </div>
+            <p className="text-slate">
+              Funds typically arrive next business day. Click below once employees confirm receipt.
+            </p>
+            {!isPaid ? (
+              <Button
+                size="sm"
+                onClick={() => paid.mutate()}
+                disabled={paid.isPending}
+              >
+                {paid.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                Mark Employees as Paid
+              </Button>
+            ) : (
+              <div className="text-bw-teal font-semibold flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4" /> Employees paid — run complete
+              </div>
+            )}
+          </div>
         )}
       </CardContent>
     </Card>

@@ -56,12 +56,20 @@ export default function PayrollPage() {
             </TabButton>
           </nav>
           {tab === 'runs' && (
-            <Link href="/payroll/new">
-              <Button variant="accent">
-                <Plus className="h-4 w-4" strokeWidth={1.5} />
-                New pay run
-              </Button>
-            </Link>
+            <div className="flex items-center gap-2">
+              <Link href="/payroll/t4s">
+                <Button variant="outline">T4 slips</Button>
+              </Link>
+              <Link href="/payroll/off-cycle/new">
+                <Button variant="outline">Off-cycle run</Button>
+              </Link>
+              <Link href="/payroll/new">
+                <Button variant="accent">
+                  <Plus className="h-4 w-4" strokeWidth={1.5} />
+                  New pay run
+                </Button>
+              </Link>
+            </div>
           )}
         </div>
 

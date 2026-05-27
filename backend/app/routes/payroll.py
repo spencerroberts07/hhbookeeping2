@@ -623,15 +623,63 @@ def post_approve(
     payroll_run_id: str = Path(...),
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
+    """Approve a payroll run for posting.
+
+    Tier-2 addition: if any payroll_run_variances row for this run has
+    severity='block' AND acknowledged=FALSE, the approve refuses with
+    409. Caller must acknowledge each block via
+    POST /runs/{id}/variances/{vid}/acknowledge first.
+    """
+    from sqlalchemy import text as _text
+    from .. import services_payroll_variance as _var
+
     enforce_entity_code(_user, body.entity_code)
     try:
         with db_session() as session:
+            # Block check — variances are per-run, not per-entity, so
+            # no extra entity scoping needed.
+            if _var.has_unacknowledged_blocks(
+                session, payroll_run_id=payroll_run_id
+            ):
+                blocking = session.execute(
+                    _text(
+                        """
+                        SELECT id, employee_id, variance_type, message
+                          FROM payroll_run_variances
+                         WHERE payroll_run_id = :rid
+                           AND severity = 'block'
+                           AND acknowledged = FALSE
+                        """
+                    ),
+                    {"rid": payroll_run_id},
+                ).mappings().all()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "unacknowledged_blocking_variances",
+                        "message": (
+                            "Approve refused — acknowledge every "
+                            "blocking variance before retrying."
+                        ),
+                        "blocking_variances": [
+                            {
+                                "id": str(b["id"]),
+                                "employee_id": str(b["employee_id"]),
+                                "variance_type": b["variance_type"],
+                                "message": b["message"],
+                            }
+                            for b in blocking
+                        ],
+                    },
+                )
             return approve_payroll_run(
                 session,
                 entity_code=body.entity_code,
                 payroll_run_id=payroll_run_id,
                 actor_email=body.actor_email,
             )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1712,3 +1760,897 @@ def get_paystub_download(
         "expires_in_seconds": 3600,
         "generated_at": row["generated_at"].isoformat() if row["generated_at"] else None,
     }
+
+
+# ======================================================================
+# Tier-2 additions — Features 1, 2, 3, 4, 5
+# ======================================================================
+
+
+# ----------------------------------------------------------------------
+# Feature 1 — Variance alerts
+# ----------------------------------------------------------------------
+
+
+@router.post("/runs/{payroll_run_id}/analyze-variances")
+def post_analyze_variances(
+    body: WorkflowRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Analyze the run for variances vs the previous run and persist
+    the result. Idempotent — re-analysis drops non-acknowledged rows.
+    Returns the full list grouped by severity."""
+    from sqlalchemy import text as _text
+    from .. import services_payroll_variance as _var
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        run = session.execute(
+            _text(
+                "SELECT id FROM payroll_runs WHERE id = :rid AND entity_id = :eid"
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not run:
+            raise HTTPException(404, "Payroll run not found for this entity")
+        variances = _var.analyze_run_variances(
+            session, payroll_run_id=payroll_run_id, entity_id=entity["id"]
+        )
+        _var.persist_variances(
+            session, payroll_run_id=payroll_run_id,
+            entity_id=entity["id"], variances=variances,
+        )
+    return {
+        "payroll_run_id": payroll_run_id,
+        "variances": [
+            {
+                "employee_id": v.employee_id,
+                "employee_name": v.employee_name,
+                "variance_type": v.variance_type,
+                "severity": v.severity,
+                "previous_value": float(v.previous_value) if v.previous_value is not None else None,
+                "current_value": float(v.current_value) if v.current_value is not None else None,
+                "change_pct": float(v.change_pct) if v.change_pct is not None else None,
+                "message": v.message,
+            }
+            for v in variances
+        ],
+        "counts": {
+            "block": sum(1 for v in variances if v.severity == "block"),
+            "warn":  sum(1 for v in variances if v.severity == "warn"),
+            "info":  sum(1 for v in variances if v.severity == "info"),
+        },
+    }
+
+
+@router.get("/runs/{payroll_run_id}/variances")
+def get_run_variances(
+    payroll_run_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        rows = session.execute(
+            _text(
+                """
+                SELECT v.id, v.employee_id, v.variance_type, v.severity,
+                       v.previous_value, v.current_value, v.change_pct,
+                       v.message, v.acknowledged, v.acknowledged_by,
+                       v.acknowledged_at, v.created_at,
+                       pe.full_name
+                  FROM payroll_run_variances v
+                  JOIN payroll_employees pe ON pe.id = v.employee_id
+                 WHERE v.payroll_run_id = :rid
+                   AND v.entity_id = :eid
+                 ORDER BY CASE v.severity
+                            WHEN 'block' THEN 0
+                            WHEN 'warn' THEN 1
+                            ELSE 2
+                          END, pe.full_name
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().all()
+    return {
+        "payroll_run_id": payroll_run_id,
+        "variances": [
+            {
+                "id": str(r["id"]),
+                "employee_id": str(r["employee_id"]),
+                "employee_name": r["full_name"],
+                "variance_type": r["variance_type"],
+                "severity": r["severity"],
+                "previous_value": float(r["previous_value"]) if r["previous_value"] is not None else None,
+                "current_value": float(r["current_value"]) if r["current_value"] is not None else None,
+                "change_pct": float(r["change_pct"]) if r["change_pct"] is not None else None,
+                "message": r["message"],
+                "acknowledged": r["acknowledged"],
+                "acknowledged_by": r["acknowledged_by"],
+                "acknowledged_at": r["acknowledged_at"].isoformat() if r["acknowledged_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+class AcknowledgeVarianceRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/runs/{payroll_run_id}/variances/{variance_id}/acknowledge")
+def post_acknowledge_variance(
+    body: AcknowledgeVarianceRequest,
+    payroll_run_id: str = Path(...),
+    variance_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        res = session.execute(
+            _text(
+                """
+                UPDATE payroll_run_variances
+                   SET acknowledged = TRUE,
+                       acknowledged_by = :who,
+                       acknowledged_at = NOW()
+                 WHERE id = :vid
+                   AND payroll_run_id = :rid
+                   AND entity_id = :eid
+                """
+            ),
+            {
+                "vid": variance_id, "rid": payroll_run_id,
+                "eid": entity["id"], "who": body.actor_email,
+            },
+        )
+        if res.rowcount == 0:
+            raise HTTPException(404, "Variance not found for this run")
+    return {"ok": True, "variance_id": variance_id, "acknowledged_by": body.actor_email}
+
+
+# ----------------------------------------------------------------------
+# Feature 2 — EFT-sent confirmation
+# ----------------------------------------------------------------------
+
+
+class MarkEftSentRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+    notes: str | None = None
+
+
+@router.post("/runs/{payroll_run_id}/mark-eft-sent")
+def post_mark_eft_sent(
+    body: MarkEftSentRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Stamp eft_sent_at + flip workflow_status → 'eft_sent'. Refuses
+    if the run isn't yet approved."""
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        run = session.execute(
+            _text(
+                """
+                SELECT id, workflow_status, status, eft_sent_at
+                  FROM payroll_runs
+                 WHERE id = :rid AND entity_id = :eid
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not run:
+            raise HTTPException(404, "Payroll run not found")
+        wf = (run["workflow_status"] or run["status"] or "").lower()
+        if wf not in {"approved", "approved_to_post", "posted", "eft_sent", "paid"}:
+            raise HTTPException(
+                409,
+                f"Run must be approved before EFT can be marked sent "
+                f"(workflow_status={wf!r}).",
+            )
+        if run["eft_sent_at"]:
+            raise HTTPException(
+                409,
+                f"EFT was already marked sent on {run['eft_sent_at'].isoformat()}.",
+            )
+        session.execute(
+            _text(
+                """
+                UPDATE payroll_runs
+                   SET eft_sent_at = NOW(),
+                       eft_sent_by = :who,
+                       eft_send_notes = :notes,
+                       workflow_status = 'eft_sent',
+                       status = 'eft_sent',
+                       updated_at = NOW()
+                 WHERE id = :rid AND entity_id = :eid
+                """
+            ),
+            {
+                "rid": payroll_run_id, "eid": entity["id"],
+                "who": body.actor_email, "notes": body.notes,
+            },
+        )
+    return {"ok": True, "payroll_run_id": payroll_run_id, "marked_at": "now"}
+
+
+@router.post("/runs/{payroll_run_id}/mark-employees-paid")
+def post_mark_employees_paid(
+    body: WorkflowRequest,
+    payroll_run_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Stamp employees_paid_at + workflow_status='paid'. Refuses if
+    EFT wasn't sent first."""
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        run = session.execute(
+            _text(
+                "SELECT id, eft_sent_at, employees_paid_at FROM payroll_runs "
+                " WHERE id = :rid AND entity_id = :eid"
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not run:
+            raise HTTPException(404, "Payroll run not found")
+        if not run["eft_sent_at"]:
+            raise HTTPException(
+                409,
+                "EFT must be marked sent before employees can be marked paid.",
+            )
+        if run["employees_paid_at"]:
+            raise HTTPException(
+                409,
+                f"Already marked paid on {run['employees_paid_at'].isoformat()}.",
+            )
+        session.execute(
+            _text(
+                """
+                UPDATE payroll_runs
+                   SET employees_paid_at = NOW(),
+                       workflow_status = 'paid',
+                       status = 'paid',
+                       updated_at = NOW()
+                 WHERE id = :rid AND entity_id = :eid
+                """
+            ),
+            {"rid": payroll_run_id, "eid": entity["id"]},
+        )
+    return {"ok": True, "payroll_run_id": payroll_run_id, "marked_paid_at": "now"}
+
+
+# ----------------------------------------------------------------------
+# Feature 3 — Retroactive calc + correction runs
+# ----------------------------------------------------------------------
+
+
+class CalculateRetroRequest(BaseModel):
+    entity_code: str
+    employee_id: str
+    old_rate: float
+    new_rate: float
+    effective_date: str
+
+
+@router.post("/calculate-retro")
+def post_calculate_retro(
+    body: CalculateRetroRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Compute the retro owed since effective_date without writing to
+    the DB. Used to populate the off-cycle run modal preview."""
+    from decimal import Decimal as _D
+    from sqlalchemy import text as _text
+    from .. import services_payroll_retro as _retro
+    enforce_entity_code(_user, body.entity_code)
+    try:
+        effective = DateType.fromisoformat(body.effective_date)
+    except ValueError:
+        raise HTTPException(400, "effective_date must be YYYY-MM-DD")
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        try:
+            calc = _retro.calculate_retro_pay(
+                session,
+                entity_id=entity["id"],
+                employee_id=body.employee_id,
+                old_rate=_D(str(body.old_rate)),
+                new_rate=_D(str(body.new_rate)),
+                effective_date=effective,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return {
+        "employee_id": calc.employee_id,
+        "employee_name": calc.employee_name,
+        "old_rate": float(calc.old_rate),
+        "new_rate": float(calc.new_rate),
+        "effective_date": calc.effective_date.isoformat(),
+        "retro_amount_gross": float(calc.retro_amount_gross),
+        "estimated_cpp": float(calc.estimated_cpp),
+        "estimated_ei": float(calc.estimated_ei),
+        "estimated_fed_tax": float(calc.estimated_fed_tax),
+        "estimated_net": float(calc.estimated_net),
+        "note": calc.note,
+        "periods": [
+            {
+                "payroll_run_id": p.payroll_run_id,
+                "period_start": p.period_start.isoformat(),
+                "period_end": p.period_end.isoformat(),
+                "pay_date": p.pay_date.isoformat(),
+                "hours": float(p.hours),
+                "old_gross": float(p.old_gross),
+                "new_gross": float(p.new_gross),
+                "delta": float(p.delta),
+            }
+            for p in calc.periods
+        ],
+    }
+
+
+class CorrectionEmployeeSpec(BaseModel):
+    employee_id: str
+    override_gross: float | None = None
+    retro_old_rate: float | None = None
+    retro_new_rate: float | None = None
+    retro_periods: int | None = None
+    hours_per_period: float | None = None
+
+
+class CreateCorrectionRunRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+    run_type: str  # 'correction' | 'bonus' | 'retroactive' | 'offcycle'
+    description: str
+    period_start: str
+    period_end: str
+    pay_date: str
+    parent_run_id: str | None = None
+    employees: list[CorrectionEmployeeSpec]
+
+
+@router.post("/runs/create-correction")
+def post_create_correction(
+    body: CreateCorrectionRunRequest,
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Create an off-cycle correction / bonus / retroactive run.
+    Same approve → EFT flow as regular runs."""
+    from sqlalchemy import text as _text
+    from .. import services_payroll_retro as _retro
+    enforce_entity_code(_user, body.entity_code)
+    try:
+        ps = DateType.fromisoformat(body.period_start)
+        pe = DateType.fromisoformat(body.period_end)
+        pd = DateType.fromisoformat(body.pay_date)
+    except ValueError:
+        raise HTTPException(400, "dates must be YYYY-MM-DD")
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id, entity_code FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        try:
+            result = _retro.create_correction_run(
+                session,
+                entity_id=entity["id"],
+                entity_code=entity["entity_code"],
+                run_type=body.run_type,
+                description=body.description,
+                period_start=ps,
+                period_end=pe,
+                pay_date=pd,
+                employees=[e.model_dump() for e in body.employees],
+                parent_run_id=body.parent_run_id,
+                actor_email=body.actor_email,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return result
+
+
+# ----------------------------------------------------------------------
+# Feature 4 — Employee pay history + employment record
+# ----------------------------------------------------------------------
+
+
+@router.get("/employees/{employee_id}/history")
+def get_employee_history(
+    employee_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Every payroll_run_lines row for this employee, joined to its
+    payroll_runs header for period/pay context. Ordered period DESC."""
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        emp = session.execute(
+            _text(
+                "SELECT id, full_name FROM payroll_employees "
+                " WHERE id = :id AND entity_id = :eid"
+            ),
+            {"id": employee_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not emp:
+            raise HTTPException(404, "Employee not found for this entity")
+        rows = session.execute(
+            _text(
+                """
+                SELECT pr.id AS run_id, pr.pay_run_number, pr.run_type,
+                       pr.period_start, pr.period_end, pr.pay_date,
+                       prl.total_hours, prl.gross_pay, prl.net_pay,
+                       prl.cpp_ee, prl.ei_ee, prl.fed_tax,
+                       prl.vacation_earned, prl.vacation_paid,
+                       prl.stat_pay
+                  FROM payroll_run_lines prl
+                  JOIN payroll_runs pr ON pr.id = prl.payroll_run_id
+                 WHERE prl.employee_id = :emp
+                   AND pr.entity_id = :eid
+                   AND COALESCE(pr.workflow_status, pr.status) NOT IN ('voided')
+                 ORDER BY pr.pay_date DESC
+                """
+            ),
+            {"emp": employee_id, "eid": entity["id"]},
+        ).mappings().all()
+    return {
+        "employee_id": str(emp["id"]),
+        "employee_name": emp["full_name"],
+        "history": [
+            {
+                "payroll_run_id": str(r["run_id"]),
+                "pay_run_number": r["pay_run_number"],
+                "run_type": r["run_type"] or "regular",
+                "period_start": r["period_start"].isoformat() if r["period_start"] else None,
+                "period_end": r["period_end"].isoformat() if r["period_end"] else None,
+                "pay_date": r["pay_date"].isoformat() if r["pay_date"] else None,
+                "total_hours": float(r["total_hours"] or 0),
+                "gross_pay": float(r["gross_pay"] or 0),
+                "net_pay": float(r["net_pay"] or 0),
+                "cpp_ee": float(r["cpp_ee"] or 0),
+                "ei_ee": float(r["ei_ee"] or 0),
+                "fed_tax": float(r["fed_tax"] or 0),
+                "vacation_earned": float(r["vacation_earned"] or 0),
+                "vacation_paid": float(r["vacation_paid"] or 0),
+                "stat_pay": float(r["stat_pay"] or 0),
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+class EmploymentRecordRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/employees/{employee_id}/employment-record")
+def post_employment_record(
+    body: EmploymentRecordRequest,
+    employee_id: str = Path(...),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Generate the employment / income verification PDF and upload to
+    R2. Returns a fresh presigned URL. R2-fail tolerant — if upload
+    returns None, the response still includes the PDF as base64 so
+    the user can save it locally."""
+    import base64
+    from sqlalchemy import text as _text
+    from datetime import date as _date
+    from .. import services_payroll_employment as _emp
+    from ..services_storage import storage_service as _r2
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        employee = session.execute(
+            _text(
+                """
+                SELECT id, full_name, employee_number, employment_type,
+                       hourly_rate, biweekly_salary, province,
+                       start_date, is_active
+                  FROM payroll_employees
+                 WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": employee_id, "eid": entity["id"]},
+        ).mappings().first()
+        if not employee:
+            raise HTTPException(404, "Employee not found")
+        history = session.execute(
+            _text(
+                """
+                SELECT pr.pay_run_number, pr.period_start, pr.period_end,
+                       pr.pay_date, prl.total_hours, prl.gross_pay,
+                       prl.net_pay
+                  FROM payroll_run_lines prl
+                  JOIN payroll_runs pr ON pr.id = prl.payroll_run_id
+                 WHERE prl.employee_id = :emp AND pr.entity_id = :eid
+                   AND COALESCE(pr.workflow_status, pr.status) NOT IN ('voided')
+                 ORDER BY pr.pay_date DESC
+                 LIMIT 12
+                """
+            ),
+            {"emp": employee_id, "eid": entity["id"]},
+        ).mappings().all()
+        history_list = [dict(r) for r in history]
+        # Calendar-year totals (same window as T4)
+        cal_year = _date.today().year
+        ytd_rows = session.execute(
+            _text(
+                """
+                SELECT
+                  COALESCE(SUM(prl.gross_pay), 0)             AS gross,
+                  COALESCE(SUM(prl.net_pay), 0)               AS net,
+                  COALESCE(SUM(prl.fed_tax), 0)               AS fed_tax,
+                  COALESCE(SUM(prl.cpp_ee), 0)                AS cpp,
+                  COALESCE(SUM(prl.ei_ee), 0)                 AS ei
+                  FROM payroll_run_lines prl
+                  JOIN payroll_runs pr ON pr.id = prl.payroll_run_id
+                 WHERE prl.employee_id = :emp AND pr.entity_id = :eid
+                   AND pr.pay_date >= :ystart AND pr.pay_date <= :yend
+                   AND COALESCE(pr.workflow_status, pr.status) NOT IN ('voided','draft')
+                """
+            ),
+            {
+                "emp": employee_id, "eid": entity["id"],
+                "ystart": _date(cal_year, 1, 1),
+                "yend": _date(cal_year, 12, 31),
+            },
+        ).mappings().first() or {}
+
+    pdf_bytes = _emp.generate_employment_record(
+        employee=dict(employee),
+        entity=dict(entity),
+        history_lines=history_list,
+        calendar_year_totals={
+            "year": cal_year,
+            "gross": ytd_rows.get("gross"),
+            "net": ytd_rows.get("net"),
+            "fed_tax": ytd_rows.get("fed_tax"),
+            "cpp": ytd_rows.get("cpp"),
+            "ei": ytd_rows.get("ei"),
+        },
+        actor_email=body.actor_email,
+    )
+    file_name = (
+        f"employment_record_{employee['full_name'].replace(' ', '_')}_"
+        f"{_date.today().isoformat()}.pdf"
+    )
+    r2_key = _r2.upload_file(
+        file_bytes=pdf_bytes,
+        original_filename=file_name,
+        entity_code=entity["entity_code"],
+        document_type="employment-records",
+        content_type="application/pdf",
+    )
+    download_url = (
+        _r2.get_presigned_url(r2_key, expires_in=3600) if r2_key else None
+    )
+    return {
+        "ok": True,
+        "file_name": file_name,
+        "r2_uploaded": bool(r2_key),
+        "download_url": download_url,
+        "pdf_base64": (
+            base64.b64encode(pdf_bytes).decode("ascii") if not r2_key else None
+        ),
+    }
+
+
+# ----------------------------------------------------------------------
+# Feature 5 — T4 generation
+# ----------------------------------------------------------------------
+
+
+class GenerateT4sRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+    calendar_year: int
+
+
+@router.post("/t4s/generate")
+def post_generate_t4s(
+    body: GenerateT4sRequest,
+    _user: dict = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Compute T4 figures for every employee with pay in the calendar
+    year, render the PDF, upload to R2, upsert the payroll_t4s row.
+    Admin-only — T4s are CRA-filed documents."""
+    from sqlalchemy import text as _text
+    from .. import services_payroll_t4 as _t4
+    from ..services_storage import storage_service as _r2
+    enforce_entity_code(_user, body.entity_code)
+    if body.calendar_year < 2020 or body.calendar_year > 2100:
+        raise HTTPException(400, "calendar_year out of range")
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        figures_list = _t4.compute_t4_figures(
+            session, entity_id=entity["id"], calendar_year=body.calendar_year
+        )
+        if not figures_list:
+            raise HTTPException(
+                400,
+                f"No employees received pay in {body.calendar_year} — nothing to generate.",
+            )
+
+        generated_count = 0
+        r2_failures = 0
+        results: list[dict[str, Any]] = []
+        totals = {
+            "employment_income": 0.0, "cpp": 0.0, "ei": 0.0, "tax": 0.0,
+        }
+        for f in figures_list:
+            pdf_bytes = _t4.generate_t4_pdf(
+                figures=f, entity=dict(entity),
+                calendar_year=body.calendar_year,
+            )
+            file_name = f"T4_{body.calendar_year}_{f.employee_name.replace(' ', '_')}.pdf"
+            r2_key = _r2.upload_file(
+                file_bytes=pdf_bytes,
+                original_filename=file_name,
+                entity_code=entity["entity_code"],
+                document_type=f"t4s/{body.calendar_year}",
+                content_type="application/pdf",
+            )
+            if not r2_key:
+                r2_failures += 1
+
+            row = session.execute(
+                _text(
+                    """
+                    INSERT INTO payroll_t4s (
+                        entity_id, employee_id, calendar_year,
+                        box_14_employment_income, box_16_cpp_employee,
+                        box_17_cpp2_employee, box_18_ei_premiums,
+                        box_22_income_tax, box_24_ei_insurable,
+                        box_26_cpp_pensionable, box_40_other_benefits,
+                        r2_object_key, file_name, generated_by
+                    ) VALUES (
+                        :eid, :emp, :cy, :b14, :b16, :b17, :b18, :b22,
+                        :b24, :b26, :b40, :key, :fn, :who
+                    )
+                    ON CONFLICT (entity_id, employee_id, calendar_year) DO UPDATE
+                       SET box_14_employment_income = EXCLUDED.box_14_employment_income,
+                           box_16_cpp_employee = EXCLUDED.box_16_cpp_employee,
+                           box_17_cpp2_employee = EXCLUDED.box_17_cpp2_employee,
+                           box_18_ei_premiums = EXCLUDED.box_18_ei_premiums,
+                           box_22_income_tax = EXCLUDED.box_22_income_tax,
+                           box_24_ei_insurable = EXCLUDED.box_24_ei_insurable,
+                           box_26_cpp_pensionable = EXCLUDED.box_26_cpp_pensionable,
+                           box_40_other_benefits = EXCLUDED.box_40_other_benefits,
+                           r2_object_key = EXCLUDED.r2_object_key,
+                           file_name = EXCLUDED.file_name,
+                           generated_at = NOW(),
+                           generated_by = EXCLUDED.generated_by
+                    RETURNING id
+                    """
+                ),
+                {
+                    "eid": entity["id"], "emp": f.employee_id,
+                    "cy": body.calendar_year,
+                    "b14": f.box_14_employment_income,
+                    "b16": f.box_16_cpp_employee,
+                    "b17": f.box_17_cpp2_employee,
+                    "b18": f.box_18_ei_premiums,
+                    "b22": f.box_22_income_tax,
+                    "b24": f.box_24_ei_insurable,
+                    "b26": f.box_26_cpp_pensionable,
+                    "b40": f.box_40_other_benefits,
+                    "key": r2_key, "fn": file_name, "who": body.actor_email,
+                },
+            ).mappings().first()
+            generated_count += 1
+            totals["employment_income"] += float(f.box_14_employment_income)
+            totals["cpp"] += float(f.box_16_cpp_employee)
+            totals["ei"] += float(f.box_18_ei_premiums)
+            totals["tax"] += float(f.box_22_income_tax)
+            results.append({
+                "t4_id": str(row["id"]) if row else None,
+                "employee_id": f.employee_id,
+                "employee_name": f.employee_name,
+                "file_name": file_name,
+                "r2_uploaded": bool(r2_key),
+                "box_14": float(f.box_14_employment_income),
+            })
+
+    return {
+        "ok": True,
+        "calendar_year": body.calendar_year,
+        "employees_count": generated_count,
+        "r2_upload_failures": r2_failures,
+        "totals": totals,
+        "results": results,
+    }
+
+
+@router.get("/t4s")
+def list_t4s(
+    entity_code: str = Query(...),
+    calendar_year: int = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        rows = session.execute(
+            _text(
+                """
+                SELECT t.id, t.employee_id, t.calendar_year,
+                       t.box_14_employment_income, t.box_16_cpp_employee,
+                       t.box_18_ei_premiums, t.box_22_income_tax,
+                       t.box_24_ei_insurable, t.box_26_cpp_pensionable,
+                       t.box_40_other_benefits, t.r2_object_key,
+                       t.file_name, t.generated_at, t.filed_with_cra,
+                       t.filed_at, pe.full_name, pe.employee_number
+                  FROM payroll_t4s t
+                  JOIN payroll_employees pe ON pe.id = t.employee_id
+                 WHERE t.entity_id = :eid AND t.calendar_year = :cy
+                 ORDER BY pe.employee_number, pe.full_name
+                """
+            ),
+            {"eid": entity["id"], "cy": calendar_year},
+        ).mappings().all()
+    return {
+        "calendar_year": calendar_year,
+        "t4s": [
+            {
+                "id": str(r["id"]),
+                "employee_id": str(r["employee_id"]),
+                "employee_name": r["full_name"],
+                "employee_number": r["employee_number"],
+                "calendar_year": r["calendar_year"],
+                "box_14": float(r["box_14_employment_income"] or 0),
+                "box_16": float(r["box_16_cpp_employee"] or 0),
+                "box_18": float(r["box_18_ei_premiums"] or 0),
+                "box_22": float(r["box_22_income_tax"] or 0),
+                "box_24": float(r["box_24_ei_insurable"] or 0),
+                "box_26": float(r["box_26_cpp_pensionable"] or 0),
+                "box_40": float(r["box_40_other_benefits"] or 0),
+                "file_name": r["file_name"],
+                "r2_uploaded": bool(r["r2_object_key"]),
+                "generated_at": r["generated_at"].isoformat() if r["generated_at"] else None,
+                "filed_with_cra": r["filed_with_cra"],
+                "filed_at": r["filed_at"].isoformat() if r["filed_at"] else None,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/t4s/{t4_id}/download")
+def get_t4_download(
+    t4_id: str = Path(...),
+    entity_code: str = Query(...),
+    _user: dict = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    from ..services_storage import storage_service as _r2
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {entity_code}")
+        row = session.execute(
+            _text(
+                """
+                SELECT id, file_name, r2_object_key, generated_at
+                  FROM payroll_t4s WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": t4_id, "eid": entity["id"]},
+        ).mappings().first()
+    if not row:
+        raise HTTPException(404, "T4 not found")
+    if not row["r2_object_key"]:
+        raise HTTPException(409, "T4 PDF missing from R2; re-run /t4s/generate")
+    url = _r2.get_presigned_url(row["r2_object_key"], expires_in=3600)
+    if not url:
+        raise HTTPException(503, "R2 presign failed")
+    return {
+        "file_name": row["file_name"],
+        "download_url": url,
+        "expires_in_seconds": 3600,
+    }
+
+
+class MarkT4FiledRequest(BaseModel):
+    entity_code: str
+    actor_email: str
+
+
+@router.post("/t4s/{t4_id}/mark-filed")
+def post_mark_t4_filed(
+    body: MarkT4FiledRequest,
+    t4_id: str = Path(...),
+    _user: dict = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    from sqlalchemy import text as _text
+    enforce_entity_code(_user, body.entity_code)
+    with db_session() as session:
+        entity = session.execute(
+            _text("SELECT id FROM entities WHERE entity_code = :ec"),
+            {"ec": body.entity_code},
+        ).mappings().first()
+        if not entity:
+            raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        res = session.execute(
+            _text(
+                """
+                UPDATE payroll_t4s
+                   SET filed_with_cra = TRUE, filed_at = NOW()
+                 WHERE id = :id AND entity_id = :eid
+                """
+            ),
+            {"id": t4_id, "eid": entity["id"]},
+        )
+        if res.rowcount == 0:
+            raise HTTPException(404, "T4 not found for this entity")
+    return {"ok": True, "t4_id": t4_id, "filed_at": "now"}

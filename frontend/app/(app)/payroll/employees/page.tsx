@@ -27,11 +27,14 @@ import {
   getVacationLedger,
   listEmployeePaystubs,
   getPaystubDownload,
+  getEmployeeHistory,
+  generateEmploymentRecord,
   type Employee,
   type UpdateEmployeeInput,
+  type PayHistoryLine,
 } from '@/lib/api/payroll';
 import { formatMoney, formatDate } from '@/lib/utils';
-import { AlertTriangle, ArrowLeft, Pencil } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Download, Pencil } from 'lucide-react';
 
 export const dynamic = 'force-dynamic';
 
@@ -511,6 +514,19 @@ function EmployeeEditor({
               <EmployeePaystubsCard entityCode={entityCode} employeeId={employeeId} />
             </Section>
 
+            {/* Tier 2 F4 — Pay history + employment record */}
+            <Section title="Pay history">
+              <EmployeeHistoryCard
+                entityCode={entityCode}
+                employeeId={employeeId}
+                employeeName={
+                  e.first_name && e.last_name
+                    ? `${e.first_name} ${e.last_name}`
+                    : (e.full_name ?? `EE# ${e.employee_number}`)
+                }
+              />
+            </Section>
+
             <div className="flex justify-end gap-2 pt-2 border-t border-border">
               <Button variant="ghost" onClick={onClose}>
                 Cancel
@@ -698,6 +714,166 @@ function PaystubDownloadLink({
     >
       {busy ? 'Opening…' : 'Download PDF'}
     </button>
+  );
+}
+
+function EmployeeHistoryCard({
+  entityCode,
+  employeeId,
+  employeeName,
+}: {
+  entityCode: string;
+  employeeId: string;
+  employeeName: string;
+}) {
+  const { user } = useUser();
+  const actorEmail = user?.primaryEmailAddress?.emailAddress ?? 'unknown';
+  const q = useQuery({
+    queryKey: ['emp-history', entityCode, employeeId],
+    queryFn: () => getEmployeeHistory(entityCode, employeeId),
+  });
+  const empRec = useMutation({
+    mutationFn: () =>
+      generateEmploymentRecord(employeeId, {
+        entity_code: entityCode,
+        actor_email: actorEmail,
+      }),
+    onSuccess: (res) => {
+      if (res.download_url) {
+        window.open(res.download_url, '_blank', 'noopener');
+      } else if (res.pdf_base64) {
+        // R2 upload failed — open the inline base64 in a new tab.
+        const link = `data:application/pdf;base64,${res.pdf_base64}`;
+        window.open(link, '_blank', 'noopener');
+      } else {
+        toast.error('Employment record could not be generated');
+      }
+    },
+    onError: () => toast.error('Employment record failed'),
+  });
+
+  if (q.isLoading) return <Skeleton className="h-12 w-full" />;
+  const history = q.data?.history ?? [];
+
+  function downloadCsv() {
+    if (history.length === 0) return;
+    const header = [
+      'Pay date',
+      'Run',
+      'Type',
+      'Period start',
+      'Period end',
+      'Hours',
+      'Gross',
+      'CPP',
+      'EI',
+      'Fed tax',
+      'Vac earned',
+      'Vac paid',
+      'Stat',
+      'Net',
+    ];
+    const rows = history.map((h) => [
+      h.pay_date ?? '',
+      h.pay_run_number,
+      h.run_type,
+      h.period_start ?? '',
+      h.period_end ?? '',
+      String(h.total_hours),
+      String(h.gross_pay),
+      String(h.cpp_ee),
+      String(h.ei_ee),
+      String(h.fed_tax),
+      String(h.vacation_earned),
+      String(h.vacation_paid),
+      String(h.stat_pay),
+      String(h.net_pay),
+    ]);
+    const csv = [header, ...rows]
+      .map((r) =>
+        r
+          .map((cell) =>
+            /[",\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell,
+          )
+          .join(','),
+      )
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pay-history-${employeeName.replace(/\s+/g, '_')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <p className="text-xs text-slate">
+          {history.length} pay periods on file.
+        </p>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={downloadCsv}
+            disabled={history.length === 0}
+          >
+            <Download className="h-3 w-3" /> CSV
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => empRec.mutate()}
+            disabled={empRec.isPending || history.length === 0}
+          >
+            {empRec.isPending ? 'Generating…' : 'Employment record (PDF)'}
+          </Button>
+        </div>
+      </div>
+      {history.length === 0 ? (
+        <p className="text-xs text-slate text-center p-3">
+          No pay history yet.
+        </p>
+      ) : (
+        <div className="border border-border rounded-md overflow-x-auto max-h-80">
+          <table className="min-w-full text-xs">
+            <thead className="bg-cloud sticky top-0">
+              <tr>
+                <th className="text-left px-2 py-1">Pay date</th>
+                <th className="text-left px-2 py-1">Run</th>
+                <th className="text-left px-2 py-1">Type</th>
+                <th className="text-right px-2 py-1">Hours</th>
+                <th className="text-right px-2 py-1">Gross</th>
+                <th className="text-right px-2 py-1">Net</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {history.map((h: PayHistoryLine) => (
+                <tr key={h.payroll_run_id}>
+                  <td className="px-2 py-1 text-ink">
+                    {h.pay_date ? formatDate(h.pay_date) : '—'}
+                  </td>
+                  <td className="px-2 py-1 text-slate">{h.pay_run_number}</td>
+                  <td className="px-2 py-1 text-slate uppercase">{h.run_type}</td>
+                  <td className="px-2 py-1 tabular-nums text-right">
+                    {h.total_hours.toFixed(2)}
+                  </td>
+                  <td className="px-2 py-1 tabular-nums text-right">
+                    {formatMoney(h.gross_pay)}
+                  </td>
+                  <td className="px-2 py-1 tabular-nums text-right">
+                    {formatMoney(h.net_pay)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 
