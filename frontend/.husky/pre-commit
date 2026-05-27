@@ -1,0 +1,27 @@
+#!/usr/bin/env sh
+# BookWize frontend pre-commit hook.
+#
+# Refuses commits that introduce TypeScript errors. Hard rule:
+# zero "Render will catch it" exceptions — every commit that lands
+# on main has type-checked locally first.
+#
+# Activated when the user runs `npm install` inside frontend/ —
+# husky 9's `prepare` script sets git core.hooksPath to point at
+# this directory. To temporarily bypass for an in-progress WIP
+# commit, use `git commit --no-verify` (but don't push it).
+
+set -e
+
+# Resolve the repo root regardless of where the user invoked git.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT/frontend"
+
+echo "→ Running TypeScript check before commit…"
+if ! npx tsc --noEmit --skipLibCheck; then
+  echo ""
+  echo "✗ TypeScript errors found. Commit blocked."
+  echo "  Fix the errors above, then re-run your commit."
+  echo "  (Bypass for WIP only: git commit --no-verify)"
+  exit 1
+fi
+echo "✓ TypeScript check passed."
