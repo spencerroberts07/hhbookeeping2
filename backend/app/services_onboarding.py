@@ -709,6 +709,134 @@ def _split_account_cell(text_val: str) -> tuple[str, str]:
     return s, s
 
 
+def _try_qbo_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
+    """Parser dedicated to QuickBooks Online's General Ledger CSV export.
+
+    QBO emits a very specific layout that the generic parser handles
+    poorly:
+
+        Row 1-3: company name / report title / date range (1 cell each)
+        Row 4:   blank
+        Row 5:   header — ",Distribution account,Transaction date,...,Amount,Balance"
+        Row 6+:  account section header rows (col[0] populated, rest empty)
+                 transaction rows (col[0] empty, data in cols 1-9)
+                 subtotal rows ("Total for 1010 …" in col[0])
+
+    The two things the generic parser gets wrong:
+
+    1. Date format. QBO uses DD/MM/YYYY (e.g. 01/10/2023 = Oct 1 2023).
+       The generic parser tries %m/%d/%Y first and silently mis-parses
+       every date as the wrong month — meaning Jan 10 instead of Oct 1.
+    2. Section headers + subtotal rows leak through and either get
+       interpreted as account-without-date (skipped, fine) or as data
+       (wrong). With the right column-shape filter we drop them
+       deterministically.
+
+    Returns the same normalized-line shape as parse_gl_file when the
+    QBO layout is detected, else None so the caller falls through.
+    """
+    rows = _read_csv_rows(file_text)
+    if not rows:
+        return None
+
+    # Detection: the literal "distribution account" header text only
+    # appears in QBO's GL CSV (other exports use "Account" or
+    # "Account name"). Scanning the first 6 rows is enough because
+    # the report header sits at row index 4 in standard exports;
+    # adding a safety margin covers customised templates.
+    header_idx: int | None = None
+    for i, row in enumerate(rows[:6]):
+        for cell in row:
+            if "distribution account" in str(cell or "").lower():
+                header_idx = i
+                break
+        if header_idx is not None:
+            break
+    if header_idx is None:
+        return None
+
+    out: list[dict[str, Any]] = []
+    for row in rows[header_idx + 1:]:
+        # Pad short rows so col[1..9] reads don't IndexError.
+        if len(row) < 10:
+            row = list(row) + [""] * (10 - len(row))
+
+        cells = [str(c or "").strip() for c in row]
+
+        # Blank separator row.
+        if not any(cells):
+            continue
+
+        # Subtotal / report-footer rows. QBO emits "Total for 1010 …"
+        # at the end of each account section and a "TOTAL" grand total
+        # at the very end. Match on word "Total" so we don't catch
+        # legitimate descriptions like "Total cleanup invoice".
+        joined = " | ".join(cells).lower()
+        if joined.startswith("total ") or " | total " in (" | " + joined):
+            continue
+
+        # Account section header — col[0] populated with the account
+        # name, col[1] (Distribution account) empty. These appear
+        # between transaction blocks; not data rows.
+        if cells[0] and not cells[1]:
+            continue
+
+        # Transaction row — col[0] empty, col[1] = "1010 Cash Float".
+        account_raw = cells[1]
+        if not account_raw:
+            continue
+        code, name = _split_account_cell(account_raw)
+        if not code:
+            continue
+
+        # QBO uses DD/MM/YYYY for Canadian / non-US accounts; the
+        # spec confirms this layout. Strict parse so we don't fall
+        # back to MM/DD and mis-attribute the month.
+        date_str = cells[2]
+        try:
+            txn_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+        except ValueError:
+            # Fall back to the generic loose parser for rare rows in
+            # an alternate date locale; if even that fails, skip.
+            txn_date = _parse_loose_date(date_str)
+            if txn_date is None:
+                continue
+
+        txn_type = cells[3]
+        ref = cells[4]
+        counterparty = cells[5] or None
+        description = cells[6]
+        amount = _parse_amount(cells[8])
+
+        # Section subtotal rows sometimes carry an empty date but
+        # match the column shape above; the date guard above catches
+        # those. A zero-amount line with no description is the other
+        # shape of subtotal — drop it.
+        if amount == 0 and not description and not ref:
+            continue
+
+        if amount >= 0:
+            dr, cr = amount, Decimal("0")
+        else:
+            dr, cr = Decimal("0"), -amount
+
+        out.append({
+            "transaction_date": txn_date,
+            "reference_number": ref,
+            "account_code": code,
+            "account_name": name,
+            "description": description,
+            "counterparty_name": counterparty,
+            "transaction_type": txn_type or None,
+            "debit_amount": dr,
+            "credit_amount": cr,
+        })
+
+    if not out:
+        return None
+    return out
+
+
 def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
     """Heuristic GL parser. Looks for date + account + debit/credit
     columns. Returns the same shape as parse_gl_file (a list of normalized
@@ -1367,9 +1495,15 @@ Rules:
 
 
 def parse_gl_file(file_bytes: bytes, filename: str) -> list[dict[str, Any]]:
-    """Try the regex/CSV fallback first for standard GL exports; fall
-    back to Claude for unknown formats."""
+    """Try parsers in order of specificity: QBO-shape first (its layout
+    is distinctive enough to detect and parses cleanly), then the
+    generic regex/CSV fallback, then Claude as a last resort."""
     file_text = _decode_file(file_bytes, filename)
+
+    qbo = _try_qbo_gl_parser(file_text)
+    if qbo:
+        logger.info("GL parsed via QBO parser (%d lines)", len(qbo))
+        return qbo
 
     fallback = _try_fallback_gl_parser(file_text)
     if fallback:
