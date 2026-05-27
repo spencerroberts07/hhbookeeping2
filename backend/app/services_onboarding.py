@@ -675,10 +675,37 @@ def _infer_type_from_code(code: str) -> str:
     }.get(p, "Other")
 
 
+# Combined "Account" cells from QBO look like "6510 Cost of Goods Sold"
+# when "Use account numbers" is enabled, or just "Cost of Goods Sold"
+# otherwise. The code half tolerates dots and dashes for sub-accounts
+# (e.g. "1085-1").
+_ACCOUNT_SPLIT_RE = re.compile(r"^\s*(\d[\d\.\-]{2,11})\s+(.+?)\s*$")
+
+
+def _split_account_cell(text_val: str) -> tuple[str, str]:
+    """Split a combined account cell into (code, name). Falls back to
+    (text, text) when no leading numeric code is present so the row
+    isn't dropped — dealers without account numbers in QBO will get
+    name-keyed account_codes, which still posts."""
+    s = (text_val or "").strip()
+    if not s:
+        return "", ""
+    m = _ACCOUNT_SPLIT_RE.match(s)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return s, s
+
+
 def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
     """Heuristic GL parser. Looks for date + account + debit/credit
     columns. Returns the same shape as parse_gl_file (a list of normalized
     line records) or None.
+
+    Handles QBO's GL CSV format — `Date, Transaction Type, Num, Name,
+    Memo/Description, Account, Split, Amount, Balance` — where the
+    "Account" column carries combined code+name text and there is no
+    separate code column. Without this branch, multi-month QBO exports
+    fall through to Claude and get truncated at 200k chars.
     """
     rows = _read_csv_rows(file_text)
     if not rows:
@@ -695,15 +722,23 @@ def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
         return None
     headers = [str(c or "").strip() for c in rows[header_idx]]
     date_idx = _find_col(headers, ["date"])
-    ref_idx = _find_col(headers, ["reference", "ref", "doc", "txn", "number"])
-    code_idx = _find_col(headers, ["account code", "account number", "code", "acct"])
+    ref_idx = _find_col(headers, ["reference", "ref", "doc", "txn", "num", "number"])
+    code_idx = _find_col(headers, ["account code", "account number", "acct", "code"])
     name_idx = _find_col(headers, ["account name", "account", "description"])
     desc_idx = _find_col(headers, ["description", "memo", "explanation"])
     cp_idx = _find_col(headers, ["payee", "vendor", "customer", "name"])
     debit_idx = _find_col(headers, ["debit", "dr"])
     credit_idx = _find_col(headers, ["credit", "cr"])
     amount_idx = _find_col(headers, ["amount", "net"])
-    if date_idx is None or code_idx is None or code_idx == name_idx:
+    # QBO GL exports have an "Account" column but no separate code
+    # column. When that's the case, treat the name column as the
+    # combined source and split per-row.
+    combined_account_col = code_idx is None and name_idx is not None
+    # A single header like "Account Code" matches both code and name —
+    # prefer the code interpretation.
+    if code_idx is not None and code_idx == name_idx:
+        name_idx = None
+    if date_idx is None or (code_idx is None and name_idx is None):
         return None
     if debit_idx is None and credit_idx is None and amount_idx is None:
         return None
@@ -718,7 +753,24 @@ def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
         txn_date = _parse_loose_date(raw_date)
         if txn_date is None:
             continue
-        code = str(row[code_idx] or "").strip() if code_idx < len(row) else ""
+        if combined_account_col:
+            raw_account = (
+                str(row[name_idx] or "").strip()
+                if name_idx is not None and name_idx < len(row)
+                else ""
+            )
+            code, name = _split_account_cell(raw_account)
+        else:
+            code = (
+                str(row[code_idx] or "").strip()
+                if code_idx is not None and code_idx < len(row)
+                else ""
+            )
+            name = (
+                str(row[name_idx] or "").strip()
+                if name_idx is not None and name_idx < len(row)
+                else ""
+            )
         if not code:
             continue
         if debit_idx is not None or credit_idx is not None:
@@ -746,11 +798,7 @@ def _try_fallback_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
                 else ""
             ),
             "account_code": code,
-            "account_name": (
-                str(row[name_idx] or "").strip()
-                if name_idx is not None and name_idx < len(row)
-                else ""
-            ),
+            "account_name": name,
             "description": (
                 str(row[desc_idx] or "").strip()
                 if desc_idx is not None and desc_idx < len(row)
