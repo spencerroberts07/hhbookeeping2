@@ -34,8 +34,11 @@ import {
 export const dynamic = 'force-dynamic';
 
 export default function PayrollRunDetailPage() {
+  // useParams returns Params | null in Next.js 15's types; accessing
+  // .id directly on null would TypeError before any other code runs.
+  // Use optional chaining and gate downstream work on runId presence.
   const params = useParams<{ id: string }>();
-  const runId = params.id;
+  const runId = params?.id ?? '';
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const { user } = useUser();
   const qc = useQueryClient();
@@ -99,12 +102,14 @@ export default function PayrollRunDetailPage() {
     },
   });
 
-  if (!entityCode) {
+  if (!entityCode || !runId) {
     return (
       <>
         <Topbar title="Pay run" />
         <main className="p-6">
-          <Card className="p-6 text-slate text-center">No entity selected.</Card>
+          <Card className="p-6 text-slate text-center">
+            {!entityCode ? 'No entity selected.' : 'Resolving pay run…'}
+          </Card>
         </main>
       </>
     );
@@ -183,6 +188,10 @@ function RunHeader({ detail }: { detail: PayrollRunDetail }) {
 }
 
 function RegisterTable({ detail }: { detail: PayrollRunDetail }) {
+  // `lines` is typed as PayrollRunLine[] but defensively coerce to []
+  // — if the backend ever returns no `lines` key on a partial response
+  // (e.g. a run with zero employees) we don't want .map to crash.
+  const lines = detail.lines ?? [];
   return (
     <Card>
       <CardHeader>
@@ -205,7 +214,7 @@ function RegisterTable({ detail }: { detail: PayrollRunDetail }) {
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {detail.lines.map((l) => (
+              {lines.map((l) => (
                 <tr key={l.id} className="hover:bg-cloud">
                   <td className="px-3 py-1.5 text-ink font-mono text-xs">
                     {l.employee_number}
@@ -264,6 +273,12 @@ function RegisterTable({ detail }: { detail: PayrollRunDetail }) {
 
 function CraSummary({ detail }: { detail: PayrollRunDetail }) {
   const r = detail.run;
+  // Backend ships numeric columns as strings; Number(undefined) = NaN
+  // and NaN + NaN = NaN, which formatMoney handles, but be explicit.
+  const safeNum = (v: unknown): number => {
+    const n = Number(v ?? 0);
+    return Number.isFinite(n) ? n : 0;
+  };
   return (
     <Card>
       <CardHeader>
@@ -273,9 +288,9 @@ function CraSummary({ detail }: { detail: PayrollRunDetail }) {
         <dl className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <Stat label="Fed + Prov tax" value={formatMoney(r.total_fed_tax)} />
           <Stat label="CPP (ee + er)"
-                value={formatMoney(Number(r.total_cpp_ee) + Number(r.total_cpp_er))} />
+                value={formatMoney(safeNum(r.total_cpp_ee) + safeNum(r.total_cpp_er))} />
           <Stat label="EI (ee + er)"
-                value={formatMoney(Number(r.total_ei_ee) + Number(r.total_ei_er))} />
+                value={formatMoney(safeNum(r.total_ei_ee) + safeNum(r.total_ei_er))} />
           <Stat label="Total remittance" value={formatMoney(r.cra_remittance_amount)} highlight />
         </dl>
       </CardContent>
