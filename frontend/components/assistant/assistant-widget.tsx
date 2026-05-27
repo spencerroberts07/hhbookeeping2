@@ -92,6 +92,7 @@ export function AssistantWidget() {
         id: res.user_message_id ?? `user-${Date.now()}`,
         role: 'user',
         content: sentText,
+        isLatestActionable: false,
       });
       next.push({
         id: res.message_id ?? `assistant-${Date.now()}`,
@@ -114,6 +115,7 @@ export function AssistantWidget() {
           role: 'assistant',
           content:
             'Something went wrong reaching the assistant. Try again in a moment.',
+          isLatestActionable: false,
         });
       setMessages(next);
     },
@@ -154,7 +156,12 @@ export function AssistantWidget() {
     if (!text || sendMutation.isPending) return;
     if (inputRef.current) inputRef.current.value = '';
     const next = messages.map((mm) => ({ ...mm, isLatestActionable: false }));
-    next.push({ id: '__pending_user__', role: 'user', content: text });
+    next.push({
+      id: '__pending_user__',
+      role: 'user',
+      content: text,
+      isLatestActionable: false,
+    });
     setMessages(next);
     sendMutation.mutate(text);
   };
