@@ -13,42 +13,89 @@ import { api } from './client';
 import type { PlanTier } from './billing';
 
 // --------------------------------------------------------------------------
-// Income Statement
+// Income Statement (4-column: current period, prior year, %, prior %)
 // --------------------------------------------------------------------------
 
-export interface IncomeStatementRow {
+export type IncomeStatementPreset =
+  | 'month'
+  | 'ytd'
+  | 'rolling12'
+  | 'qtd'
+  | 'trailing3'
+  | 'last6'
+  | 'custom';
+
+export interface IncomeStatementAccount {
   account_code: string;
   account_name: string;
-  amount: number;
+  current_amount: number;
+  prior_amount: number;
+  current_pct: number | null;
+  prior_pct: number | null;
 }
 
-export interface IncomeStatementBody {
-  revenue: IncomeStatementRow[];
-  revenue_total: number;
-  cogs: IncomeStatementRow[];
-  cogs_total: number;
-  gross_profit: number;
-  gross_margin_pct: number | null;
-  operating_expenses: IncomeStatementRow[];
-  operating_expenses_total: number;
-  net_income: number;
+export interface IncomeStatementSection {
+  section:
+    | 'Revenue'
+    | 'COGS'
+    | 'Gross Profit'
+    | 'Operating Expenses'
+    | 'Net Income';
+  accounts: IncomeStatementAccount[];
+  section_total: number;
+  prior_total: number;
+  section_pct: number | null;
+  prior_pct: number | null;
 }
 
-export interface IncomeStatementReport extends IncomeStatementBody {
+export interface IncomeStatementReport {
   entity_code: string;
-  period: { from: string; to: string };
-  comparison: IncomeStatementBody | null;
+  preset: IncomeStatementPreset;
+  period_label: string;
+  prior_label: string;
+  period_start: string;
+  period_end: string;
+  prior_start: string;
+  prior_end: string;
+  total_revenue: number;
+  prior_revenue: number;
+  sections: IncomeStatementSection[];
 }
 
 export async function getIncomeStatement(params: {
   entity_code: string;
-  date_from: string;
-  date_to: string;
-  compare_to?: 'prior_period' | 'prior_year';
+  preset: IncomeStatementPreset;
+  period_end?: string;
+  date_from?: string;
+  date_to?: string;
 }): Promise<IncomeStatementReport> {
   const res = await api.get<IncomeStatementReport>(
     '/api/reports/income-statement',
     { params },
+  );
+  return res.data;
+}
+
+export interface IncomeStatementPeriod {
+  period_label: string;
+  period_start: string;
+  period_end: string;
+  status: string;
+  fiscal_year: number | null;
+  fiscal_period_number: number | null;
+}
+
+export interface IncomeStatementPeriodsResponse {
+  entity_code: string;
+  periods: IncomeStatementPeriod[];
+}
+
+export async function getIncomeStatementPeriods(
+  entityCode: string,
+): Promise<IncomeStatementPeriodsResponse> {
+  const res = await api.get<IncomeStatementPeriodsResponse>(
+    '/api/reports/income-statement/periods',
+    { params: { entity_code: entityCode } },
   );
   return res.data;
 }

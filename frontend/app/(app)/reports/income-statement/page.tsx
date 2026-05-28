@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ReportShell } from '@/components/reports/report-shell';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -9,49 +9,116 @@ import { Label } from '@/components/ui/label';
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
 import { useEntityStore } from '@/lib/store/entity';
 import {
   getIncomeStatement,
-  type IncomeStatementRow,
-  type IncomeStatementBody,
+  getIncomeStatementPeriods,
+  type IncomeStatementPreset,
+  type IncomeStatementSection,
 } from '@/lib/api/reports';
-import { formatMoney, formatMonthLabel, formatPercent } from '@/lib/utils';
+import { formatMoney } from '@/lib/utils';
+import { cn } from '@/lib/utils';
 
-type CompareTo = '' | 'prior_period' | 'prior_year';
+type SelectorValue =
+  | { kind: 'month'; period_end: string }
+  | { kind: 'ytd' | 'rolling12' | 'qtd' | 'trailing3' | 'last6' }
+  | { kind: 'custom' };
+
+function encodeSelector(v: SelectorValue): string {
+  return v.kind === 'month' ? `month:${v.period_end}` : v.kind;
+}
+
+function decodeSelector(s: string): SelectorValue {
+  if (s.startsWith('month:')) {
+    return { kind: 'month', period_end: s.slice('month:'.length) };
+  }
+  if (
+    s === 'ytd' ||
+    s === 'rolling12' ||
+    s === 'qtd' ||
+    s === 'trailing3' ||
+    s === 'last6' ||
+    s === 'custom'
+  ) {
+    return { kind: s };
+  }
+  return { kind: 'custom' };
+}
 
 export default function IncomeStatementPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
-  const today = new Date();
-  const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
-  const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-  const [periodStart, setPeriodStart] = useState(
-    lastMonthStart.toISOString().slice(0, 10),
-  );
-  const [periodEnd, setPeriodEnd] = useState(
-    lastMonthEnd.toISOString().slice(0, 10),
-  );
-  const [compareTo, setCompareTo] = useState<CompareTo>('');
 
-  const report = useQuery({
-    queryKey: ['income-statement', entityCode, periodStart, periodEnd, compareTo],
+  const periodsQ = useQuery({
+    queryKey: ['is-periods', entityCode],
     enabled: !!entityCode,
-    queryFn: () =>
-      getIncomeStatement({
-        entity_code: entityCode!,
-        date_from: periodStart,
-        date_to: periodEnd,
-        compare_to: compareTo || undefined,
-      }),
+    queryFn: () => getIncomeStatementPeriods(entityCode!),
   });
 
-  const subtitle = useMemo(
-    () => `${formatMonthLabel(periodStart)} – ${formatMonthLabel(periodEnd)}`,
-    [periodStart, periodEnd],
+  const closedPeriods = periodsQ.data?.periods ?? [];
+  const mostRecent = closedPeriods[0];
+
+  const defaultSelector: SelectorValue = mostRecent
+    ? { kind: 'month', period_end: mostRecent.period_end }
+    : { kind: 'custom' };
+
+  const [selector, setSelector] = useState<SelectorValue>(defaultSelector);
+  // When periods load after mount, jump to most-recent month if user hasn't touched the selector yet.
+  const [touched, setTouched] = useState(false);
+  if (!touched && selector.kind === 'custom' && mostRecent) {
+    setSelector({ kind: 'month', period_end: mostRecent.period_end });
+  }
+
+  const today = new Date();
+  const [customFrom, setCustomFrom] = useState(
+    new Date(today.getFullYear(), today.getMonth() - 1, 1).toISOString().slice(0, 10),
   );
+  const [customTo, setCustomTo] = useState(
+    new Date(today.getFullYear(), today.getMonth(), 0).toISOString().slice(0, 10),
+  );
+  // Anchor for ytd/rolling12/qtd/trailing3/last6 presets — defaults to
+  // the most recent closed period_end.
+  const presetAnchor = mostRecent?.period_end;
+
+  const [showCompare, setShowCompare] = useState(true);
+
+  const params = useMemo(() => {
+    if (!entityCode) return null;
+    if (selector.kind === 'month') {
+      return { entity_code: entityCode, preset: 'month' as const, period_end: selector.period_end };
+    }
+    if (selector.kind === 'custom') {
+      return {
+        entity_code: entityCode,
+        preset: 'custom' as const,
+        date_from: customFrom,
+        date_to: customTo,
+      };
+    }
+    if (!presetAnchor) return null;
+    return {
+      entity_code: entityCode,
+      preset: selector.kind satisfies IncomeStatementPreset,
+      period_end: presetAnchor,
+    };
+  }, [entityCode, selector, customFrom, customTo, presetAnchor]);
+
+  const report = useQuery({
+    queryKey: ['income-statement', params],
+    enabled: !!params,
+    queryFn: () => getIncomeStatement(params!),
+  });
+
+  const subtitle = report.data
+    ? showCompare
+      ? `${report.data.period_label} vs ${report.data.prior_label}`
+      : report.data.period_label
+    : '';
 
   return (
     <ReportShell
@@ -59,48 +126,106 @@ export default function IncomeStatementPage() {
       subtitle={subtitle}
       onExportCsv={() => {
         if (!report.data) return;
-        const lines: string[] = ['Section,Account,Name,Amount'];
-        for (const row of report.data.revenue)
-          lines.push(`Revenue,${row.account_code},"${row.account_name}",${row.amount}`);
-        for (const row of report.data.cogs)
-          lines.push(`COGS,${row.account_code},"${row.account_name}",${row.amount}`);
-        for (const row of report.data.operating_expenses)
-          lines.push(`Opex,${row.account_code},"${row.account_name}",${row.amount}`);
+        const header = showCompare
+          ? 'Section,Account Code,Account Name,Current,Prior Year,Current %,Prior Year %'
+          : 'Section,Account Code,Account Name,Current,Current %';
+        const lines: string[] = [header];
+        for (const sec of report.data.sections) {
+          for (const a of sec.accounts) {
+            const row = showCompare
+              ? `"${sec.section}",${a.account_code},"${a.account_name}",${a.current_amount},${a.prior_amount},${a.current_pct ?? ''},${a.prior_pct ?? ''}`
+              : `"${sec.section}",${a.account_code},"${a.account_name}",${a.current_amount},${a.current_pct ?? ''}`;
+            lines.push(row);
+          }
+          const totalRow = showCompare
+            ? `"${sec.section} — Total",,,"${sec.section_total}",${sec.prior_total},${sec.section_pct ?? ''},${sec.prior_pct ?? ''}`
+            : `"${sec.section} — Total",,,"${sec.section_total}",${sec.section_pct ?? ''}`;
+          lines.push(totalRow);
+        }
         const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `income-statement-${periodEnd}.csv`;
+        a.download = `income-statement-${report.data.period_end}.csv`;
         a.click();
         URL.revokeObjectURL(url);
       }}
     >
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4 max-w-2xl no-print">
-        <div>
-          <Label htmlFor="ps">Period start</Label>
-          <Input id="ps" type="date" value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} />
-        </div>
-        <div>
-          <Label htmlFor="pe">Period end</Label>
-          <Input id="pe" type="date" value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} />
-        </div>
-        <div>
-          <Label htmlFor="cmp">Compare to</Label>
+      <div className="flex flex-wrap items-end gap-3 mb-4 no-print">
+        <div className="min-w-[280px]">
+          <Label htmlFor="period">Period</Label>
           <Select
-            value={compareTo || 'none'}
-            onValueChange={(v) => setCompareTo(v === 'none' ? '' : (v as CompareTo))}
+            value={encodeSelector(selector)}
+            onValueChange={(v) => {
+              setTouched(true);
+              setSelector(decodeSelector(v));
+            }}
           >
-            <SelectTrigger id="cmp">
-              <SelectValue />
+            <SelectTrigger id="period">
+              <SelectValue placeholder="Pick a period" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="none">No comparison</SelectItem>
-              <SelectItem value="prior_period">Prior period</SelectItem>
-              <SelectItem value="prior_year">Prior year</SelectItem>
+              {closedPeriods.length > 0 && (
+                <SelectGroup>
+                  <SelectLabel>Monthly</SelectLabel>
+                  {closedPeriods.map((p) => (
+                    <SelectItem
+                      key={p.period_end}
+                      value={`month:${p.period_end}`}
+                    >
+                      {p.period_label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              )}
+              <SelectGroup>
+                <SelectLabel>Period ranges</SelectLabel>
+                <SelectItem value="ytd">Year to date (fiscal)</SelectItem>
+                <SelectItem value="rolling12">Rolling 12 months</SelectItem>
+                <SelectItem value="qtd">Quarter to date (fiscal)</SelectItem>
+                <SelectItem value="trailing3">Last 3 months</SelectItem>
+                <SelectItem value="last6">Last 6 months</SelectItem>
+              </SelectGroup>
+              <SelectGroup>
+                <SelectLabel>Custom</SelectLabel>
+                <SelectItem value="custom">Custom date range…</SelectItem>
+              </SelectGroup>
             </SelectContent>
           </Select>
         </div>
+        {selector.kind === 'custom' && (
+          <>
+            <div>
+              <Label htmlFor="from">From</Label>
+              <Input
+                id="from"
+                type="date"
+                value={customFrom}
+                onChange={(e) => setCustomFrom(e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="to">To</Label>
+              <Input
+                id="to"
+                type="date"
+                value={customTo}
+                onChange={(e) => setCustomTo(e.target.value)}
+              />
+            </div>
+          </>
+        )}
+        <label className="flex items-center gap-2 text-sm text-ink cursor-pointer pb-2">
+          <input
+            type="checkbox"
+            checked={showCompare}
+            onChange={(e) => setShowCompare(e.target.checked)}
+            className="h-4 w-4 rounded border-input text-ledger-blue"
+          />
+          Compare to prior year
+        </label>
       </div>
+
       {report.isLoading ? (
         <Skeleton className="h-96" />
       ) : report.isError ? (
@@ -108,115 +233,170 @@ export default function IncomeStatementPage() {
       ) : !report.data ? (
         <p className="text-slate">No data for this period.</p>
       ) : (
-        <div className="space-y-6">
-          <Section label="Revenue" rows={report.data.revenue} subtotal={report.data.revenue_total} />
-          <Section label="Cost of Goods Sold" rows={report.data.cogs} subtotal={report.data.cogs_total} />
-          <Row
-            label="Gross Profit"
-            amount={report.data.gross_profit}
-            bold
-            extra={
-              report.data.gross_margin_pct !== null
-                ? formatPercent(report.data.gross_margin_pct, 1)
-                : undefined
-            }
-          />
-          <Section
-            label="Operating Expenses"
-            rows={report.data.operating_expenses}
-            subtotal={report.data.operating_expenses_total}
-          />
-          <div className="border-t-2 border-deep-navy pt-3">
-            <Row label="Net Income" amount={report.data.net_income} bold large />
-          </div>
-          {report.data.comparison && <ComparisonBlock body={report.data.comparison} />}
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-cloud sticky top-0">
+              <tr>
+                <th className="text-left font-semibold text-deep-navy px-4 py-2">
+                  Account
+                </th>
+                <th className="text-right font-semibold text-deep-navy px-4 py-2">
+                  {report.data.period_label}
+                </th>
+                {showCompare && (
+                  <th className="text-right font-semibold text-deep-navy px-4 py-2">
+                    {report.data.prior_label}
+                  </th>
+                )}
+                <th className="text-right font-semibold text-deep-navy px-4 py-2">
+                  %
+                </th>
+                {showCompare && (
+                  <th className="text-right font-semibold text-deep-navy px-4 py-2">
+                    PY %
+                  </th>
+                )}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {report.data.sections.map((sec) => (
+                <SectionRows
+                  key={sec.section}
+                  section={sec}
+                  showCompare={showCompare}
+                />
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </ReportShell>
   );
 }
 
-function Section({
-  label,
-  rows,
-  subtotal,
+function SectionRows({
+  section,
+  showCompare,
 }: {
-  label: string;
-  rows: IncomeStatementRow[];
-  subtotal: number;
+  section: IncomeStatementSection;
+  showCompare: boolean;
 }) {
+  const isSummary =
+    section.section === 'Gross Profit' || section.section === 'Net Income';
+  const summaryClass = section.section === 'Net Income'
+    ? 'bg-cloud font-bold text-deep-navy border-t-2 border-deep-navy'
+    : 'bg-cloud/60 font-semibold text-deep-navy border-t border-deep-navy';
+  if (isSummary) {
+    return (
+      <tr className={summaryClass}>
+        <td className="px-4 py-2 uppercase tracking-wider text-xs">
+          {section.section}
+        </td>
+        <td className="px-4 py-2 text-right tabular-nums">
+          {formatAmt(section.section_total)}
+        </td>
+        {showCompare && (
+          <td className="px-4 py-2 text-right tabular-nums">
+            {formatAmt(section.prior_total)}
+          </td>
+        )}
+        <td className="px-4 py-2 text-right tabular-nums">
+          {formatPct(section.section_pct)}
+        </td>
+        {showCompare && (
+          <td className="px-4 py-2 text-right tabular-nums">
+            {formatPct(section.prior_pct)}
+          </td>
+        )}
+      </tr>
+    );
+  }
+
   return (
-    <div>
-      <div className="text-sm font-semibold text-deep-navy uppercase tracking-wider mb-2">
-        {label}
-      </div>
-      {rows.length === 0 ? (
-        <div className="text-sm text-slate py-1.5">No activity in this period.</div>
+    <>
+      <tr className="bg-cloud/40">
+        <td
+          className="px-4 py-1.5 text-xs uppercase tracking-wider font-semibold text-deep-navy"
+          colSpan={showCompare ? 5 : 3}
+        >
+          {section.section}
+        </td>
+      </tr>
+      {section.accounts.length === 0 ? (
+        <tr>
+          <td
+            className="px-4 py-1.5 text-xs text-slate italic"
+            colSpan={showCompare ? 5 : 3}
+          >
+            No activity.
+          </td>
+        </tr>
       ) : (
-        <div className="divide-y divide-border">
-          {rows.map((r) => (
-            <div key={r.account_code} className="flex justify-between py-1.5 text-sm">
-              <span className="text-ink">
-                <span className="text-slate font-mono mr-2">{r.account_code}</span>
-                {r.account_name}
+        section.accounts.map((a) => (
+          <tr key={a.account_code} className="hover:bg-cloud">
+            <td className="px-4 py-1.5">
+              <span className="text-slate font-mono text-xs mr-2">
+                {a.account_code}
               </span>
-              <span className="tabular-nums text-ink">{formatMoney(r.amount)}</span>
-            </div>
-          ))}
-        </div>
+              <span className="text-ink">{a.account_name}</span>
+            </td>
+            <td className="px-4 py-1.5 text-right tabular-nums">
+              {formatAmt(a.current_amount)}
+            </td>
+            {showCompare && (
+              <td className="px-4 py-1.5 text-right tabular-nums">
+                {formatAmt(a.prior_amount)}
+              </td>
+            )}
+            <td className="px-4 py-1.5 text-right tabular-nums">
+              {formatPct(a.current_pct)}
+            </td>
+            {showCompare && (
+              <td className="px-4 py-1.5 text-right tabular-nums">
+                {formatPct(a.prior_pct)}
+              </td>
+            )}
+          </tr>
+        ))
       )}
-      <div className="flex justify-between py-2 font-semibold border-t border-deep-navy text-deep-navy">
-        <span>Total {label}</span>
-        <span className="tabular-nums">{formatMoney(subtotal)}</span>
-      </div>
-    </div>
+      <tr className="font-semibold text-deep-navy border-t border-border">
+        <td className="px-4 py-1.5">Total {section.section}</td>
+        <td className="px-4 py-1.5 text-right tabular-nums">
+          {formatAmt(section.section_total)}
+        </td>
+        {showCompare && (
+          <td className="px-4 py-1.5 text-right tabular-nums">
+            {formatAmt(section.prior_total)}
+          </td>
+        )}
+        <td className="px-4 py-1.5 text-right tabular-nums">
+          {formatPct(section.section_pct)}
+        </td>
+        {showCompare && (
+          <td className="px-4 py-1.5 text-right tabular-nums">
+            {formatPct(section.prior_pct)}
+          </td>
+        )}
+      </tr>
+    </>
   );
 }
 
-function Row({
-  label,
-  amount,
-  bold,
-  large,
-  extra,
-}: {
-  label: string;
-  amount: number;
-  bold?: boolean;
-  large?: boolean;
-  extra?: string;
-}) {
-  return (
-    <div
-      className={`flex justify-between py-2 ${bold ? 'font-semibold' : ''} ${large ? 'text-xl text-deep-navy' : 'text-sm'}`}
-    >
-      <span>
-        {label}
-        {extra && <span className="text-slate ml-2 text-sm">({extra})</span>}
+function formatAmt(n: number): React.ReactNode {
+  if (!n) return <span className="text-slate">—</span>;
+  if (n < 0) {
+    return (
+      <span className="text-red-700">
+        ({formatMoney(Math.abs(n))})
       </span>
-      <span className="tabular-nums">{formatMoney(amount)}</span>
-    </div>
-  );
+    );
+  }
+  return formatMoney(n);
 }
 
-function ComparisonBlock({ body }: { body: IncomeStatementBody }) {
-  return (
-    <div className="border-t border-border pt-4">
-      <div className="text-sm font-semibold text-slate uppercase tracking-wider mb-2">
-        Comparison period
-      </div>
-      <dl className="grid grid-cols-2 gap-2 text-sm max-w-md">
-        <dt className="text-slate">Revenue</dt>
-        <dd className="tabular-nums text-ink">{formatMoney(body.revenue_total)}</dd>
-        <dt className="text-slate">COGS</dt>
-        <dd className="tabular-nums text-ink">{formatMoney(body.cogs_total)}</dd>
-        <dt className="text-slate">Gross profit</dt>
-        <dd className="tabular-nums text-ink">{formatMoney(body.gross_profit)}</dd>
-        <dt className="text-slate">Operating expenses</dt>
-        <dd className="tabular-nums text-ink">{formatMoney(body.operating_expenses_total)}</dd>
-        <dt className="text-slate font-semibold">Net income</dt>
-        <dd className="tabular-nums text-ink font-semibold">{formatMoney(body.net_income)}</dd>
-      </dl>
-    </div>
-  );
+function formatPct(n: number | null): React.ReactNode {
+  if (n === null || n === undefined) return <span className="text-slate">—</span>;
+  if (n === 0) return <span className="text-slate">—</span>;
+  const cls = cn(n < 0 && 'text-red-700');
+  return <span className={cls}>{n.toFixed(1)}%</span>;
 }

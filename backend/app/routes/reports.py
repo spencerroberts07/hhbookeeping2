@@ -32,7 +32,7 @@ draft hasn't been agreed-to yet and shouldn't move report numbers.
 """
 from __future__ import annotations
 
-from datetime import date as DateType, datetime as DateTimeType
+from datetime import date as DateType, datetime as DateTimeType, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -43,6 +43,63 @@ from ..db import db_session
 from ..services_auth import require_role
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+
+# Bridlewood fiscal year ends Sep 30 — months Oct-Dec roll into the
+# next FY number (e.g., Oct 2025 is FY2026 P01). Hardcoded for now;
+# per-entity FY config can come later.
+_FY_END_MONTH = 9
+
+
+def _fy_of(d: DateType) -> int:
+    return d.year + 1 if d.month > _FY_END_MONTH else d.year
+
+
+def _fy_start(fy: int) -> DateType:
+    return DateType(fy - 1, _FY_END_MONTH + 1, 1)
+
+
+def _last_day_of_month(d: DateType) -> DateType:
+    nxt = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return nxt - timedelta(days=1)
+
+
+def _first_day_of_month(d: DateType) -> DateType:
+    return d.replace(day=1)
+
+
+def _shift_by_months(d: DateType, months: int) -> DateType:
+    """Add a signed number of months to d, snapping day to month end if
+    overflowed (e.g. shifting Feb-28 back 12 months stays Feb-28)."""
+    total = d.month - 1 + months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    last = _last_day_of_month(DateType(year, month, 1))
+    day = min(d.day, last.day)
+    return DateType(year, month, day)
+
+
+def _fiscal_quarter_start(d: DateType) -> DateType:
+    """Bridlewood quarters: Q1 Oct-Dec, Q2 Jan-Mar, Q3 Apr-Jun, Q4 Jul-Sep."""
+    m = d.month
+    if m in (10, 11, 12):
+        return DateType(d.year, 10, 1)
+    if m in (1, 2, 3):
+        return DateType(d.year, 1, 1)
+    if m in (4, 5, 6):
+        return DateType(d.year, 4, 1)
+    return DateType(d.year, 7, 1)
+
+
+def _fiscal_quarter_number(d: DateType) -> int:
+    m = d.month
+    if m in (10, 11, 12):
+        return 1
+    if m in (1, 2, 3):
+        return 2
+    if m in (4, 5, 6):
+        return 3
+    return 4
 
 
 # --------------------------------------------------------------------------
@@ -196,97 +253,395 @@ def _parse_date(name: str, value: str) -> DateType:
 
 
 # --------------------------------------------------------------------------
-# Income Statement
+# Income Statement (enhanced — 4-column with preset date ranges)
 # --------------------------------------------------------------------------
+
+
+# Stricter status whitelist used by the enhanced income statement.
+# Mirrors the dashboard's POSTED_BATCH_STATUSES — only counts journals
+# that have been explicitly posted/approved.
+_IS_BATCH_STATUSES = ("posted", "approved_to_post", "approved", "closed_locked")
+# Periods must be closed (or in active close approval) to feed the IS.
+_IS_PERIOD_STATUSES = ("closed_locked", "approved_to_close")
+
+
+_VALID_PRESETS = (
+    "month",
+    "ytd",
+    "rolling12",
+    "qtd",
+    "trailing3",
+    "last6",
+    "custom",
+)
+
+
+def _resolve_preset_range(
+    preset: str,
+    period_end: DateType | None,
+    date_from: DateType | None,
+    date_to: DateType | None,
+) -> tuple[DateType, DateType, str, str]:
+    """Returns (current_start, current_end, current_label, prior_label).
+    Prior range is always the same span shifted back 12 months."""
+    if preset == "custom":
+        if not date_from or not date_to:
+            raise HTTPException(400, "custom preset requires date_from and date_to")
+        cur_start, cur_end = date_from, date_to
+        label = f"{cur_start.isoformat()} → {cur_end.isoformat()}"
+        prior_label = (
+            f"{_shift_by_months(cur_start, -12).isoformat()} → "
+            f"{_shift_by_months(cur_end, -12).isoformat()}"
+        )
+        return cur_start, cur_end, label, prior_label
+
+    if period_end is None:
+        raise HTTPException(400, f"{preset!r} preset requires period_end")
+
+    pe = _last_day_of_month(period_end)
+    month_name = pe.strftime("%b %Y")
+
+    if preset == "month":
+        cur_start = _first_day_of_month(pe)
+        return cur_start, pe, month_name, _shift_by_months(pe, -12).strftime("%b %Y")
+
+    if preset == "ytd":
+        fy = _fy_of(pe)
+        cur_start = _fy_start(fy)
+        prior_start = _fy_start(fy - 1)
+        prior_end = _shift_by_months(pe, -12)
+        return (
+            cur_start,
+            pe,
+            f"YTD FY{fy} → {pe.strftime('%b %Y')}",
+            f"YTD FY{fy - 1} → {prior_end.strftime('%b %Y')}",
+        )
+
+    if preset == "rolling12":
+        cur_start = _first_day_of_month(_shift_by_months(pe, -11))
+        return (
+            cur_start,
+            pe,
+            f"Rolling 12 mo ending {month_name}",
+            f"Rolling 12 mo ending {_shift_by_months(pe, -12).strftime('%b %Y')}",
+        )
+
+    if preset == "qtd":
+        cur_start = _fiscal_quarter_start(pe)
+        q = _fiscal_quarter_number(pe)
+        fy = _fy_of(pe)
+        return (
+            cur_start,
+            pe,
+            f"QTD Q{q} FY{fy} → {month_name}",
+            f"QTD Q{q} FY{fy - 1} → {_shift_by_months(pe, -12).strftime('%b %Y')}",
+        )
+
+    if preset == "trailing3":
+        cur_start = _first_day_of_month(_shift_by_months(pe, -2))
+        return (
+            cur_start,
+            pe,
+            f"Trailing 3 mo ending {month_name}",
+            f"Trailing 3 mo ending {_shift_by_months(pe, -12).strftime('%b %Y')}",
+        )
+
+    if preset == "last6":
+        cur_start = _first_day_of_month(_shift_by_months(pe, -5))
+        return (
+            cur_start,
+            pe,
+            f"Trailing 6 mo ending {month_name}",
+            f"Trailing 6 mo ending {_shift_by_months(pe, -12).strftime('%b %Y')}",
+        )
+
+    raise HTTPException(400, f"unknown preset {preset!r}")
+
+
+def _is_account_sums(
+    session,
+    *,
+    entity_id: str,
+    period_start: DateType,
+    period_end: DateType,
+) -> list[dict[str, Any]]:
+    """Per-account debit/credit sums for the income statement.
+
+    Tighter filter than `_account_sums`: requires periods in
+    `_IS_PERIOD_STATUSES` and batches in `_IS_BATCH_STATUSES`.
+    """
+    rows = session.execute(
+        text(
+            """
+            WITH sums AS (
+                SELECT jl.account_code,
+                       SUM(jl.debit_amount)  AS sum_debit,
+                       SUM(jl.credit_amount) AS sum_credit
+                  FROM journal_lines jl
+                  JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                  JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                 WHERE jb.entity_id = :entity_id
+                   AND ap.period_start >= :period_start
+                   AND ap.period_end <= :period_end
+                   AND ap.status = ANY(:period_statuses)
+                   AND jb.status = ANY(:batch_statuses)
+              GROUP BY jl.account_code
+            ),
+            names AS (
+                SELECT DISTINCT ON (account_code)
+                       account_code, account_name
+                  FROM gl_account_balances
+                 WHERE entity_id = :entity_id
+              ORDER BY account_code, created_at DESC
+            )
+            SELECT s.account_code,
+                   s.sum_debit,
+                   s.sum_credit,
+                   n.account_name
+              FROM sums s
+         LEFT JOIN names n ON n.account_code = s.account_code
+          ORDER BY s.account_code
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+            "period_statuses": list(_IS_PERIOD_STATUSES),
+            "batch_statuses": list(_IS_BATCH_STATUSES),
+        },
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _signed_amount_by_type(t: str, debit: Decimal, credit: Decimal) -> Decimal:
+    """Convert raw debit/credit sums into the natural P&L sign.
+
+    Revenue: credit-natural → credit - debit (positive = real revenue,
+    negative = contra/refund).
+    COGS / Opex: debit-natural → debit - credit (positive = expense).
+    """
+    if t == "revenue":
+        return credit - debit
+    if t in {"cogs", "operating_expense"}:
+        return debit - credit
+    if t == "other_income_expense":
+        return credit - debit
+    return Decimal("0")
+
+
+def _pct(amount: Decimal, base: Decimal) -> float | None:
+    if base == 0:
+        return None
+    return round(float(amount / base * 100), 1)
+
+
+def _build_is_side(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate raw _is_account_sums rows into per-account natural-sign
+    amounts grouped by section. No percentages yet — those are applied
+    once we know total_revenue."""
+    by_section: dict[str, list[dict[str, Any]]] = {
+        "revenue": [],
+        "cogs": [],
+        "operating_expenses": [],
+    }
+    for r in rows:
+        code = r["account_code"]
+        t = _account_type(code)
+        if t not in {"revenue", "cogs", "operating_expense"}:
+            continue
+        debit = Decimal(str(r["sum_debit"] or 0))
+        credit = Decimal(str(r["sum_credit"] or 0))
+        amount = _signed_amount_by_type(t, debit, credit)
+        if amount == 0:
+            continue
+        section_key = (
+            "revenue" if t == "revenue"
+            else "cogs" if t == "cogs"
+            else "operating_expenses"
+        )
+        by_section[section_key].append({
+            "account_code": code,
+            "account_name": r.get("account_name") or code,
+            "amount": amount,
+        })
+
+    revenue_total = sum((a["amount"] for a in by_section["revenue"]), Decimal("0"))
+    cogs_total = sum((a["amount"] for a in by_section["cogs"]), Decimal("0"))
+    opex_total = sum((a["amount"] for a in by_section["operating_expenses"]), Decimal("0"))
+    gross_profit = revenue_total - cogs_total
+    net_income = gross_profit - opex_total
+
+    return {
+        "by_section": by_section,
+        "revenue_total": revenue_total,
+        "cogs_total": cogs_total,
+        "opex_total": opex_total,
+        "gross_profit": gross_profit,
+        "net_income": net_income,
+    }
+
+
+@router.get("/income-statement/periods")
+def list_income_statement_periods(
+    entity_code: str = Query(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Closed periods for the income-statement preset dropdown.
+
+    Returns the periods that are eligible to anchor the report
+    (closed_locked or approved_to_close) in descending date order.
+    """
+    with db_session() as session:
+        entity = _resolve_entity(session, entity_code)
+        rows = session.execute(
+            text(
+                """
+                SELECT id, period_label, period_start, period_end,
+                       status, fiscal_year, fiscal_period_number
+                  FROM accounting_periods
+                 WHERE entity_id = :eid
+                   AND status = ANY(:statuses)
+              ORDER BY period_end DESC
+                """
+            ),
+            {"eid": entity["id"], "statuses": list(_IS_PERIOD_STATUSES)},
+        ).mappings().all()
+    return {
+        "entity_code": entity_code,
+        "periods": [
+            {
+                "period_label": r["period_label"],
+                "period_start": r["period_start"].isoformat(),
+                "period_end": r["period_end"].isoformat(),
+                "status": r["status"],
+                "fiscal_year": r["fiscal_year"],
+                "fiscal_period_number": r["fiscal_period_number"],
+            }
+            for r in rows
+        ],
+    }
 
 
 @router.get("/income-statement")
 def get_income_statement(
     entity_code: str = Query(...),
-    date_from: str = Query(...),
-    date_to: str = Query(...),
-    compare_to: str | None = Query(default=None, pattern="^(prior_period|prior_year)$"),
+    preset: str = Query(default="month"),
+    period_end: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     _user: Any = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
-    period_start = _parse_date("date_from", date_from)
-    period_end = _parse_date("date_to", date_to)
-    if period_end < period_start:
+    if preset not in _VALID_PRESETS:
+        raise HTTPException(400, f"preset must be one of {_VALID_PRESETS}")
+
+    pe = _parse_date("period_end", period_end) if period_end else None
+    df = _parse_date("date_from", date_from) if date_from else None
+    dt = _parse_date("date_to", date_to) if date_to else None
+    if dt and df and dt < df:
         raise HTTPException(400, "date_to must be on or after date_from")
+
+    cur_start, cur_end, period_label, prior_label = _resolve_preset_range(
+        preset, pe, df, dt,
+    )
+    prior_start = _shift_by_months(cur_start, -12)
+    prior_end = _shift_by_months(cur_end, -12)
 
     with db_session() as session:
         entity = _resolve_entity(session, entity_code)
-        primary = _build_income_statement(session, entity["id"], period_start, period_end)
+        cur_rows = _is_account_sums(
+            session, entity_id=entity["id"],
+            period_start=cur_start, period_end=cur_end,
+        )
+        prior_rows = _is_account_sums(
+            session, entity_id=entity["id"],
+            period_start=prior_start, period_end=prior_end,
+        )
 
-        comparison: dict[str, Any] | None = None
-        if compare_to == "prior_period":
-            span = (period_end - period_start).days + 1
-            from datetime import timedelta
-            prior_end = period_start - timedelta(days=1)
-            prior_start = prior_end - timedelta(days=span - 1)
-            comparison = _build_income_statement(session, entity["id"], prior_start, prior_end)
-        elif compare_to == "prior_year":
-            from datetime import timedelta
-            prior_start = period_start.replace(year=period_start.year - 1)
-            prior_end = period_end.replace(year=period_end.year - 1)
-            comparison = _build_income_statement(session, entity["id"], prior_start, prior_end)
+    cur = _build_is_side(cur_rows)
+    prior = _build_is_side(prior_rows)
+
+    # Index prior accounts by code so each current row can attach its
+    # prior-period counterpart (and vice versa for prior-only accounts).
+    def index_by_code(section: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {a["account_code"]: a for a in section}
+
+    cur_by_sec = {
+        "revenue": index_by_code(cur["by_section"]["revenue"]),
+        "cogs": index_by_code(cur["by_section"]["cogs"]),
+        "operating_expenses": index_by_code(cur["by_section"]["operating_expenses"]),
+    }
+    prior_by_sec = {
+        "revenue": index_by_code(prior["by_section"]["revenue"]),
+        "cogs": index_by_code(prior["by_section"]["cogs"]),
+        "operating_expenses": index_by_code(prior["by_section"]["operating_expenses"]),
+    }
+
+    cur_rev_total = cur["revenue_total"]
+    prior_rev_total = prior["revenue_total"]
+
+    def merge_section(label: str, key: str) -> dict[str, Any]:
+        codes = sorted(set(cur_by_sec[key].keys()) | set(prior_by_sec[key].keys()))
+        accounts: list[dict[str, Any]] = []
+        for code in codes:
+            c = cur_by_sec[key].get(code)
+            p = prior_by_sec[key].get(code)
+            c_amt = c["amount"] if c else Decimal("0")
+            p_amt = p["amount"] if p else Decimal("0")
+            name = (c["account_name"] if c else None) or (p["account_name"] if p else None) or code
+            accounts.append({
+                "account_code": code,
+                "account_name": name,
+                "current_amount": float(c_amt),
+                "prior_amount": float(p_amt),
+                "current_pct": _pct(c_amt, cur_rev_total),
+                "prior_pct": _pct(p_amt, prior_rev_total),
+            })
+        section_total = sum((Decimal(str(a["current_amount"])) for a in accounts), Decimal("0"))
+        prior_total = sum((Decimal(str(a["prior_amount"])) for a in accounts), Decimal("0"))
+        return {
+            "section": label,
+            "accounts": accounts,
+            "section_total": float(section_total),
+            "prior_total": float(prior_total),
+            "section_pct": _pct(section_total, cur_rev_total),
+            "prior_pct": _pct(prior_total, prior_rev_total),
+        }
+
+    sections = [
+        merge_section("Revenue", "revenue"),
+        merge_section("COGS", "cogs"),
+        {
+            "section": "Gross Profit",
+            "accounts": [],
+            "section_total": float(cur["gross_profit"]),
+            "prior_total": float(prior["gross_profit"]),
+            "section_pct": _pct(cur["gross_profit"], cur_rev_total),
+            "prior_pct": _pct(prior["gross_profit"], prior_rev_total),
+        },
+        merge_section("Operating Expenses", "operating_expenses"),
+        {
+            "section": "Net Income",
+            "accounts": [],
+            "section_total": float(cur["net_income"]),
+            "prior_total": float(prior["net_income"]),
+            "section_pct": _pct(cur["net_income"], cur_rev_total),
+            "prior_pct": _pct(prior["net_income"], prior_rev_total),
+        },
+    ]
 
     return {
         "entity_code": entity_code,
-        "period": {"from": period_start.isoformat(), "to": period_end.isoformat()},
-        **primary,
-        "comparison": comparison,
-    }
-
-
-def _build_income_statement(
-    session, entity_id: str, period_start: DateType, period_end: DateType,
-) -> dict[str, Any]:
-    rows = _account_sums(
-        session,
-        entity_id=entity_id,
-        period_end_from=period_start,
-        period_end_to=period_end,
-    )
-    revenue: list[dict[str, Any]] = []
-    cogs: list[dict[str, Any]] = []
-    operating_expenses: list[dict[str, Any]] = []
-    for r in rows:
-        code = r["account_code"]
-        t = _account_type(code)
-        debit = Decimal(str(r["sum_debit"] or 0))
-        credit = Decimal(str(r["sum_credit"] or 0))
-        name = r.get("account_name") or code
-        if t == "revenue":
-            amount = credit - debit  # credits increase revenue
-            if amount != 0:
-                revenue.append({"account_code": code, "account_name": name, "amount": float(amount)})
-        elif t == "cogs":
-            amount = debit - credit  # debits increase COGS
-            if amount != 0:
-                cogs.append({"account_code": code, "account_name": name, "amount": float(amount)})
-        elif t == "operating_expense":
-            amount = debit - credit
-            if amount != 0:
-                operating_expenses.append({"account_code": code, "account_name": name, "amount": float(amount)})
-
-    revenue_total = sum(Decimal(str(r["amount"])) for r in revenue)
-    cogs_total = sum(Decimal(str(r["amount"])) for r in cogs)
-    gross_profit = revenue_total - cogs_total
-    opex_total = sum(Decimal(str(r["amount"])) for r in operating_expenses)
-    net_income = gross_profit - opex_total
-    gross_margin_pct = (
-        float((gross_profit / revenue_total) * 100) if revenue_total else None
-    )
-    return {
-        "revenue": revenue,
-        "revenue_total": float(revenue_total),
-        "cogs": cogs,
-        "cogs_total": float(cogs_total),
-        "gross_profit": float(gross_profit),
-        "gross_margin_pct": gross_margin_pct,
-        "operating_expenses": operating_expenses,
-        "operating_expenses_total": float(opex_total),
-        "net_income": float(net_income),
+        "preset": preset,
+        "period_label": period_label,
+        "prior_label": prior_label,
+        "period_start": cur_start.isoformat(),
+        "period_end": cur_end.isoformat(),
+        "prior_start": prior_start.isoformat(),
+        "prior_end": prior_end.isoformat(),
+        "total_revenue": float(cur_rev_total),
+        "prior_revenue": float(prior_rev_total),
+        "sections": sections,
     }
 
 
