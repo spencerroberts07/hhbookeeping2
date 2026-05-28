@@ -56,6 +56,9 @@ export interface GrossMarginResponse {
   sales: number;
   cogs: number;
   margin_pct: number;
+  ttm_sales?: number;
+  ttm_cogs?: number;
+  ttm_margin_pct?: number;
 }
 
 export async function getGrossMargin(
@@ -64,6 +67,47 @@ export async function getGrossMargin(
   const res = await api.get<GrossMarginResponse>('/api/dashboard/gross-margin', {
     params: { entity_code: entityCode },
   });
+  return res.data;
+}
+
+export interface SalesHistoryPoint {
+  period_end: string;
+  period_label: string;
+  sales: number;
+  cogs: number;
+  margin_pct: number;
+}
+
+export interface SalesHistoryResponse {
+  entity_code: string;
+  months: number;
+  series: SalesHistoryPoint[];
+}
+
+export async function getSalesHistory(
+  entityCode: string,
+  months = 24,
+): Promise<SalesHistoryResponse> {
+  const res = await api.get<SalesHistoryResponse>(
+    '/api/dashboard/sales-history',
+    { params: { entity_code: entityCode, months } },
+  );
+  return res.data;
+}
+
+export interface GlCashBalanceResponse {
+  entity_code: string;
+  account_code: string;
+  balance: number;
+}
+
+export async function getGlCashBalance(
+  entityCode: string,
+): Promise<GlCashBalanceResponse> {
+  const res = await api.get<GlCashBalanceResponse>(
+    '/api/dashboard/gl-cash-balance',
+    { params: { entity_code: entityCode } },
+  );
   return res.data;
 }
 

@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
-import { getGrossMargin } from '@/lib/api/dashboard';
+import { getGlCashBalance, getGrossMargin } from '@/lib/api/dashboard';
 import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
@@ -76,15 +76,23 @@ export default function DashboardPage() {
     enabled: !!entityCode && !!periodEnd,
     queryFn: () => getPeriodStatus(entityCode!, periodEnd!),
   });
-  // Cash card now reads from QBO live (sum of every active bank
-  // account's CurrentBalance). The cash_balancing_days snapshot from
-  // last night isn't a real-time view — QBO is.
+  // Cash card primarily reads QBO live (sum of every active bank
+  // account's CurrentBalance) — QBO is the real-time view, not the
+  // cash_balancing_days snapshot from last night. When QBO is
+  // disconnected or errors, fall back to the GL balance on account
+  // 1020 so the card still shows a number.
   const qboBalances = useQuery({
     queryKey: ['qbo-bank-balances', entityCode],
     enabled: !!entityCode,
     queryFn: () => getQboBankBalances(entityCode!),
     // Live-ish: stale after 60s, refetch on focus.
     staleTime: 60 * 1000,
+  });
+  const qboDisconnected = qboBalances.data && !qboBalances.data.connected;
+  const glCash = useQuery({
+    queryKey: ['gl-cash-balance', entityCode],
+    enabled: !!entityCode && qboDisconnected,
+    queryFn: () => getGlCashBalance(entityCode!),
   });
   const grossMargin = useQuery({
     queryKey: ['gross-margin', entityCode],
@@ -234,14 +242,27 @@ export default function DashboardPage() {
                 </>
               ) : (
                 <>
-                  <div className="text-2xl font-bold text-slate">
-                    Not connected
-                  </div>
+                  {glCash.isLoading ? (
+                    <Skeleton className="h-9 w-32" />
+                  ) : glCash.data ? (
+                    <>
+                      <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
+                        {formatMoney(glCash.data.balance)}
+                      </div>
+                      <p className="text-[10px] text-slate mt-1">
+                        Book balance (GL · acct 1020)
+                      </p>
+                    </>
+                  ) : (
+                    <div className="text-2xl font-bold text-slate">
+                      Not connected
+                    </div>
+                  )}
                   <Link
                     href="/settings"
-                    className="text-xs text-ledger-blue hover:underline"
+                    className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
                   >
-                    Connect QuickBooks to see live balance →
+                    Connect QuickBooks for live balance →
                   </Link>
                 </>
               )}
@@ -281,7 +302,10 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
 
-          {/* Gross margin */}
+          {/* Gross margin — rolling 12 months. ttm_margin_pct is computed
+              server-side from posted/approved batches across the trailing
+              12 periods ending at the current period_end. Falls back to
+              the single-period margin if the TTM field is absent. */}
           <Card>
             <CardHeader>
               <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
@@ -293,14 +317,17 @@ export default function DashboardPage() {
                 {grossMargin.isLoading ? (
                   <Skeleton className="h-9 w-24" />
                 ) : grossMargin.data && grossMargin.data.period_end ? (
-                  formatPercent(grossMargin.data.margin_pct)
+                  formatPercent(
+                    grossMargin.data.ttm_margin_pct ??
+                      grossMargin.data.margin_pct,
+                  )
                 ) : (
                   <span className="text-slate text-base">No data</span>
                 )}
               </div>
               {grossMargin.data?.period_label && (
                 <p className="text-xs text-slate mt-1">
-                  {grossMargin.data.period_label}
+                  Trailing 12 months · ending {grossMargin.data.period_label}
                 </p>
               )}
               <GrossMarginSparkline />
