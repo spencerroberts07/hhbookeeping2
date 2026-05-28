@@ -196,6 +196,12 @@ export function StepOpening() {
       }),
     onSuccess: (res) => {
       toast.success(`Opening balance journal posted — ${res.line_count} lines`);
+      // Backend skips income-statement accounts (4/5/6/7) on save and
+      // returns a warning when any were dropped. Surface it so the
+      // dealer can re-export a post-close TB if they want those lines.
+      if (res.warning) {
+        toast.warning(res.warning, { duration: 10_000 });
+      }
       qc.invalidateQueries({ queryKey: ['onboarding-status', entityCode] });
       setPreview(null);
       setManualMode(false);

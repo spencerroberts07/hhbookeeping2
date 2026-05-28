@@ -188,6 +188,12 @@ function OpeningBalancesSection({ entityCode }: { entityCode: string }) {
       }),
     onSuccess: (res) => {
       toast.success(`Opening balances posted — ${res.line_count} lines`);
+      // Backend filters out income-statement accounts on save and
+      // returns a warning when any were skipped. Surface it so the
+      // dealer can decide whether to re-export a post-close TB.
+      if (res.warning) {
+        toast.warning(res.warning, { duration: 10_000 });
+      }
       setPreview(null);
       qc.invalidateQueries({ queryKey: ['onboarding-status', entityCode] });
     },
@@ -345,6 +351,19 @@ function PreviewTable({
   const pluggable = !balanced && Math.abs(totals.variance) <= PLUG_TOLERANCE;
   const blocked = !balanced && !pluggable;
 
+  // Detect income-statement accounts (4/5/6/7) before the user clicks
+  // Save. The backend filters them out on insertion, but warning
+  // up-front lets the dealer go back and re-export a post-close TB
+  // instead of seeing a confusing variance error after submitting.
+  const incomeStatementLines = useMemo(
+    () =>
+      preview.tb_lines.filter((l) => {
+        const c = (l.account_code || '').trim();
+        return c.length > 0 && ['4', '5', '6', '7'].includes(c[0]!);
+      }),
+    [preview.tb_lines],
+  );
+
   const update = (idx: number, patch: Partial<TbPreviewLine>) => {
     const next = preview.tb_lines.map((l, i) => (i === idx ? { ...l, ...patch } : l));
     const t = recompute(next);
@@ -389,6 +408,25 @@ function PreviewTable({
 
   return (
     <div className="space-y-3">
+      {incomeStatementLines.length > 0 && (
+        <div className="rounded-md border-2 border-amber-300 bg-amber-50 p-3 text-sm flex items-start gap-2">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-amber-700" />
+          <div className="text-amber-900">
+            <div className="font-semibold">
+              Your trial balance contains {incomeStatementLines.length}{' '}
+              income-statement account
+              {incomeStatementLines.length === 1 ? '' : 's'}{' '}
+              (4xxx/5xxx/6xxx/7xxx).
+            </div>
+            <div className="text-amber-900/80 mt-1">
+              These will be skipped on save — opening balances should only
+              include balance-sheet accounts. Upload a post-close trial
+              balance for accurate results.
+            </div>
+          </div>
+        </div>
+      )}
+
       <div
         className={
           'rounded-md border p-3 text-sm flex justify-between items-center ' +

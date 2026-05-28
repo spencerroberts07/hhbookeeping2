@@ -116,6 +116,12 @@ export interface OpeningConfirmResponse {
   total_debits: number;
   total_credits: number;
   balanced: boolean;
+  // Lines for income-statement accounts (4/5/6/7) that the importer
+  // skipped because opening balances should only carry balance-sheet
+  // figures. `warning` is set whenever skipped_income_statement is
+  // non-empty.
+  skipped_income_statement: string[];
+  warning: string | null;
 }
 
 export interface GLJobResponse {

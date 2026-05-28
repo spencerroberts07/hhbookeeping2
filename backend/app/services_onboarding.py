@@ -1237,6 +1237,17 @@ def parse_trial_balance(file_bytes: bytes, filename: str) -> dict[str, Any]:
     }
 
 
+def _is_income_statement_code(code: str) -> bool:
+    """4xxx (revenue), 5xxx (COGS), 6xxx + 7xxx (expenses) are
+    income-statement accounts. They reset to zero at fiscal year-end
+    via closing entries, so a *post-close* TB has them at zero. An
+    opening balance batch must not carry non-zero income-statement
+    balances — those would post as if they were activity in the
+    opening period and inflate the dashboard's monthly sales / COGS
+    aggregates by the YTD totals."""
+    return bool(code) and code[0] in ("4", "5", "6", "7")
+
+
 def import_opening_balances(
     session,
     *,
@@ -1249,18 +1260,60 @@ def import_opening_balances(
     """Validate the TB sum, create / find the opening period, write the
     journal_batch + lines.
 
-    Returns {batch_id, line_count, total_debits, total_credits, balanced}.
-    Raises ValueError when the TB doesn't balance — caller renders the
-    variance back to the user.
+    Filters out income-statement accounts (4xxx / 5xxx / 6xxx / 7xxx)
+    before insertion — those don't belong in an opening balance and
+    posting them inflates dashboard sales / COGS by the prior year's
+    YTD totals. When skipped, returns a `warning` + `skipped_income_statement`
+    list in the result so the UI can prompt the dealer to upload a
+    post-close TB.
+
+    Balance check runs on the *filtered* set. A pre-close TB filtered
+    down to balance-sheet rows will fail the check (variance = YTD net
+    income); the error message tells the user to upload a post-close
+    TB instead.
+
+    Returns {batch_id, line_count, total_debits, total_credits, balanced,
+    warning, skipped_income_statement}.
     """
+    # Split the incoming TB into balance-sheet (kept) and
+    # income-statement (skipped) buckets.
+    bs_lines: list[dict[str, Any]] = []
+    skipped_codes: list[str] = []
+    for line in tb_lines:
+        code = str(line.get("account_code") or "").strip()
+        if not code:
+            continue
+        if _is_income_statement_code(code):
+            dr = _to_decimal(line.get("debit_balance"))
+            cr = _to_decimal(line.get("credit_balance"))
+            # Track even zero-balance I/S lines so the UI can warn the
+            # user that their TB was pre-close (a post-close TB
+            # typically omits these rows entirely).
+            skipped_codes.append(code)
+            del dr, cr  # not used; explicit del for readability
+            continue
+        bs_lines.append(line)
+
     total_dr = Decimal("0")
     total_cr = Decimal("0")
-    for line in tb_lines:
+    for line in bs_lines:
         total_dr += _to_decimal(line.get("debit_balance"))
         total_cr += _to_decimal(line.get("credit_balance"))
 
     variance = total_dr - total_cr
     if variance != 0:
+        if skipped_codes:
+            # Pre-close TB: variance is the YTD net income that should
+            # already be closed to retained earnings.
+            raise ValueError(
+                f"Your trial balance doesn't balance after removing "
+                f"income-statement accounts. The variance "
+                f"(${float(variance):,.2f}) is your year-to-date net "
+                f"income, which should be closed to retained earnings "
+                f"on a post-close trial balance. Please re-export from "
+                f"QuickBooks after running year-end closing entries, "
+                f"or include a manual retained-earnings adjustment."
+            )
         raise ValueError(
             f"Trial balance is out of balance by ${float(variance):,.2f} "
             f"(debits ${float(total_dr):,.2f}, credits ${float(total_cr):,.2f}). "
@@ -1324,7 +1377,7 @@ def import_opening_balances(
     batch_id = batch_row["id"]
 
     line_count = 0
-    for idx, line in enumerate(tb_lines, start=1):
+    for idx, line in enumerate(bs_lines, start=1):
         code = str(line.get("account_code") or "").strip()
         if not code:
             continue
@@ -1356,12 +1409,24 @@ def import_opening_balances(
         )
         line_count += 1
 
+    warning = None
+    if skipped_codes:
+        warning = (
+            f"{len(skipped_codes)} line"
+            f"{'s' if len(skipped_codes) != 1 else ''} for income-statement "
+            f"accounts (4xxx/5xxx/6xxx/7xxx) were skipped. Opening balances "
+            f"should only contain balance-sheet accounts. Please upload a "
+            f"post-close trial balance."
+        )
+
     return {
         "batch_id": str(batch_id),
         "line_count": line_count,
         "total_debits": float(total_dr),
         "total_credits": float(total_cr),
         "balanced": True,
+        "skipped_income_statement": skipped_codes,
+        "warning": warning,
     }
 
 
