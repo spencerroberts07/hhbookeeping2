@@ -28,19 +28,28 @@ export type IncomeStatementPreset =
 export interface IncomeStatementAccount {
   account_code: string;
   account_name: string;
-  current_amount: number;
-  prior_amount: number;
+  /** Indentation level — 0 = top-level under section. */
+  depth?: number;
+  /** True for group header rows (no amount on the line). */
+  is_group_header?: boolean;
+  /** True for the "Total <code> <name>" subtotal row of a group. */
+  is_group_subtotal?: boolean;
+  current_amount: number | null;
+  prior_amount: number | null;
   current_pct: number | null;
   prior_pct: number | null;
 }
 
+export type IncomeStatementSectionLabel =
+  | 'INCOME'
+  | 'COST OF GOODS SOLD'
+  | 'GROSS PROFIT'
+  | 'EXPENSES'
+  | 'OTHER INCOME'
+  | 'PROFIT';
+
 export interface IncomeStatementSection {
-  section:
-    | 'Revenue'
-    | 'COGS'
-    | 'Gross Profit'
-    | 'Operating Expenses'
-    | 'Net Income';
+  section: IncomeStatementSectionLabel;
   accounts: IncomeStatementAccount[];
   section_total: number;
   prior_total: number;

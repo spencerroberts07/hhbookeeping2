@@ -369,6 +369,10 @@ def _is_account_sums(
 
     Tighter filter than `_account_sums`: requires periods in
     `_IS_PERIOD_STATUSES` and batches in `_IS_BATCH_STATUSES`.
+
+    Account name resolution: the CoA `accounts` table (synced from
+    QBO) is the authority. `gl_account_balances` is the fallback for
+    codes that have GL activity but were never in a CoA sync.
     """
     rows = session.execute(
         text(
@@ -387,7 +391,7 @@ def _is_account_sums(
                    AND jb.status = ANY(:batch_statuses)
               GROUP BY jl.account_code
             ),
-            names AS (
+            gl_names AS (
                 SELECT DISTINCT ON (account_code)
                        account_code, account_name
                   FROM gl_account_balances
@@ -397,9 +401,17 @@ def _is_account_sums(
             SELECT s.account_code,
                    s.sum_debit,
                    s.sum_credit,
-                   n.account_name
+                   COALESCE(a.account_name, gl.account_name, s.account_code) AS account_name,
+                   a.parent_code,
+                   a.account_type,
+                   a.is_sub_account
               FROM sums s
-         LEFT JOIN names n ON n.account_code = s.account_code
+         LEFT JOIN accounts a
+                ON a.entity_id = :entity_id
+               AND a.account_code = s.account_code
+               AND a.is_active = TRUE
+         LEFT JOIN gl_names gl
+                ON gl.account_code = s.account_code
           ORDER BY s.account_code
             """
         ),
@@ -410,6 +422,41 @@ def _is_account_sums(
             "period_statuses": list(_IS_PERIOD_STATUSES),
             "batch_statuses": list(_IS_BATCH_STATUSES),
         },
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _is_account_metadata(
+    session,
+    *,
+    entity_id: str,
+) -> list[dict[str, Any]]:
+    """All active income-statement accounts for the entity, including
+    parent group headers that have no GL activity in the period.
+
+    Group headers (account_type containing the QBO "*Income" /
+    "*Expense" / "Cost of Goods Sold" / "Other Income" categories)
+    show up even when they have zero direct lines — children roll up
+    under them.
+    """
+    rows = session.execute(
+        text(
+            """
+            SELECT account_code,
+                   account_name,
+                   parent_code,
+                   account_type,
+                   account_subtype,
+                   is_sub_account,
+                   statement_type
+              FROM accounts
+             WHERE entity_id = :entity_id
+               AND is_active = TRUE
+               AND statement_type = 'income_statement'
+          ORDER BY account_code
+            """
+        ),
+        {"entity_id": entity_id},
     ).mappings().all()
     return [dict(r) for r in rows]
 
@@ -439,44 +486,63 @@ def _pct(amount: Decimal, base: Decimal) -> float | None:
 def _build_is_side(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate raw _is_account_sums rows into per-account natural-sign
     amounts grouped by section. No percentages yet — those are applied
-    once we know total_revenue."""
+    once we know total_revenue.
+
+    Sections:
+      revenue            (4xxx — credit-natural)
+      cogs               (5xxx — debit-natural)
+      operating_expenses (6xxx — debit-natural)
+      other_income       (7xxx — credit-natural)
+
+    Each row carries `parent_code` from the accounts CoA so the
+    caller can roll children under their group header.
+    """
     by_section: dict[str, list[dict[str, Any]]] = {
         "revenue": [],
         "cogs": [],
         "operating_expenses": [],
+        "other_income": [],
     }
     for r in rows:
         code = r["account_code"]
         t = _account_type(code)
-        if t not in {"revenue", "cogs", "operating_expense"}:
+        if t == "revenue":
+            section_key = "revenue"
+        elif t == "cogs":
+            section_key = "cogs"
+        elif t == "operating_expense":
+            section_key = "operating_expenses"
+        elif t == "other_income_expense":
+            section_key = "other_income"
+        else:
             continue
         debit = Decimal(str(r["sum_debit"] or 0))
         credit = Decimal(str(r["sum_credit"] or 0))
         amount = _signed_amount_by_type(t, debit, credit)
         if amount == 0:
             continue
-        section_key = (
-            "revenue" if t == "revenue"
-            else "cogs" if t == "cogs"
-            else "operating_expenses"
-        )
         by_section[section_key].append({
             "account_code": code,
             "account_name": r.get("account_name") or code,
+            "parent_code": r.get("parent_code"),
             "amount": amount,
         })
 
     revenue_total = sum((a["amount"] for a in by_section["revenue"]), Decimal("0"))
     cogs_total = sum((a["amount"] for a in by_section["cogs"]), Decimal("0"))
     opex_total = sum((a["amount"] for a in by_section["operating_expenses"]), Decimal("0"))
+    other_income_total = sum(
+        (a["amount"] for a in by_section["other_income"]), Decimal("0"),
+    )
     gross_profit = revenue_total - cogs_total
-    net_income = gross_profit - opex_total
+    net_income = gross_profit - opex_total + other_income_total
 
     return {
         "by_section": by_section,
         "revenue_total": revenue_total,
         "cogs_total": cogs_total,
         "opex_total": opex_total,
+        "other_income_total": other_income_total,
         "gross_profit": gross_profit,
         "net_income": net_income,
     }
@@ -557,78 +623,21 @@ def get_income_statement(
             session, entity_id=entity["id"],
             period_start=prior_start, period_end=prior_end,
         )
+        accounts_meta = _is_account_metadata(session, entity_id=entity["id"])
 
     cur = _build_is_side(cur_rows)
     prior = _build_is_side(prior_rows)
 
-    # Index prior accounts by code so each current row can attach its
-    # prior-period counterpart (and vice versa for prior-only accounts).
-    def index_by_code(section: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        return {a["account_code"]: a for a in section}
-
-    cur_by_sec = {
-        "revenue": index_by_code(cur["by_section"]["revenue"]),
-        "cogs": index_by_code(cur["by_section"]["cogs"]),
-        "operating_expenses": index_by_code(cur["by_section"]["operating_expenses"]),
-    }
-    prior_by_sec = {
-        "revenue": index_by_code(prior["by_section"]["revenue"]),
-        "cogs": index_by_code(prior["by_section"]["cogs"]),
-        "operating_expenses": index_by_code(prior["by_section"]["operating_expenses"]),
-    }
-
     cur_rev_total = cur["revenue_total"]
     prior_rev_total = prior["revenue_total"]
 
-    def merge_section(label: str, key: str) -> dict[str, Any]:
-        codes = sorted(set(cur_by_sec[key].keys()) | set(prior_by_sec[key].keys()))
-        accounts: list[dict[str, Any]] = []
-        for code in codes:
-            c = cur_by_sec[key].get(code)
-            p = prior_by_sec[key].get(code)
-            c_amt = c["amount"] if c else Decimal("0")
-            p_amt = p["amount"] if p else Decimal("0")
-            name = (c["account_name"] if c else None) or (p["account_name"] if p else None) or code
-            accounts.append({
-                "account_code": code,
-                "account_name": name,
-                "current_amount": float(c_amt),
-                "prior_amount": float(p_amt),
-                "current_pct": _pct(c_amt, cur_rev_total),
-                "prior_pct": _pct(p_amt, prior_rev_total),
-            })
-        section_total = sum((Decimal(str(a["current_amount"])) for a in accounts), Decimal("0"))
-        prior_total = sum((Decimal(str(a["prior_amount"])) for a in accounts), Decimal("0"))
-        return {
-            "section": label,
-            "accounts": accounts,
-            "section_total": float(section_total),
-            "prior_total": float(prior_total),
-            "section_pct": _pct(section_total, cur_rev_total),
-            "prior_pct": _pct(prior_total, prior_rev_total),
-        }
-
-    sections = [
-        merge_section("Revenue", "revenue"),
-        merge_section("COGS", "cogs"),
-        {
-            "section": "Gross Profit",
-            "accounts": [],
-            "section_total": float(cur["gross_profit"]),
-            "prior_total": float(prior["gross_profit"]),
-            "section_pct": _pct(cur["gross_profit"], cur_rev_total),
-            "prior_pct": _pct(prior["gross_profit"], prior_rev_total),
-        },
-        merge_section("Operating Expenses", "operating_expenses"),
-        {
-            "section": "Net Income",
-            "accounts": [],
-            "section_total": float(cur["net_income"]),
-            "prior_total": float(prior["net_income"]),
-            "section_pct": _pct(cur["net_income"], cur_rev_total),
-            "prior_pct": _pct(prior["net_income"], prior_rev_total),
-        },
-    ]
+    sections = _build_grouped_sections(
+        cur=cur,
+        prior=prior,
+        accounts_meta=accounts_meta,
+        cur_rev_total=cur_rev_total,
+        prior_rev_total=prior_rev_total,
+    )
 
     return {
         "entity_code": entity_code,
@@ -643,6 +652,222 @@ def get_income_statement(
         "prior_revenue": float(prior_rev_total),
         "sections": sections,
     }
+
+
+# --------------------------------------------------------------------------
+# Income statement — group-header rollup
+# --------------------------------------------------------------------------
+
+
+# Section labels match QBO's P&L exactly so the report is recognisable
+# side-by-side with the QBO export.
+_SECTION_LABELS = {
+    "revenue": "INCOME",
+    "cogs": "COST OF GOODS SOLD",
+    "operating_expenses": "EXPENSES",
+    "other_income": "OTHER INCOME",
+}
+
+
+def _build_grouped_sections(
+    *,
+    cur: dict[str, Any],
+    prior: dict[str, Any],
+    accounts_meta: list[dict[str, Any]],
+    cur_rev_total: Decimal,
+    prior_rev_total: Decimal,
+) -> list[dict[str, Any]]:
+    """Render each IS section as a tree of group-header rows with
+    indented children and a per-group subtotal. Group identity comes
+    from `accounts.parent_code` — set by the QBO CoA sync. Accounts
+    whose parent_code is null (or whose parent doesn't appear on this
+    statement) render as standalone lines under the section.
+    """
+    meta_by_code: dict[str, dict[str, Any]] = {
+        a["account_code"]: a for a in accounts_meta
+    }
+
+    def index_amounts(section: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {a["account_code"]: a for a in section}
+
+    cur_by_sec = {
+        k: index_amounts(cur["by_section"][k])
+        for k in ("revenue", "cogs", "operating_expenses", "other_income")
+    }
+    prior_by_sec = {
+        k: index_amounts(prior["by_section"][k])
+        for k in ("revenue", "cogs", "operating_expenses", "other_income")
+    }
+
+    def build_section(key: str) -> dict[str, Any]:
+        cur_idx = cur_by_sec[key]
+        prior_idx = prior_by_sec[key]
+        # All codes that have activity in either period.
+        active_codes = sorted(set(cur_idx.keys()) | set(prior_idx.keys()))
+
+        # Resolve each code's effective parent. A parent is "effective"
+        # only when it lives in the meta map AND belongs to the same
+        # section — otherwise the child rolls up as standalone.
+        section_codes = set(active_codes)
+        for code in active_codes:
+            m = meta_by_code.get(code) or {}
+            pc = m.get("parent_code")
+            if pc and pc in meta_by_code:
+                section_codes.add(pc)
+
+        def amount_for(code: str, idx: dict[str, dict[str, Any]]) -> Decimal:
+            row = idx.get(code)
+            return row["amount"] if row else Decimal("0")
+
+        def name_for(code: str) -> str:
+            return (
+                (meta_by_code.get(code) or {}).get("account_name")
+                or (cur_idx.get(code) or {}).get("account_name")
+                or (prior_idx.get(code) or {}).get("account_name")
+                or code
+            )
+
+        # parent_code lookup that only honors same-section parents.
+        def parent_of(code: str) -> str | None:
+            pc = (meta_by_code.get(code) or {}).get("parent_code")
+            if pc and pc in section_codes:
+                return pc
+            return None
+
+        # Children index: parent_code → list[child_code], sorted.
+        children: dict[str, list[str]] = {}
+        for code in sorted(section_codes):
+            pc = parent_of(code)
+            if pc:
+                children.setdefault(pc, []).append(code)
+
+        # Top-level codes: accounts with no in-section parent.
+        top_codes = sorted(
+            code for code in section_codes if parent_of(code) is None
+        )
+
+        accounts_out: list[dict[str, Any]] = []
+
+        def emit_node(code: str, depth: int) -> tuple[Decimal, Decimal]:
+            """Recursively emit a node and return its (current, prior)
+            rolled-up totals (self amount + descendants)."""
+            self_cur = amount_for(code, cur_idx)
+            self_prior = amount_for(code, prior_idx)
+            kids = children.get(code, [])
+            is_group = bool(kids)
+
+            if is_group:
+                # Group header — no amount on its own line.
+                header_idx = len(accounts_out)
+                accounts_out.append({
+                    "account_code": code,
+                    "account_name": name_for(code),
+                    "depth": depth,
+                    "is_group_header": True,
+                    "current_amount": None,
+                    "prior_amount": None,
+                    "current_pct": None,
+                    "prior_pct": None,
+                })
+                group_cur = self_cur
+                group_prior = self_prior
+                # Self-amount on a parent that also has direct activity:
+                # emit it as a leaf row inside the group so it shows up.
+                if self_cur != 0 or self_prior != 0:
+                    accounts_out.append({
+                        "account_code": code,
+                        "account_name": name_for(code),
+                        "depth": depth + 1,
+                        "is_group_header": False,
+                        "current_amount": float(self_cur),
+                        "prior_amount": float(self_prior),
+                        "current_pct": _pct(self_cur, cur_rev_total),
+                        "prior_pct": _pct(self_prior, prior_rev_total),
+                    })
+                for kid in kids:
+                    kc, kp = emit_node(kid, depth + 1)
+                    group_cur += kc
+                    group_prior += kp
+                accounts_out.append({
+                    "account_code": code,
+                    "account_name": f"Total {code} {name_for(code)}",
+                    "depth": depth,
+                    "is_group_subtotal": True,
+                    "current_amount": float(group_cur),
+                    "prior_amount": float(group_prior),
+                    "current_pct": _pct(group_cur, cur_rev_total),
+                    "prior_pct": _pct(group_prior, prior_rev_total),
+                })
+                _ = header_idx  # reserved if we later want to attach the subtotal back to the header
+                return group_cur, group_prior
+
+            # Leaf account — no children. Skip when it has no activity
+            # in either period (a CoA entry with zero movement).
+            if self_cur == 0 and self_prior == 0:
+                return Decimal("0"), Decimal("0")
+            accounts_out.append({
+                "account_code": code,
+                "account_name": name_for(code),
+                "depth": depth,
+                "is_group_header": False,
+                "current_amount": float(self_cur),
+                "prior_amount": float(self_prior),
+                "current_pct": _pct(self_cur, cur_rev_total),
+                "prior_pct": _pct(self_prior, prior_rev_total),
+            })
+            return self_cur, self_prior
+
+        section_total = Decimal("0")
+        prior_total = Decimal("0")
+        for code in top_codes:
+            c, p = emit_node(code, 0)
+            section_total += c
+            prior_total += p
+
+        return {
+            "section": _SECTION_LABELS[key],
+            "accounts": accounts_out,
+            "section_total": float(section_total),
+            "prior_total": float(prior_total),
+            "section_pct": _pct(section_total, cur_rev_total),
+            "prior_pct": _pct(prior_total, prior_rev_total),
+        }
+
+    revenue_section = build_section("revenue")
+    cogs_section = build_section("cogs")
+    opex_section = build_section("operating_expenses")
+    other_section = build_section("other_income")
+
+    sections: list[dict[str, Any]] = [
+        revenue_section,
+        cogs_section,
+        {
+            "section": "GROSS PROFIT",
+            "accounts": [],
+            "section_total": float(cur["gross_profit"]),
+            "prior_total": float(prior["gross_profit"]),
+            "section_pct": _pct(cur["gross_profit"], cur_rev_total),
+            "prior_pct": _pct(prior["gross_profit"], prior_rev_total),
+        },
+        opex_section,
+    ]
+    # Only show OTHER INCOME when there's activity in either period —
+    # it's noise for entities that don't use 7xxx.
+    if (
+        cur["other_income_total"] != 0
+        or prior["other_income_total"] != 0
+        or other_section["accounts"]
+    ):
+        sections.append(other_section)
+    sections.append({
+        "section": "PROFIT",
+        "accounts": [],
+        "section_total": float(cur["net_income"]),
+        "prior_total": float(prior["net_income"]),
+        "section_pct": _pct(cur["net_income"], cur_rev_total),
+        "prior_pct": _pct(prior["net_income"], prior_rev_total),
+    })
+    return sections
 
 
 # --------------------------------------------------------------------------

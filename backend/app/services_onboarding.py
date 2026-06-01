@@ -817,18 +817,16 @@ def _try_qbo_gl_parser(file_text: str) -> list[dict[str, Any]] | None:
 
         # Sign convention. QBO's Amount column is signed by account
         # type, not by debit/credit nature:
-        #   * Asset / COGS / Expense (1xxx, 5xxx, 6xxx, 7xxx) —
-        #     debit-normal. Positive Amount = debit increases balance,
-        #     negative = credit reduces balance.
-        #   * Liability / Equity / Revenue (2xxx, 3xxx, 4xxx) —
-        #     credit-normal. Positive Amount = credit increases balance,
-        #     negative = debit reduces balance.
-        # Treating positive=debit for every account turned revenue
-        # postings into debits and made the dashboard render
-        # negative sales / >100% margin. Classification by first
-        # digit matches reports.py and accounts._type_from_code.
+        #   * Asset / COGS / Expense (1xxx, 5xxx, 6xxx) — debit-normal.
+        #     Positive Amount = debit, negative = credit.
+        #   * Liability / Equity / Revenue / Other Income (2xxx, 3xxx,
+        #     4xxx, 7xxx) — credit-normal. Positive Amount = credit,
+        #     negative = debit. (7xxx assumes Bridlewood's convention
+        #     where 7xxx = other income. TODO: switch to per-account
+        #     classification using accounts.account_type once the QBO
+        #     CoA sync captures it — see migration 044.)
         first_digit = code[0] if code else "1"
-        credit_normal = first_digit in ("2", "3", "4")
+        credit_normal = first_digit in ("2", "3", "4", "7")
 
         if credit_normal:
             if amount >= 0:

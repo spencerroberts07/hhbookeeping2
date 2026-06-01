@@ -127,19 +127,27 @@ export default function IncomeStatementPage() {
       onExportCsv={() => {
         if (!report.data) return;
         const header = showCompare
-          ? 'Section,Account Code,Account Name,Current,Prior Year,Current %,Prior Year %'
-          : 'Section,Account Code,Account Name,Current,Current %';
+          ? 'Section,Account Code,Account Name,Row Type,Current,Prior Year,Current %,Prior Year %'
+          : 'Section,Account Code,Account Name,Row Type,Current,Current %';
         const lines: string[] = [header];
+        const numOr = (n: number | null): string =>
+          n === null || n === undefined ? '' : String(n);
         for (const sec of report.data.sections) {
           for (const a of sec.accounts) {
+            const rowType = a.is_group_header
+              ? 'group_header'
+              : a.is_group_subtotal
+                ? 'group_subtotal'
+                : 'account';
+            const indent = '  '.repeat(a.depth ?? 0);
             const row = showCompare
-              ? `"${sec.section}",${a.account_code},"${a.account_name}",${a.current_amount},${a.prior_amount},${a.current_pct ?? ''},${a.prior_pct ?? ''}`
-              : `"${sec.section}",${a.account_code},"${a.account_name}",${a.current_amount},${a.current_pct ?? ''}`;
+              ? `"${sec.section}",${a.account_code},"${indent}${a.account_name}",${rowType},${numOr(a.current_amount)},${numOr(a.prior_amount)},${a.current_pct ?? ''},${a.prior_pct ?? ''}`
+              : `"${sec.section}",${a.account_code},"${indent}${a.account_name}",${rowType},${numOr(a.current_amount)},${a.current_pct ?? ''}`;
             lines.push(row);
           }
           const totalRow = showCompare
-            ? `"${sec.section} — Total",,,"${sec.section_total}",${sec.prior_total},${sec.section_pct ?? ''},${sec.prior_pct ?? ''}`
-            : `"${sec.section} — Total",,,"${sec.section_total}",${sec.section_pct ?? ''}`;
+            ? `"Total ${sec.section}",,,section_total,${sec.section_total},${sec.prior_total},${sec.section_pct ?? ''},${sec.prior_pct ?? ''}`
+            : `"Total ${sec.section}",,,section_total,${sec.section_total},${sec.section_pct ?? ''}`;
           lines.push(totalRow);
         }
         const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
@@ -282,8 +290,8 @@ function SectionRows({
   showCompare: boolean;
 }) {
   const isSummary =
-    section.section === 'Gross Profit' || section.section === 'Net Income';
-  const summaryClass = section.section === 'Net Income'
+    section.section === 'GROSS PROFIT' || section.section === 'PROFIT';
+  const summaryClass = section.section === 'PROFIT'
     ? 'bg-cloud font-bold text-deep-navy border-t-2 border-deep-navy'
     : 'bg-cloud/60 font-semibold text-deep-navy border-t border-deep-navy';
   if (isSummary) {
@@ -332,32 +340,94 @@ function SectionRows({
           </td>
         </tr>
       ) : (
-        section.accounts.map((a) => (
-          <tr key={a.account_code} className="hover:bg-cloud">
-            <td className="px-4 py-1.5">
-              <span className="text-slate font-mono text-xs mr-2">
-                {a.account_code}
-              </span>
-              <span className="text-ink">{a.account_name}</span>
-            </td>
-            <td className="px-4 py-1.5 text-right tabular-nums">
-              {formatAmt(a.current_amount)}
-            </td>
-            {showCompare && (
-              <td className="px-4 py-1.5 text-right tabular-nums">
-                {formatAmt(a.prior_amount)}
+        section.accounts.map((a, i) => {
+          const depth = a.depth ?? 0;
+          const indentPx = 16 + depth * 16;
+          if (a.is_group_header) {
+            return (
+              <tr
+                key={`${a.account_code}-h-${i}`}
+                className="bg-cloud/20"
+              >
+                <td
+                  className="py-1.5"
+                  style={{ paddingLeft: indentPx, paddingRight: 16 }}
+                >
+                  <span className="text-slate font-mono text-xs mr-2">
+                    {a.account_code}
+                  </span>
+                  <span className="text-deep-navy font-semibold">
+                    {a.account_name}
+                  </span>
+                </td>
+                <td className="px-4 py-1.5" />
+                {showCompare && <td className="px-4 py-1.5" />}
+                <td className="px-4 py-1.5" />
+                {showCompare && <td className="px-4 py-1.5" />}
+              </tr>
+            );
+          }
+          if (a.is_group_subtotal) {
+            return (
+              <tr
+                key={`${a.account_code}-s-${i}`}
+                className="font-semibold text-deep-navy border-t border-border"
+              >
+                <td
+                  className="py-1.5"
+                  style={{ paddingLeft: indentPx, paddingRight: 16 }}
+                >
+                  {a.account_name}
+                </td>
+                <td className="px-4 py-1.5 text-right tabular-nums">
+                  {formatAmt(a.current_amount)}
+                </td>
+                {showCompare && (
+                  <td className="px-4 py-1.5 text-right tabular-nums">
+                    {formatAmt(a.prior_amount)}
+                  </td>
+                )}
+                <td className="px-4 py-1.5 text-right tabular-nums">
+                  {formatPct(a.current_pct)}
+                </td>
+                {showCompare && (
+                  <td className="px-4 py-1.5 text-right tabular-nums">
+                    {formatPct(a.prior_pct)}
+                  </td>
+                )}
+              </tr>
+            );
+          }
+          return (
+            <tr key={`${a.account_code}-${i}`} className="hover:bg-cloud">
+              <td
+                className="py-1.5"
+                style={{ paddingLeft: indentPx, paddingRight: 16 }}
+              >
+                <span className="text-slate font-mono text-xs mr-2">
+                  {a.account_code}
+                </span>
+                <span className="text-ink">{a.account_name}</span>
               </td>
-            )}
-            <td className="px-4 py-1.5 text-right tabular-nums">
-              {formatPct(a.current_pct)}
-            </td>
-            {showCompare && (
               <td className="px-4 py-1.5 text-right tabular-nums">
-                {formatPct(a.prior_pct)}
+                {formatAmt(a.current_amount)}
               </td>
-            )}
-          </tr>
-        ))
+              {showCompare && (
+                <td className="px-4 py-1.5 text-right tabular-nums">
+                  {formatAmt(a.prior_amount)}
+                </td>
+              )}
+              <td className="px-4 py-1.5 text-right tabular-nums">
+                {formatPct(a.current_pct)}
+              </td>
+              {showCompare && (
+                <td className="px-4 py-1.5 text-right tabular-nums">
+                  {formatPct(a.prior_pct)}
+                </td>
+              )}
+            </tr>
+          );
+        })
       )}
       <tr className="font-semibold text-deep-navy border-t border-border">
         <td className="px-4 py-1.5">Total {section.section}</td>
@@ -382,7 +452,8 @@ function SectionRows({
   );
 }
 
-function formatAmt(n: number): React.ReactNode {
+function formatAmt(n: number | null): React.ReactNode {
+  if (n === null || n === undefined) return null;
   if (!n) return <span className="text-slate">—</span>;
   if (n < 0) {
     return (

@@ -93,28 +93,48 @@ async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
         object_name="Account",
     )
 
+    # Pass 1: upsert every account with its raw QBO ParentRef.value.
+    # parent_code is resolved in pass 2 once every account's AcctNum
+    # is known — the QBO API can return parents after their children.
+    qbo_id_to_code: dict[str, str] = {}
     imported = 0
     bank_accounts = 0
 
     for acc in accounts:
         code = acc.get("AcctNum") or acc.get("Id")
+        qbo_id = str(acc.get("Id"))
         name = acc.get("Name") or "Unnamed"
         classification = acc.get("Classification") or "Unclassified"
         account_type = acc.get("AccountType") or classification
+        account_subtype = acc.get("AccountSubType") or None
+        fully_qualified_name = acc.get("FullyQualifiedName") or None
+        is_sub_account = bool(acc.get("SubAccount") or False)
+        parent_ref = acc.get("ParentRef") or {}
+        qbo_parent_id = (
+            str(parent_ref.get("value")) if parent_ref.get("value") else None
+        )
         statement_type = (
             "balance_sheet"
             if classification in {"Asset", "Liability", "Equity"}
             else "income_statement"
         )
 
+        qbo_id_to_code[qbo_id] = str(code)
+
         session.execute(
             text(
                 """
                 INSERT INTO accounts (
-                    entity_id, account_code, account_name, account_class, statement_type, quickbooks_account_id
+                    entity_id, account_code, account_name, account_class,
+                    statement_type, quickbooks_account_id,
+                    fully_qualified_name, account_type, account_subtype,
+                    is_sub_account, quickbooks_parent_id
                 )
                 VALUES (
-                    :entity_id, :account_code, :account_name, :account_class, :statement_type, :quickbooks_account_id
+                    :entity_id, :account_code, :account_name, :account_class,
+                    :statement_type, :quickbooks_account_id,
+                    :fully_qualified_name, :account_type, :account_subtype,
+                    :is_sub_account, :quickbooks_parent_id
                 )
                 ON CONFLICT (entity_id, account_code)
                 DO UPDATE SET
@@ -122,6 +142,11 @@ async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
                     account_class = EXCLUDED.account_class,
                     statement_type = EXCLUDED.statement_type,
                     quickbooks_account_id = EXCLUDED.quickbooks_account_id,
+                    fully_qualified_name = EXCLUDED.fully_qualified_name,
+                    account_type = EXCLUDED.account_type,
+                    account_subtype = EXCLUDED.account_subtype,
+                    is_sub_account = EXCLUDED.is_sub_account,
+                    quickbooks_parent_id = EXCLUDED.quickbooks_parent_id,
                     is_active = TRUE
                 """
             ),
@@ -131,13 +156,49 @@ async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
                 "account_name": name,
                 "account_class": account_type,
                 "statement_type": statement_type,
-                "quickbooks_account_id": str(acc.get("Id")),
+                "quickbooks_account_id": qbo_id,
+                "fully_qualified_name": fully_qualified_name,
+                "account_type": account_type,
+                "account_subtype": account_subtype,
+                "is_sub_account": is_sub_account,
+                "quickbooks_parent_id": qbo_parent_id,
             },
         )
 
         imported += 1
         if account_type in BANK_ACCOUNT_TYPES:
             bank_accounts += 1
+
+    # Pass 2: resolve parent_code via the QBO Id → AcctNum map built
+    # above. Done in SQL so a single UPDATE handles every account
+    # whose parent appeared later in the response.
+    session.execute(
+        text(
+            """
+            UPDATE accounts a
+               SET parent_code = NULL
+             WHERE a.entity_id = :entity_id
+               AND a.quickbooks_parent_id IS NULL
+            """
+        ),
+        {"entity_id": entity["id"]},
+    )
+    for qbo_id, code in qbo_id_to_code.items():
+        session.execute(
+            text(
+                """
+                UPDATE accounts a
+                   SET parent_code = :parent_code
+                 WHERE a.entity_id = :entity_id
+                   AND a.quickbooks_parent_id = :parent_qbo_id
+                """
+            ),
+            {
+                "entity_id": entity["id"],
+                "parent_code": code,
+                "parent_qbo_id": qbo_id,
+            },
+        )
 
     return {
         "imported_count": imported,
