@@ -184,8 +184,10 @@ def _account_sums(
     is a cumulative-to-date query — the natural shape for a balance sheet
     or trial balance.
 
-    Each row also carries the latest known `account_name` from
-    gl_account_balances (most recent import), if any.
+    Account name resolution: the CoA `accounts` table (synced from
+    QBO) is the authority. `gl_account_balances` is the fallback for
+    codes that have GL activity but were never in a CoA sync. Final
+    fallback is the bare code itself so callers never see a null.
     """
     where = [
         "jb.entity_id = :entity_id",
@@ -214,7 +216,7 @@ def _account_sums(
                  WHERE {' AND '.join(where)}
               GROUP BY jl.account_code
             ),
-            names AS (
+            gl_names AS (
                 SELECT DISTINCT ON (account_code)
                        account_code, account_name
                   FROM gl_account_balances
@@ -224,9 +226,14 @@ def _account_sums(
             SELECT s.account_code,
                    s.sum_debit,
                    s.sum_credit,
-                   n.account_name
+                   COALESCE(a.account_name, gl.account_name, s.account_code) AS account_name
               FROM sums s
-         LEFT JOIN names n ON n.account_code = s.account_code
+         LEFT JOIN accounts a
+                ON a.entity_id = :entity_id
+               AND a.account_code = s.account_code
+               AND a.is_active = TRUE
+         LEFT JOIN gl_names gl
+                ON gl.account_code = s.account_code
           ORDER BY s.account_code
             """
         ),
