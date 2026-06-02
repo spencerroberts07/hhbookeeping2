@@ -170,6 +170,33 @@ def _bs_subclass(account_code: str) -> str:
 _POSTED_BATCH_STATUSES = ("draft", "voided", "rejected")
 
 
+def _find_opening_balance_cutover(session, entity_id: str) -> DateType | None:
+    """Period_end of the most recent non-voided opening_balance batch.
+
+    Used by the cumulative balance sheet / trial balance path to treat
+    that date as a cutover: pre-cutover historical_import becomes
+    irrelevant because the opening_balance batch already represents
+    the cumulative starting position. Returns None when the entity has
+    no opening_balance batch (fresh entity with no TB carry-in).
+    """
+    row = session.execute(
+        text(
+            f"""
+            SELECT ap.period_end
+              FROM journal_batches jb
+              JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+             WHERE jb.entity_id = :entity_id
+               AND jb.source_module = 'opening_balance'
+               AND jb.status NOT IN {_POSTED_BATCH_STATUSES}
+          ORDER BY ap.period_end DESC
+             LIMIT 1
+            """
+        ),
+        {"entity_id": entity_id},
+    ).mappings().first()
+    return row["period_end"] if row else None
+
+
 def _account_sums(
     session,
     *,
@@ -183,6 +210,24 @@ def _account_sums(
     `(period_end_from, period_end_to]`. When `period_end_from` is None this
     is a cumulative-to-date query — the natural shape for a balance sheet
     or trial balance.
+
+    Cutover handling (cumulative mode only — period_end_from is None):
+    When the entity has a non-voided opening_balance batch and the
+    requested as-of date is on/after that batch's period_end, the query
+    splits into two parts:
+
+      Part A — only the opening_balance batch (carries the cutover-date
+      starting position).
+      Part B — every non-voided batch in periods that START strictly
+      after the cutover date (post-cutover activity).
+
+    Pre-cutover historical_import is excluded. Without this, pre-cutover
+    historical activity would stack on top of the opening_balance batch
+    and double the BS / TB figures.
+
+    Period-range mode (period_end_from is not None) keeps pure date
+    semantics — no cutover logic is applied, so callers that need
+    activity-in-a-window get exactly that.
 
     Account name resolution: the CoA `accounts` table (synced from
     QBO) is the authority. `gl_account_balances` is the fallback for
@@ -202,6 +247,21 @@ def _account_sums(
         # Inclusive lower bound — IS uses [from, to].
         where.append("ap.period_end >= :period_end_from")
         params["period_end_from"] = period_end_from
+    else:
+        cutover = _find_opening_balance_cutover(session, entity_id)
+        # Cutover only kicks in when the as-of date reaches the cutover.
+        # For pre-cutover as-of dates we fall through to legacy
+        # cumulative behavior so forensic queries on historical periods
+        # still return a number.
+        if cutover is not None and period_end_to >= cutover:
+            where.append(
+                "("
+                "(jb.source_module = 'opening_balance'"
+                " AND ap.period_end <= :cutover)"
+                " OR ap.period_start > :cutover"
+                ")"
+            )
+            params["cutover"] = cutover
 
     rows = session.execute(
         text(
