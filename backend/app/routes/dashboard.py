@@ -508,3 +508,248 @@ def _current_period_for_entity(session, entity_id: str) -> dict[str, Any] | None
     )
     row = session.execute(sql_any_draft, {"eid": entity_id}).mappings().first()
     return dict(row) if row else None
+
+
+# --------------------------------------------------------------------------
+# Sales drill-down (Phase 2A)
+#
+# Monthly trend / rolling-12 / growth come from the GL (4xxx revenue, 5xxx
+# COGS) — "GL net", reconciles to the income statement. Daily and MTD come
+# from cash_balancing_days — "POS gross", the SAME source the Sales MTD card
+# reads, so the card and the drill agree. The two sources do not tie exactly
+# (POS gross sales vs GL net revenue); each response carries a `source` label
+# so the UI can mark them.
+# --------------------------------------------------------------------------
+
+
+def _prev_month(key: tuple[int, int]) -> tuple[int, int]:
+    y, m = key
+    return (y - 1, 12) if m == 1 else (y, m - 1)
+
+
+def _same_day_prior_year(d: DateType) -> DateType:
+    try:
+        return d.replace(year=d.year - 1)
+    except ValueError:  # Feb 29 -> Feb 28 prior year
+        return d.replace(year=d.year - 1, day=28)
+
+
+def _monthly_sales_map(session, entity_id: str, months_back: int) -> dict[tuple[int, int], dict]:
+    """{(year, month): {period_end, period_label, sales, cogs}} from the GL."""
+    rows = session.execute(
+        text(
+            """
+            SELECT ap.period_end, ap.period_label,
+                   COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1)='4'
+                                     THEN jl.credit_amount - jl.debit_amount ELSE 0 END),0) AS sales,
+                   COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1)='5'
+                                     THEN jl.debit_amount - jl.credit_amount ELSE 0 END),0) AS cogs
+              FROM accounting_periods ap
+              LEFT JOIN journal_batches jb
+                ON jb.accounting_period_id = ap.id AND jb.status IN :statuses
+              LEFT JOIN journal_lines jl ON jl.journal_batch_id = jb.id
+             WHERE ap.entity_id = :eid
+               AND ap.period_end <= CURRENT_DATE
+               AND ap.period_end > (CURRENT_DATE - make_interval(months => :months))
+             GROUP BY ap.period_end, ap.period_label
+             ORDER BY ap.period_end ASC
+            """
+        ).bindparams(bindparam("statuses", expanding=True)),
+        {"eid": entity_id, "months": months_back, "statuses": list(POSTED_BATCH_STATUSES)},
+    ).mappings().all()
+    out: dict[tuple[int, int], dict] = {}
+    for r in rows:
+        pe = r["period_end"]
+        out[(pe.year, pe.month)] = {
+            "period_end": pe.isoformat(),
+            "period_label": r["period_label"],
+            "sales": float(r["sales"] or 0),
+            "cogs": float(r["cogs"] or 0),
+        }
+    return out
+
+
+def _pct_growth(cur: float, base: float | None) -> float | None:
+    if base is None or base == 0:
+        return None
+    return round((cur - base) / base * 100, 1)
+
+
+@router.get("/sales/monthly")
+def sales_monthly(
+    entity_code: str = Query(...),
+    months: int = Query(default=24, ge=1, le=60),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Monthly sales + COGS + margin, this year vs last, with YoY & MoM growth.
+    GL-sourced (reconciles to the income statement)."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        m = _monthly_sales_map(session, entity["id"], months + 12)
+
+    keys = sorted(m.keys())
+    recent = keys[-months:]
+    series = []
+    for k in recent:
+        cur = m[k]
+        py = m.get((k[0] - 1, k[1]))
+        prev = m.get(_prev_month(k))
+        sales, cogs = cur["sales"], cur["cogs"]
+        series.append({
+            "period_end": cur["period_end"],
+            "period_label": cur["period_label"],
+            "sales": sales,
+            "cogs": cogs,
+            "margin_pct": round((sales - cogs) / sales * 100, 1) if sales else 0.0,
+            "py_sales": py["sales"] if py else None,
+            "py_cogs": py["cogs"] if py else None,
+            "py_margin_pct": (round((py["sales"] - py["cogs"]) / py["sales"] * 100, 1)
+                              if py and py["sales"] else None),
+            "yoy_growth_pct": _pct_growth(sales, py["sales"] if py else None),
+            "mom_growth_pct": _pct_growth(sales, prev["sales"] if prev else None),
+        })
+    return {"entity_code": entity_code, "source": "gl_net", "months": months, "series": series}
+
+
+@router.get("/sales/rolling12")
+def sales_rolling12(
+    entity_code: str = Query(...),
+    months: int = Query(default=24, ge=1, le=48),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Trailing-12-month sales at each month-end, current vs prior-year rolling-12."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        m = _monthly_sales_map(session, entity["id"], months + 24)
+
+    def trailing12(end_key: tuple[int, int]) -> float | None:
+        total = 0.0
+        seen = 0
+        y, mo = end_key
+        for _ in range(12):
+            cell = m.get((y, mo))
+            if cell:
+                total += cell["sales"]
+                seen += 1
+            mo -= 1
+            if mo == 0:
+                y, mo = y - 1, 12
+        return round(total, 2) if seen else None
+
+    keys = sorted(m.keys())
+    recent = keys[-months:]
+    series = []
+    for k in recent:
+        cur = trailing12(k)
+        py = trailing12((k[0] - 1, k[1]))
+        series.append({
+            "period_end": m[k]["period_end"],
+            "period_label": m[k]["period_label"],
+            "rolling12_sales": cur,
+            "py_rolling12_sales": py,
+            "yoy_growth_pct": _pct_growth(cur, py) if cur is not None else None,
+        })
+    return {"entity_code": entity_code, "source": "gl_net", "months": months, "series": series}
+
+
+@router.get("/sales/daily")
+def sales_daily(
+    entity_code: str = Query(...),
+    days: int = Query(default=90, ge=1, le=400),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Daily sales (POS gross) + the same calendar day prior year, from
+    cash_balancing_days."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        rows = session.execute(
+            text(
+                """
+                SELECT business_date, total_sales
+                  FROM cash_balancing_days
+                 WHERE entity_id = :e
+                   AND business_date <= CURRENT_DATE
+                   AND business_date > (CURRENT_DATE - make_interval(days => :days))
+              ORDER BY business_date ASC
+                """
+            ),
+            {"e": entity["id"], "days": days},
+        ).mappings().all()
+        py_rows = session.execute(
+            text(
+                """
+                SELECT business_date, total_sales
+                  FROM cash_balancing_days
+                 WHERE entity_id = :e
+                   AND business_date <= (CURRENT_DATE - make_interval(years => 1))
+                   AND business_date > (CURRENT_DATE - make_interval(years => 1)
+                                        - make_interval(days => :days))
+                """
+            ),
+            {"e": entity["id"], "days": days},
+        ).mappings().all()
+
+    py_map = {r["business_date"]: float(r["total_sales"] or 0) for r in py_rows}
+    series = []
+    for r in rows:
+        d = r["business_date"]
+        py_d = _same_day_prior_year(d)
+        series.append({
+            "date": d.isoformat(),
+            "sales": float(r["total_sales"] or 0),
+            "py_date": py_d.isoformat(),
+            "py_sales": py_map.get(py_d),
+        })
+    return {"entity_code": entity_code, "source": "pos_gross", "days": days, "series": series}
+
+
+@router.get("/sales/mtd")
+def sales_mtd(
+    entity_code: str = Query(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Month-to-date sales (POS gross) vs the SAME month-to-date prior year
+    (partial-period aware). This is the figure the dashboard Sales MTD card
+    shows, so card and drill agree."""
+    today = DateType.today()
+    month_start = today.replace(day=1)
+    py_today = _same_day_prior_year(today)
+    py_month_start = _same_day_prior_year(month_start)
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+
+        def mtd_sum(start: DateType, end: DateType) -> float:
+            row = session.execute(
+                text(
+                    """
+                    SELECT COALESCE(SUM(total_sales), 0) AS s
+                      FROM cash_balancing_days
+                     WHERE entity_id = :e AND business_date BETWEEN :a AND :b
+                    """
+                ),
+                {"e": entity["id"], "a": start, "b": end},
+            ).mappings().first()
+            return float((row or {}).get("s") or 0)
+
+        cur = mtd_sum(month_start, today)
+        pyv = mtd_sum(py_month_start, py_today)
+
+    return {
+        "entity_code": entity_code,
+        "source": "pos_gross",
+        "as_of": today.isoformat(),
+        "py_as_of": py_today.isoformat(),
+        "month_label": today.strftime("%b %Y"),
+        "days_elapsed": today.day,
+        "mtd_sales": round(cur, 2),
+        "py_mtd_sales": round(pyv, 2),
+        "yoy_growth_pct": _pct_growth(cur, pyv),
+    }

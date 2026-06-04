@@ -135,3 +135,108 @@ export async function getDashboardAlerts(
   });
   return res.data;
 }
+
+// --------------------------------------------------------------------------
+// Sales drill-down (Phase 2A). source: 'gl_net' (monthly/rolling, reconciles
+// to the income statement) vs 'pos_gross' (daily/MTD, from cash balancing).
+// --------------------------------------------------------------------------
+
+export type SalesSource = 'gl_net' | 'pos_gross';
+
+export interface SalesMonthlyPoint {
+  period_end: string;
+  period_label: string;
+  sales: number;
+  cogs: number;
+  margin_pct: number;
+  py_sales: number | null;
+  py_cogs: number | null;
+  py_margin_pct: number | null;
+  yoy_growth_pct: number | null;
+  mom_growth_pct: number | null;
+}
+
+export interface SalesMonthlyResponse {
+  entity_code: string;
+  source: SalesSource;
+  months: number;
+  series: SalesMonthlyPoint[];
+}
+
+export async function getSalesMonthly(
+  entityCode: string,
+  months = 24,
+): Promise<SalesMonthlyResponse> {
+  const res = await api.get<SalesMonthlyResponse>('/api/dashboard/sales/monthly', {
+    params: { entity_code: entityCode, months },
+  });
+  return res.data;
+}
+
+export interface SalesRolling12Point {
+  period_end: string;
+  period_label: string;
+  rolling12_sales: number | null;
+  py_rolling12_sales: number | null;
+  yoy_growth_pct: number | null;
+}
+
+export interface SalesRolling12Response {
+  entity_code: string;
+  source: SalesSource;
+  months: number;
+  series: SalesRolling12Point[];
+}
+
+export async function getSalesRolling12(
+  entityCode: string,
+  months = 24,
+): Promise<SalesRolling12Response> {
+  const res = await api.get<SalesRolling12Response>('/api/dashboard/sales/rolling12', {
+    params: { entity_code: entityCode, months },
+  });
+  return res.data;
+}
+
+export interface SalesDailyPoint {
+  date: string;
+  sales: number;
+  py_date: string;
+  py_sales: number | null;
+}
+
+export interface SalesDailyResponse {
+  entity_code: string;
+  source: SalesSource;
+  days: number;
+  series: SalesDailyPoint[];
+}
+
+export async function getSalesDaily(
+  entityCode: string,
+  days = 90,
+): Promise<SalesDailyResponse> {
+  const res = await api.get<SalesDailyResponse>('/api/dashboard/sales/daily', {
+    params: { entity_code: entityCode, days },
+  });
+  return res.data;
+}
+
+export interface SalesMtdResponse {
+  entity_code: string;
+  source: SalesSource;
+  as_of: string;
+  py_as_of: string;
+  month_label: string;
+  days_elapsed: number;
+  mtd_sales: number;
+  py_mtd_sales: number;
+  yoy_growth_pct: number | null;
+}
+
+export async function getSalesMtd(entityCode: string): Promise<SalesMtdResponse> {
+  const res = await api.get<SalesMtdResponse>('/api/dashboard/sales/mtd', {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}

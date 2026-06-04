@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
 import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
-import { getGlCashBalance, getGrossMargin } from '@/lib/api/dashboard';
+import { getGlCashBalance, getGrossMargin, getSalesMtd } from '@/lib/api/dashboard';
 import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
@@ -98,6 +98,13 @@ export default function DashboardPage() {
     queryKey: ['gross-margin', entityCode],
     enabled: !!entityCode,
     queryFn: () => getGrossMargin(entityCode!),
+  });
+  // Sales MTD comes from cash balancing (POS gross) — the SAME source as the
+  // sales drill-down's MTD, so the card and the drill always agree.
+  const salesMtd = useQuery({
+    queryKey: ['sales-mtd', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getSalesMtd(entityCode!),
   });
 
   if (!entityCode) {
@@ -273,34 +280,34 @@ export default function DashboardPage() {
               4xxx accounts via the gross-margin endpoint (which already
               returns the per-period sales sum). Label switches to
               "(closed)" when the period is closed, "(open)" otherwise. */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
-                {grossMargin.data?.period_label
-                  ? `Sales — ${grossMargin.data.period_label}`
-                  : 'Sales — current period'}
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {grossMargin.isLoading ? (
-                <Skeleton className="h-9 w-32" />
-              ) : grossMargin.data && grossMargin.data.period_end ? (
-                <>
-                  <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
-                    {formatMoney(grossMargin.data.sales)}
-                  </div>
-                  <p className="text-xs text-slate mt-1">
-                    From journal_lines (4xxx) ·{' '}
-                    {periodStatus.data?.status === 'closed'
-                      ? 'closed'
-                      : 'open'}
-                  </p>
-                </>
-              ) : (
-                <p className="text-sm text-slate">No journal data yet</p>
-              )}
-            </CardContent>
-          </Card>
+          <Link href="/dashboard/sales" className="block transition hover:ring-2 hover:ring-ledger-blue/30 rounded-xl">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
+                  {salesMtd.data ? `Sales — ${salesMtd.data.month_label} MTD` : 'Sales — month to date'}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {salesMtd.isLoading || !salesMtd.data ? (
+                  <Skeleton className="h-9 w-32" />
+                ) : (
+                  <>
+                    <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
+                      {formatMoney(salesMtd.data.mtd_sales)}
+                    </div>
+                    <p className="text-xs text-slate mt-1">
+                      POS gross · vs {formatMoney(salesMtd.data.py_mtd_sales)} same period last year
+                      {salesMtd.data.yoy_growth_pct !== null && (
+                        <span className={salesMtd.data.yoy_growth_pct >= 0 ? ' text-green-700' : ' text-red-700'}>
+                          {' '}({salesMtd.data.yoy_growth_pct >= 0 ? '+' : ''}{salesMtd.data.yoy_growth_pct.toFixed(1)}%)
+                        </span>
+                      )}
+                    </p>
+                  </>
+                )}
+              </CardContent>
+            </Card>
+          </Link>
 
           {/* Gross margin — rolling 12 months. ttm_margin_pct is computed
               server-side from posted/approved batches across the trailing
