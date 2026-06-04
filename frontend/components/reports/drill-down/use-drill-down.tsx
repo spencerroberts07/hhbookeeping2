@@ -20,7 +20,14 @@ export type DrillLevel =
       line_amount: number;
     }
   | { kind: 'entry'; journal_batch_id: string }
-  | { kind: 'document'; journal_batch_id: string; journal_line_id?: string };
+  | { kind: 'document'; journal_batch_id: string; journal_line_id?: string }
+  | {
+      // HH AP invoice root — resolves to a journal entry if linked, else
+      // the source document. Breadcrumb root reads "Invoice …".
+      kind: 'invoice';
+      hh_ap_invoice_id: string;
+      title: string;
+    };
 
 interface DrillDownContextValue {
   open: boolean;

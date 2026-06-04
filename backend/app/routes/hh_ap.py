@@ -4603,6 +4603,147 @@ def hh_ap_summary(entity_code: str):
         }
 
 
+@router.get("/invoices")
+def hh_ap_list_invoices(
+    entity_code: str,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """Outstanding HH AP invoices — the detail behind the aging-summary
+    buckets.
+
+    Consistent with /summary: same `match_status <> 'matched'` filter and
+    `total_amount` field, so these rows sum to the buckets and the row
+    count equals the summary's `unreconciled_invoice_count`.
+
+    Each row carries `has_batch` — whether a posted journal batch is linked
+    via `invoice_journal_links`. That pivot is currently empty, so every row
+    is `false` and the UI drills to the source document; the flag is here so
+    the same rows drill to the journal entry once the posting flow links
+    them. Pure read, scoped by entity_id.
+    """
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        entity_id = entity["id"]
+        rows = session.execute(
+            text(
+                """
+                SELECT hi.id,
+                       hi.invoice_date,
+                       hi.due_date,
+                       hi.invoice_type,
+                       hi.invoice_number,
+                       hi.vendor_name,
+                       hi.total_amount,
+                       EXISTS (
+                           SELECT 1 FROM invoice_journal_links l
+                            WHERE l.hh_ap_invoice_id = hi.id
+                              AND l.journal_batch_id IS NOT NULL
+                       ) AS has_batch
+                  FROM hh_ap_invoices hi
+                 WHERE hi.entity_id = :eid
+                   AND hi.match_status <> 'matched'
+              ORDER BY COALESCE(hi.due_date, hi.invoice_date) DESC NULLS LAST,
+                       hi.invoice_number
+                 LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"eid": entity_id, "limit": limit, "offset": offset},
+        ).mappings().all()
+        total = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS n FROM hh_ap_invoices
+                 WHERE entity_id = :eid AND match_status <> 'matched'
+                """
+            ),
+            {"eid": entity_id},
+        ).scalar()
+
+    invoices = [
+        {
+            "id": str(r["id"]),
+            "document_date": (
+                r["invoice_date"].isoformat()
+                if r["invoice_date"]
+                else (r["due_date"].isoformat() if r["due_date"] else None)
+            ),
+            "document_type": r["invoice_type"],
+            "document_number": r["invoice_number"],
+            "vendor_name": r["vendor_name"],
+            "amount": float(r["total_amount"] or 0),
+            "has_batch": bool(r["has_batch"]),
+        }
+        for r in rows
+    ]
+    return {"invoices": invoices, "total": int(total or 0)}
+
+
+@router.get("/invoices/{invoice_id}/drill")
+def hh_ap_invoice_drill(invoice_id: str, entity_code: str):
+    """Resolve an HH AP invoice to its drill target.
+
+    Returns a posted `journal_batch_id` if one is linked via
+    `invoice_journal_links` (the panel then opens the full journal entry),
+    else the source `document` (presigned R2 URL from `hh_ap_documents`) so
+    the panel opens the PDF. `invoice_journal_links` is currently empty, so
+    `journal_batch_id` is null today and callers fall through to the
+    document — forward-compatible for when posting links invoices.
+    """
+    from ..services_storage import storage_service as _r2
+
+    with db_session() as session:
+        entity = get_entity(session, entity_code)
+        entity_id = entity["id"]
+        inv = session.execute(
+            text(
+                """
+                SELECT hi.id,
+                       hi.invoice_number,
+                       hi.invoice_type,
+                       hi.vendor_name,
+                       hi.total_amount,
+                       hd.r2_object_key,
+                       hd.source_filename
+                  FROM hh_ap_invoices hi
+             LEFT JOIN hh_ap_documents hd ON hd.id = hi.document_id
+                 WHERE hi.id = :id AND hi.entity_id = :eid
+                """
+            ),
+            {"id": invoice_id, "eid": entity_id},
+        ).mappings().first()
+        if not inv:
+            raise HTTPException(404, "Invoice not found for this entity")
+        link = session.execute(
+            text(
+                """
+                SELECT journal_batch_id FROM invoice_journal_links
+                 WHERE hh_ap_invoice_id = :id AND journal_batch_id IS NOT NULL
+                 LIMIT 1
+                """
+            ),
+            {"id": invoice_id},
+        ).mappings().first()
+
+    journal_batch_id = str(link["journal_batch_id"]) if link else None
+    document = None
+    if inv["r2_object_key"]:
+        amount = inv["total_amount"]
+        document = {
+            "file_name": inv["source_filename"],
+            "presigned_url": _r2.get_presigned_url(inv["r2_object_key"]),
+            "vendor_name": inv["vendor_name"],
+            "invoice_number": inv["invoice_number"],
+            "invoice_type": inv["invoice_type"],
+            "amount": float(amount) if amount is not None else None,
+        }
+    return {
+        "hh_ap_invoice_id": invoice_id,
+        "journal_batch_id": journal_batch_id,
+        "document": document,
+    }
+
+
 @router.get("/status")
 def hh_ap_status(entity_code: str):
     with db_session() as session:

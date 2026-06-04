@@ -8,6 +8,7 @@ import { useDrillDown, type DrillLevel } from './use-drill-down';
 import { AccountView } from './account-view';
 import { EntryView } from './entry-view';
 import { DocumentView } from './document-view';
+import { InvoiceView } from './invoice-view';
 
 function crumbLabel(level: DrillLevel): string {
   switch (level.kind) {
@@ -17,6 +18,8 @@ function crumbLabel(level: DrillLevel): string {
       return 'Journal entry';
     case 'document':
       return 'Document';
+    case 'invoice':
+      return level.title;
   }
 }
 
@@ -73,6 +76,9 @@ export function DrillDownPanel() {
               journalBatchId={active.journal_batch_id}
               journalLineId={active.journal_line_id}
             />
+          )}
+          {active?.kind === 'invoice' && (
+            <InvoiceView hhApInvoiceId={active.hh_ap_invoice_id} />
           )}
         </div>
       </SheetContent>

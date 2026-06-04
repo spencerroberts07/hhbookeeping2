@@ -6,9 +6,11 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { useEntityStore } from '@/lib/store/entity';
 import { getHHAPSummary, listHHAPInvoices } from '@/lib/api/hh_ap';
 import { formatMoney, formatDate } from '@/lib/utils';
+import { useDrillDown } from '@/components/reports/drill-down/use-drill-down';
 
 export default function ApAgingPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
+  const { openAt } = useDrillDown();
 
   const summary = useQuery({
     queryKey: ['hh-ap-summary', entityCode],
@@ -59,7 +61,18 @@ export default function ApAgingPage() {
             </thead>
             <tbody className="divide-y divide-border">
               {invoices.data.invoices.map((i) => (
-                <tr key={i.id} className="hover:bg-cloud">
+                <tr
+                  key={i.id}
+                  className="cursor-pointer hover:bg-cloud"
+                  onClick={() =>
+                    openAt({
+                      kind: 'invoice',
+                      hh_ap_invoice_id: i.id,
+                      title: `Invoice ${i.document_number ?? i.document_type}`,
+                    })
+                  }
+                  title={i.has_batch ? 'View journal entry' : 'View invoice document'}
+                >
                   <td className="px-4 py-2 text-ink">{formatDate(i.document_date)}</td>
                   <td className="px-4 py-2 text-slate font-mono text-xs">{i.document_type}</td>
                   <td className="px-4 py-2 text-slate font-mono text-xs">

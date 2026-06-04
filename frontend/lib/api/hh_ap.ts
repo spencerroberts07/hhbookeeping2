@@ -14,11 +14,39 @@ export interface HHAPSummary {
 
 export interface HHAPInvoice {
   id: string;
-  document_date: string;
+  document_date: string | null;
   document_type: string;
   document_number: string | null;
+  vendor_name: string | null;
   amount: number;
-  source_hash: string;
+  /** True once a posted journal batch is linked (invoice_journal_links).
+   *  Currently always false — the panel drills to the document instead. */
+  has_batch: boolean;
+}
+
+export interface HHAPInvoiceDrill {
+  hh_ap_invoice_id: string;
+  /** Posted journal batch, when linked; null today (pivot is empty). */
+  journal_batch_id: string | null;
+  document: {
+    file_name: string | null;
+    presigned_url: string | null;
+    vendor_name: string | null;
+    invoice_number: string | null;
+    invoice_type: string | null;
+    amount: number | null;
+  } | null;
+}
+
+export async function getHHAPInvoiceDrill(input: {
+  entity_code: string;
+  invoice_id: string;
+}): Promise<HHAPInvoiceDrill> {
+  const res = await api.get<HHAPInvoiceDrill>(
+    `/api/hh-ap/invoices/${input.invoice_id}/drill`,
+    { params: { entity_code: input.entity_code } },
+  );
+  return res.data;
 }
 
 export async function getHHAPSummary(entityCode: string): Promise<HHAPSummary> {
