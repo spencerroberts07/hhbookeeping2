@@ -1219,8 +1219,8 @@ def get_general_ledger_report(
                  WHERE jb.entity_id = :eid
                    AND jl.account_code = :code
                    AND jb.status NOT IN ('draft', 'voided', 'rejected')
-                   AND (:df IS NULL OR ap.period_end >= :df)
-                   AND (:dt IS NULL OR ap.period_end <= :dt)
+                   AND (CAST(:df AS date) IS NULL OR ap.period_end >= :df)
+                   AND (CAST(:dt AS date) IS NULL OR ap.period_end <= :dt)
                  ORDER BY ap.period_end, jb.batch_label, jl.line_number
                 """
             ),
