@@ -1,6 +1,6 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FileText } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
@@ -8,10 +8,12 @@ import { useEntityStore } from '@/lib/store/entity';
 import { getJournalEntry } from '@/lib/api/reports';
 import { formatMoney, formatDate } from '@/lib/utils';
 import { useDrillDown } from './use-drill-down';
+import { EditControls } from './edit-controls';
 
 export function EntryView({ journalBatchId }: { journalBatchId: string }) {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const { push } = useDrillDown();
+  const queryClient = useQueryClient();
 
   const q = useQuery({
     queryKey: ['journal-entry', journalBatchId, entityCode],
@@ -19,6 +21,13 @@ export function EntryView({ journalBatchId }: { journalBatchId: string }) {
     queryFn: () =>
       getJournalEntry({ entity_code: entityCode!, journal_batch_id: journalBatchId }),
   });
+
+  // After any edit/correction, refresh this entry and any account-activity
+  // panels so totals (and reconcile chips) reflect the change.
+  const onChanged = () => {
+    queryClient.invalidateQueries({ queryKey: ['journal-entry', journalBatchId] });
+    queryClient.invalidateQueries({ queryKey: ['account-activity'] });
+  };
 
   if (q.isLoading) return <Skeleton className="h-80" />;
   if (q.isError) return <p className="text-red-700 text-sm">Could not load the journal entry.</p>;
@@ -111,6 +120,13 @@ export function EntryView({ journalBatchId }: { journalBatchId: string }) {
           <p className="text-xs text-slate">No source document attached to this entry.</p>
         )}
       </div>
+
+      <EditControls
+        journalBatchId={journalBatchId}
+        lines={lines}
+        periodLocked={periodLocked}
+        onChanged={onChanged}
+      />
     </div>
   );
 }

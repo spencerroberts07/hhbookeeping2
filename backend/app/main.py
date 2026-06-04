@@ -27,6 +27,7 @@ from .routes.gl_import import router as gl_import_router
 from .routes.hh_ap import router as hh_ap_router
 from .routes import hh_ap_overrides
 from .routes.invoice_documents import router as invoice_documents_router
+from .routes.journal_edits import router as journal_edits_router
 from .routes.hh_ap_remittance_bank_match import (
     clearing_router as hh_ap_remittance_clearing_router,
     router as hh_ap_remittance_bank_match_router,
@@ -140,6 +141,10 @@ app.include_router(invoice_documents_router)
 
 # Live financial reports (Income Statement, Balance Sheet, Trial Balance).
 app.include_router(reports_router)
+
+# Report drill-down write path (Slice 2): reclassify / edit-amount / correct
+# / note. Admin-only; locked periods route to reversal + re-entry.
+app.include_router(journal_edits_router)
 
 # BookWize AI assistant — conversational classifier + entity memory.
 app.include_router(assistant_router)
