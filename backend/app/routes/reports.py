@@ -41,6 +41,7 @@ from sqlalchemy import text
 
 from ..db import db_session
 from ..services_auth import require_role
+from ..services_storage import storage_service
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -197,6 +198,30 @@ def _find_opening_balance_cutover(session, entity_id: str) -> DateType | None:
     return row["period_end"] if row else None
 
 
+def _cutover_where(
+    session, entity_id: str, period_end_to: DateType
+) -> tuple[str | None, dict[str, Any]]:
+    """Build the cumulative-mode cutover WHERE fragment for an as-of date.
+
+    Returns ``(clause, params)``. ``clause`` is None when no opening_balance
+    cutover applies — either the entity has no opening_balance batch, or the
+    requested as-of date is before the cutover — in which case callers fall
+    through to legacy cumulative behavior. Shared by ``_account_sums`` and the
+    account-activity drill-down so both walk byte-identical filter logic.
+    """
+    cutover = _find_opening_balance_cutover(session, entity_id)
+    if cutover is not None and period_end_to >= cutover:
+        clause = (
+            "("
+            "(jb.source_module = 'opening_balance'"
+            " AND ap.period_end <= :cutover)"
+            " OR ap.period_start > :cutover"
+            ")"
+        )
+        return clause, {"cutover": cutover}
+    return None, {}
+
+
 def _account_sums(
     session,
     *,
@@ -248,20 +273,14 @@ def _account_sums(
         where.append("ap.period_end >= :period_end_from")
         params["period_end_from"] = period_end_from
     else:
-        cutover = _find_opening_balance_cutover(session, entity_id)
         # Cutover only kicks in when the as-of date reaches the cutover.
-        # For pre-cutover as-of dates we fall through to legacy
-        # cumulative behavior so forensic queries on historical periods
-        # still return a number.
-        if cutover is not None and period_end_to >= cutover:
-            where.append(
-                "("
-                "(jb.source_module = 'opening_balance'"
-                " AND ap.period_end <= :cutover)"
-                " OR ap.period_start > :cutover"
-                ")"
-            )
-            params["cutover"] = cutover
+        # For pre-cutover as-of dates the helper returns (None, {}) and we
+        # fall through to legacy cumulative behavior so forensic queries on
+        # historical periods still return a number.
+        clause, cutover_params = _cutover_where(session, entity_id, period_end_to)
+        if clause is not None:
+            where.append(clause)
+            params.update(cutover_params)
 
     rows = session.execute(
         text(
@@ -1185,6 +1204,7 @@ def get_general_ledger_report(
             text(
                 """
                 SELECT jl.id,
+                       jl.journal_batch_id,
                        ap.period_end       AS posting_date,
                        jb.source_module,
                        jb.batch_label,
@@ -1239,6 +1259,7 @@ def get_general_ledger_report(
         description = r["memo"] or r["source_module"]
         transactions.append({
             "id": str(r["id"]),
+            "journal_batch_id": str(r["journal_batch_id"]),
             "posting_date": r["posting_date"].isoformat(),
             "description": description,
             "reference": reference,
@@ -1259,3 +1280,386 @@ def get_general_ledger_report(
         "transactions": transactions,
         "transaction_count": len(transactions),
     }
+
+
+# --------------------------------------------------------------------------
+# Report drill-down (Slice 1, read-only)
+#
+# Report line -> account GL activity (this endpoint) -> full journal entry
+# (/journal-entry/{id}) -> linked source document (/journal-entry/{id}/documents).
+# All three are scoped by entity_id and reuse the report aggregation helpers
+# so the panel reconciles to the report line the user clicked.
+# --------------------------------------------------------------------------
+
+
+def _resolve_account_name(session, entity_id: str, account_code: str) -> str:
+    """CoA name -> gl_account_balances name -> bare code. Mirrors the
+    fallback chain used by _account_sums so drill-down names match reports."""
+    arow = session.execute(
+        text(
+            """
+            SELECT account_name FROM accounts
+             WHERE entity_id = :eid AND account_code = :code AND is_active = TRUE
+             LIMIT 1
+            """
+        ),
+        {"eid": entity_id, "code": account_code},
+    ).mappings().first()
+    if arow and arow.get("account_name"):
+        return arow["account_name"]
+    grow = session.execute(
+        text(
+            """
+            SELECT account_name FROM gl_account_balances
+             WHERE entity_id = :eid AND account_code = :code
+             ORDER BY created_at DESC LIMIT 1
+            """
+        ),
+        {"eid": entity_id, "code": account_code},
+    ).mappings().first()
+    if grow and grow.get("account_name"):
+        return grow["account_name"]
+    return account_code
+
+
+@router.get("/account-activity")
+def get_account_activity(
+    entity_code: str = Query(...),
+    account_code: str = Query(...),
+    mode: str = Query(...),
+    period_end: str = Query(...),
+    period_start: str | None = Query(default=None),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """GL activity behind a single report line — the account-level drill.
+
+    Two modes, chosen to match the report the line came from so the panel's
+    running balance reconciles to the clicked figure:
+
+      mode='period'      Income Statement. Activity strictly inside
+                         [period_start, period_end], opening_balance = 0,
+                         using the IS period/batch status whitelists.
+      mode='cumulative'  Balance Sheet / Trial Balance. Cumulative-to-date
+                         WITH the opening-balance cutover (shared
+                         `_cutover_where`); every qualifying line is listed
+                         so the running balance ends at the BS/TB figure.
+
+    `closing_balance` is the raw debit-minus-credit running total (TB
+    convention). The panel reconciles by magnitude against the clicked line,
+    which sidesteps the per-report sign conventions (BS type-signed, IS
+    `_signed_amount_by_type`, TB raw dr-cr).
+
+    Each transaction carries `journal_batch_id` (to drill into the full
+    entry) and `has_document` (whether a source doc is linked).
+    """
+    if mode not in ("period", "cumulative"):
+        raise HTTPException(400, "mode must be 'period' or 'cumulative'")
+    pe = _parse_date("period_end", period_end)
+    ps = _parse_date("period_start", period_start) if period_start else None
+    if mode == "period" and ps is None:
+        raise HTTPException(400, "period_start is required when mode='period'")
+
+    with db_session() as session:
+        entity = _resolve_entity(session, entity_code)
+        eid = entity["id"]
+
+        where = [
+            "jl.account_code = :code",
+            "jb.entity_id = :eid",
+            "ap.period_end <= :pe",
+        ]
+        params: dict[str, Any] = {"eid": eid, "code": account_code, "pe": pe}
+
+        if mode == "period":
+            where.append("ap.period_start >= :ps")
+            where.append("ap.status = ANY(:period_statuses)")
+            where.append("jb.status = ANY(:batch_statuses)")
+            params["ps"] = ps
+            params["period_statuses"] = list(_IS_PERIOD_STATUSES)
+            params["batch_statuses"] = list(_IS_BATCH_STATUSES)
+        else:
+            where.append(f"jb.status NOT IN {_POSTED_BATCH_STATUSES}")
+            clause, cutover_params = _cutover_where(session, eid, pe)
+            if clause is not None:
+                where.append(clause)
+                params.update(cutover_params)
+
+        rows = session.execute(
+            text(
+                f"""
+                SELECT jl.id,
+                       jl.journal_batch_id,
+                       ap.period_end       AS posting_date,
+                       jb.source_module,
+                       jb.batch_label,
+                       jb.status           AS batch_status,
+                       jl.line_number,
+                       jl.memo,
+                       jl.debit_amount,
+                       jl.credit_amount,
+                       jl.source_json,
+                       EXISTS (
+                           SELECT 1 FROM invoice_journal_links ijl
+                            WHERE ijl.journal_batch_id = jb.id
+                               OR ijl.journal_line_id = jl.id
+                       )                   AS has_document
+                  FROM journal_lines jl
+                  JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                  JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY ap.period_end, jb.batch_label, jl.line_number
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        account_name = _resolve_account_name(session, eid, account_code)
+
+    running = Decimal("0")
+    transactions: list[dict[str, Any]] = []
+    for r in rows:
+        dr = Decimal(str(r["debit_amount"] or 0))
+        cr = Decimal(str(r["credit_amount"] or 0))
+        running += dr - cr
+        sj = r.get("source_json") or {}
+        reference = (
+            (sj.get("reference_number") if isinstance(sj, dict) else None)
+            or r["batch_label"]
+        )
+        transactions.append({
+            "id": str(r["id"]),
+            "journal_batch_id": str(r["journal_batch_id"]),
+            "posting_date": r["posting_date"].isoformat(),
+            "description": r["memo"] or r["source_module"],
+            "reference": reference,
+            "debit": float(dr),
+            "credit": float(cr),
+            "balance": float(running),
+            "source_module": r["source_module"],
+            "batch_status": r["batch_status"],
+            "has_document": bool(r["has_document"]),
+        })
+
+    return {
+        "entity_code": entity_code,
+        "account_code": account_code,
+        "account_name": account_name,
+        "mode": mode,
+        "period_start": ps.isoformat() if ps else None,
+        "period_end": pe.isoformat(),
+        "opening_balance": 0.0,
+        "closing_balance": float(running),
+        "transactions": transactions,
+        "transaction_count": len(transactions),
+    }
+
+
+@router.get("/journal-entry/{journal_batch_id}")
+def get_journal_entry(
+    journal_batch_id: str,
+    entity_code: str = Query(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Full double-entry batch by id — header + every line, both sides."""
+    with db_session() as session:
+        entity = _resolve_entity(session, entity_code)
+        eid = entity["id"]
+        batch = session.execute(
+            text(
+                """
+                SELECT jb.id, jb.source_module, jb.batch_label, jb.status,
+                       jb.workflow_status, jb.total_debits, jb.total_credits,
+                       jb.created_at,
+                       ap.id          AS period_id,
+                       ap.period_label,
+                       ap.period_start,
+                       ap.period_end,
+                       ap.status      AS period_status
+                  FROM journal_batches jb
+                  JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                 WHERE jb.id = :bid AND jb.entity_id = :eid
+                """
+            ),
+            {"bid": journal_batch_id, "eid": eid},
+        ).mappings().first()
+        if not batch:
+            raise HTTPException(404, "Journal batch not found for this entity")
+
+        lines = session.execute(
+            text(
+                """
+                WITH gl_names AS (
+                    SELECT DISTINCT ON (account_code) account_code, account_name
+                      FROM gl_account_balances
+                     WHERE entity_id = :eid
+                  ORDER BY account_code, created_at DESC
+                )
+                SELECT jl.id,
+                       jl.line_number,
+                       jl.account_code,
+                       COALESCE(a.account_name, gl.account_name, jl.account_code)
+                           AS account_name,
+                       jl.debit_amount,
+                       jl.credit_amount,
+                       jl.memo,
+                       jl.source_json
+                  FROM journal_lines jl
+             LEFT JOIN accounts a
+                    ON a.entity_id = :eid
+                   AND a.account_code = jl.account_code
+                   AND a.is_active = TRUE
+             LEFT JOIN gl_names gl ON gl.account_code = jl.account_code
+                 WHERE jl.journal_batch_id = :bid
+              ORDER BY jl.line_number
+                """
+            ),
+            {"bid": journal_batch_id, "eid": eid},
+        ).mappings().all()
+
+        has_docs = session.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM invoice_journal_links WHERE journal_batch_id = :bid
+                ) AS e
+                """
+            ),
+            {"bid": journal_batch_id},
+        ).scalar()
+
+    td = Decimal(str(batch["total_debits"] or 0))
+    tc = Decimal(str(batch["total_credits"] or 0))
+    out_lines: list[dict[str, Any]] = []
+    for ln in lines:
+        sj = ln.get("source_json") or {}
+        reference = sj.get("reference_number") if isinstance(sj, dict) else None
+        out_lines.append({
+            "id": str(ln["id"]),
+            "line_number": ln["line_number"],
+            "account_code": ln["account_code"],
+            "account_name": ln["account_name"],
+            "debit": float(ln["debit_amount"] or 0),
+            "credit": float(ln["credit_amount"] or 0),
+            "memo": ln["memo"],
+            "reference": reference,
+        })
+
+    return {
+        "batch": {
+            "id": str(batch["id"]),
+            "source_module": batch["source_module"],
+            "batch_label": batch["batch_label"],
+            "status": batch["status"],
+            "workflow_status": batch["workflow_status"],
+            "total_debits": float(td),
+            "total_credits": float(tc),
+            "balanced": abs(td - tc) < Decimal("0.01"),
+            "created_at": batch["created_at"].isoformat() if batch["created_at"] else None,
+            "period": {
+                "id": str(batch["period_id"]),
+                "period_label": batch["period_label"],
+                "period_start": batch["period_start"].isoformat(),
+                "period_end": batch["period_end"].isoformat(),
+                "status": batch["period_status"],
+            },
+        },
+        "lines": out_lines,
+        "has_documents": bool(has_docs),
+    }
+
+
+@router.get("/journal-entry/{journal_batch_id}/documents")
+def get_journal_entry_documents(
+    journal_batch_id: str,
+    entity_code: str = Query(...),
+    journal_line_id: str | None = Query(default=None),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Source documents linked to a batch (or a specific line).
+
+    Two sources: the `invoice_documents` pivot (`invoice_journal_links`) and
+    the HH AP branch (`hh_ap_invoices.document_id -> hh_ap_documents`).
+    An empty list is normal — most historical entries have no linked
+    document — so this never 404s on "no documents".
+    """
+    with db_session() as session:
+        entity = _resolve_entity(session, entity_code)
+        eid = entity["id"]
+        owns = session.execute(
+            text("SELECT 1 FROM journal_batches WHERE id = :bid AND entity_id = :eid"),
+            {"bid": journal_batch_id, "eid": eid},
+        ).first()
+        if not owns:
+            raise HTTPException(404, "Journal batch not found for this entity")
+
+        if journal_line_id:
+            link_where = "(l.journal_batch_id = :bid OR l.journal_line_id = :lid)"
+            lp: dict[str, Any] = {"bid": journal_batch_id, "lid": journal_line_id}
+        else:
+            link_where = "l.journal_batch_id = :bid"
+            lp = {"bid": journal_batch_id}
+
+        inv_rows = session.execute(
+            text(
+                f"""
+                SELECT l.id           AS link_id,
+                       l.link_type,
+                       d.id           AS invoice_document_id,
+                       d.file_path,
+                       d.file_name,
+                       d.vendor_name,
+                       d.invoice_number,
+                       d.invoice_type,
+                       d.amount
+                  FROM invoice_journal_links l
+                  JOIN invoice_documents d ON d.id = l.invoice_document_id
+                 WHERE {link_where}
+                   AND d.file_path IS NOT NULL
+                """
+            ),
+            lp,
+        ).mappings().all()
+
+        # HH AP branch: file lives on hh_ap_documents.r2_object_key (confirmed
+        # against the live DB — the table was migrated off file_bytes to R2).
+        hh_rows = session.execute(
+            text(
+                f"""
+                SELECT l.id              AS link_id,
+                       l.link_type,
+                       hd.id             AS invoice_document_id,
+                       hd.r2_object_key  AS file_path,
+                       hd.source_filename AS file_name,
+                       hi.vendor_name,
+                       hi.invoice_number,
+                       hi.invoice_type,
+                       hi.total_amount   AS amount
+                  FROM invoice_journal_links l
+                  JOIN hh_ap_invoices hi ON hi.id = l.hh_ap_invoice_id
+                  JOIN hh_ap_documents hd ON hd.id = hi.document_id
+                 WHERE {link_where}
+                   AND l.hh_ap_invoice_id IS NOT NULL
+                   AND hd.r2_object_key IS NOT NULL
+                """
+            ),
+            lp,
+        ).mappings().all()
+
+    documents: list[dict[str, Any]] = []
+    for source, batch in (("invoice_documents", inv_rows), ("hh_ap_documents", hh_rows)):
+        for r in batch:
+            amount = r.get("amount")
+            documents.append({
+                "link_id": str(r["link_id"]),
+                "link_type": r["link_type"],
+                "invoice_document_id": str(r["invoice_document_id"]),
+                "file_name": r["file_name"],
+                "presigned_url": storage_service.get_presigned_url(r["file_path"]),
+                "vendor_name": r.get("vendor_name"),
+                "invoice_number": r.get("invoice_number"),
+                "invoice_type": r.get("invoice_type"),
+                "amount": float(amount) if amount is not None else None,
+                "source": source,
+            })
+
+    return {"journal_batch_id": journal_batch_id, "documents": documents}

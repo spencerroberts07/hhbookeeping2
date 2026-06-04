@@ -12,6 +12,7 @@ import { useEntityStore } from '@/lib/store/entity';
 import { getTrialBalance } from '@/lib/api/reports';
 import { formatMoney, formatDate } from '@/lib/utils';
 import { cn } from '@/lib/utils';
+import { useDrillDown } from '@/components/reports/drill-down/use-drill-down';
 
 export default function TrialBalancePage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
@@ -19,6 +20,7 @@ export default function TrialBalancePage() {
   const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
   const [asOf, setAsOf] = useState(lastMonthEnd.toISOString().slice(0, 10));
   const [onlyUnexpected, setOnlyUnexpected] = useState(false);
+  const { openAt } = useDrillDown();
 
   const tb = useQuery({
     queryKey: ['trial-balance', entityCode, asOf],
@@ -111,8 +113,20 @@ export default function TrialBalancePage() {
               {visible.map((r) => (
                 <tr
                   key={r.account_code}
+                  onClick={() =>
+                    openAt({
+                      kind: 'account',
+                      account_code: r.account_code,
+                      account_name: r.account_name,
+                      mode: 'cumulative',
+                      period_start: null,
+                      period_end: asOf,
+                      line_amount: r.net_balance,
+                    })
+                  }
+                  title="View account activity"
                   className={cn(
-                    'hover:bg-cloud',
+                    'cursor-pointer hover:bg-cloud',
                     r.unexpected_balance && 'bg-amber-50',
                   )}
                 >

@@ -10,6 +10,7 @@ import { useEntityStore } from '@/lib/store/entity';
 import { getGeneralLedgerReport } from '@/lib/api/reports';
 import { listAccounts } from '@/lib/api/accounts';
 import { formatMoney, formatDate } from '@/lib/utils';
+import { useDrillDown } from '@/components/reports/drill-down/use-drill-down';
 
 // Live app-native General Ledger — backed by /api/reports/general-ledger
 // (journal_lines, posted-only). Replaces the previous gl-import-runs
@@ -21,6 +22,7 @@ export default function GeneralLedgerPage() {
   const [accountCode, setAccountCode] = useState('');
   const [dateFrom, setDateFrom] = useState(ninetyAgo.toISOString().slice(0, 10));
   const [dateTo, setDateTo] = useState(today.toISOString().slice(0, 10));
+  const { openAt } = useDrillDown();
 
   const accounts = useQuery({
     queryKey: ['accounts', entityCode],
@@ -128,7 +130,14 @@ export default function GeneralLedgerPage() {
               </thead>
               <tbody className="divide-y divide-border">
                 {report.data.transactions.map((t) => (
-                  <tr key={t.id} className="hover:bg-cloud">
+                  <tr
+                    key={t.id}
+                    className="cursor-pointer hover:bg-cloud"
+                    onClick={() =>
+                      openAt({ kind: 'entry', journal_batch_id: t.journal_batch_id })
+                    }
+                    title="View full journal entry"
+                  >
                     <td className="px-4 py-2 text-ink">{formatDate(t.posting_date)}</td>
                     <td className="px-4 py-2 text-ink">{t.description}</td>
                     <td className="px-4 py-2 text-slate font-mono text-xs">{t.reference}</td>

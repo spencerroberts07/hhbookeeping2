@@ -21,9 +21,11 @@ import {
   getIncomeStatementPeriods,
   type IncomeStatementPreset,
   type IncomeStatementSection,
+  type IncomeStatementAccount,
 } from '@/lib/api/reports';
 import { formatMoney } from '@/lib/utils';
 import { cn } from '@/lib/utils';
+import { useDrillDown } from '@/components/reports/drill-down/use-drill-down';
 
 type SelectorValue =
   | { kind: 'month'; period_end: string }
@@ -53,6 +55,7 @@ function decodeSelector(s: string): SelectorValue {
 
 export default function IncomeStatementPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
+  const { openAt } = useDrillDown();
 
   const periodsQ = useQuery({
     queryKey: ['is-periods', entityCode],
@@ -272,6 +275,17 @@ export default function IncomeStatementPage() {
                   key={sec.section}
                   section={sec}
                   showCompare={showCompare}
+                  onSelectAccount={(a) =>
+                    openAt({
+                      kind: 'account',
+                      account_code: a.account_code,
+                      account_name: a.account_name,
+                      mode: 'period',
+                      period_start: report.data!.period_start,
+                      period_end: report.data!.period_end,
+                      line_amount: a.current_amount ?? 0,
+                    })
+                  }
                 />
               ))}
             </tbody>
@@ -285,9 +299,11 @@ export default function IncomeStatementPage() {
 function SectionRows({
   section,
   showCompare,
+  onSelectAccount,
 }: {
   section: IncomeStatementSection;
   showCompare: boolean;
+  onSelectAccount?: (a: IncomeStatementAccount) => void;
 }) {
   const isSummary =
     section.section === 'GROSS PROFIT' || section.section === 'PROFIT';
@@ -399,7 +415,12 @@ function SectionRows({
             );
           }
           return (
-            <tr key={`${a.account_code}-${i}`} className="hover:bg-cloud">
+            <tr
+              key={`${a.account_code}-${i}`}
+              className={cn('hover:bg-cloud', onSelectAccount && 'cursor-pointer')}
+              onClick={onSelectAccount ? () => onSelectAccount(a) : undefined}
+              title={onSelectAccount ? 'View account activity' : undefined}
+            >
               <td
                 className="py-1.5"
                 style={{ paddingLeft: indentPx, paddingRight: 16 }}

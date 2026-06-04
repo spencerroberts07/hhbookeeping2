@@ -11,12 +11,14 @@ import { AlertTriangle } from 'lucide-react';
 import { useEntityStore } from '@/lib/store/entity';
 import { getBalanceSheet, type BalanceSheetRow } from '@/lib/api/reports';
 import { formatMoney, formatDate } from '@/lib/utils';
+import { useDrillDown } from '@/components/reports/drill-down/use-drill-down';
 
 export default function BalanceSheetPage() {
   const entityCode = useEntityStore((s) => s.activeEntityCode);
   const today = new Date();
   const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
   const [asOf, setAsOf] = useState(lastMonthEnd.toISOString().slice(0, 10));
+  const { openAt } = useDrillDown();
 
   const report = useQuery({
     queryKey: ['balance-sheet', entityCode, asOf],
@@ -24,6 +26,17 @@ export default function BalanceSheetPage() {
     queryFn: () =>
       getBalanceSheet({ entity_code: entityCode!, as_of_date: asOf }),
   });
+
+  const selectAccount = (r: BalanceSheetRow) =>
+    openAt({
+      kind: 'account',
+      account_code: r.account_code,
+      account_name: r.account_name,
+      mode: 'cumulative',
+      period_start: null,
+      period_end: asOf,
+      line_amount: r.balance,
+    });
 
   return (
     <ReportShell title="Balance Sheet" subtitle={`As of ${formatDate(asOf)}`}>
@@ -68,8 +81,8 @@ export default function BalanceSheetPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             <div>
               <h3 className="text-h2 text-deep-navy mb-3">Assets</h3>
-              <Group label="Current assets" rows={report.data.assets.current} total={report.data.assets.current_total} />
-              <Group label="Fixed assets" rows={report.data.assets.fixed} total={report.data.assets.fixed_total} />
+              <Group label="Current assets" rows={report.data.assets.current} total={report.data.assets.current_total} onSelect={selectAccount} />
+              <Group label="Fixed assets" rows={report.data.assets.fixed} total={report.data.assets.fixed_total} onSelect={selectAccount} />
               <div className="border-t-2 border-deep-navy mt-3 pt-2 flex justify-between font-bold text-deep-navy">
                 <span>Total assets</span>
                 <span className="tabular-nums">{formatMoney(report.data.assets.total)}</span>
@@ -78,8 +91,8 @@ export default function BalanceSheetPage() {
 
             <div>
               <h3 className="text-h2 text-deep-navy mb-3">Liabilities & Equity</h3>
-              <Group label="Current liabilities" rows={report.data.liabilities.current} total={report.data.liabilities.current_total} />
-              <Group label="Long-term liabilities" rows={report.data.liabilities.long_term} total={report.data.liabilities.long_term_total} />
+              <Group label="Current liabilities" rows={report.data.liabilities.current} total={report.data.liabilities.current_total} onSelect={selectAccount} />
+              <Group label="Long-term liabilities" rows={report.data.liabilities.long_term} total={report.data.liabilities.long_term_total} onSelect={selectAccount} />
               <div className="border-t border-border pt-2 mt-2 flex justify-between font-semibold text-deep-navy">
                 <span>Total liabilities</span>
                 <span className="tabular-nums">{formatMoney(report.data.liabilities.total)}</span>
@@ -89,6 +102,7 @@ export default function BalanceSheetPage() {
                 rows={report.data.equity.accounts}
                 total={report.data.equity.total}
                 className="mt-4"
+                onSelect={selectAccount}
               />
               <div className="border-t-2 border-deep-navy mt-3 pt-2 flex justify-between font-bold text-deep-navy">
                 <span>Total liabilities + equity</span>
@@ -114,11 +128,13 @@ function Group({
   rows,
   total,
   className,
+  onSelect,
 }: {
   label: string;
   rows: BalanceSheetRow[];
   total: number;
   className?: string;
+  onSelect?: (r: BalanceSheetRow) => void;
 }) {
   return (
     <div className={className}>
@@ -129,15 +145,28 @@ function Group({
         <div className="text-xs text-slate py-1">No balance.</div>
       ) : (
         <div className="divide-y divide-border">
-          {rows.map((r) => (
-            <div key={r.account_code} className="flex justify-between py-1.5 text-sm">
-              <span className="text-ink">
-                <span className="text-slate font-mono mr-2">{r.account_code}</span>
-                {r.account_name}
-              </span>
-              <span className="tabular-nums text-ink">{formatMoney(r.balance)}</span>
-            </div>
-          ))}
+          {rows.map((r) => {
+            // "RE" is the synthetic computed retained-earnings line — no
+            // single account to drill into.
+            const clickable = !!onSelect && r.account_code !== 'RE';
+            return (
+              <div
+                key={r.account_code}
+                className={
+                  'flex justify-between py-1.5 text-sm ' +
+                  (clickable ? 'cursor-pointer hover:bg-cloud -mx-2 px-2 rounded' : '')
+                }
+                onClick={clickable ? () => onSelect!(r) : undefined}
+                title={clickable ? 'View account activity' : undefined}
+              >
+                <span className="text-ink">
+                  <span className="text-slate font-mono mr-2">{r.account_code}</span>
+                  {r.account_name}
+                </span>
+                <span className="tabular-nums text-ink">{formatMoney(r.balance)}</span>
+              </div>
+            );
+          })}
         </div>
       )}
       <div className="flex justify-between py-1.5 text-sm font-semibold text-deep-navy">

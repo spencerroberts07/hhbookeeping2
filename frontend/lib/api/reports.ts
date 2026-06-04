@@ -255,6 +255,7 @@ export const PLAN_FEATURES: Record<PlanTier, string[]> = {
 
 export interface GLTransaction {
   id: string;
+  journal_batch_id: string;
   posting_date: string;
   description: string;
   reference: string;
@@ -290,6 +291,142 @@ export async function getGeneralLedgerReport(input: {
   if (input.date_to) params.date_to = input.date_to;
   const res = await api.get<GeneralLedgerResponse>(
     '/api/reports/general-ledger',
+    { params },
+  );
+  return res.data;
+}
+
+// --------------------------------------------------------------------------
+// Report drill-down (Slice 1, read-only)
+//
+// Report line -> account GL activity -> full journal entry -> source document.
+// `mode` matches the originating report so the panel reconciles to the line:
+//   'period'      Income Statement — activity inside [period_start, period_end]
+//   'cumulative'  Balance Sheet / Trial Balance — cumulative-to-date w/ cutover
+// --------------------------------------------------------------------------
+
+export type AccountActivityMode = 'period' | 'cumulative';
+
+export interface AccountActivityTxn {
+  id: string;
+  journal_batch_id: string;
+  posting_date: string;
+  description: string;
+  reference: string;
+  debit: number;
+  credit: number;
+  balance: number;
+  source_module: string;
+  batch_status: string;
+  has_document: boolean;
+}
+
+export interface AccountActivityResponse {
+  entity_code: string;
+  account_code: string;
+  account_name: string;
+  mode: AccountActivityMode;
+  period_start: string | null;
+  period_end: string;
+  opening_balance: number;
+  closing_balance: number;
+  transactions: AccountActivityTxn[];
+  transaction_count: number;
+}
+
+export async function getAccountActivity(input: {
+  entity_code: string;
+  account_code: string;
+  mode: AccountActivityMode;
+  period_end: string;
+  period_start?: string | null;
+}): Promise<AccountActivityResponse> {
+  const params: Record<string, string> = {
+    entity_code: input.entity_code,
+    account_code: input.account_code,
+    mode: input.mode,
+    period_end: input.period_end,
+  };
+  if (input.period_start) params.period_start = input.period_start;
+  const res = await api.get<AccountActivityResponse>(
+    '/api/reports/account-activity',
+    { params },
+  );
+  return res.data;
+}
+
+export interface JournalEntryLine {
+  id: string;
+  line_number: number;
+  account_code: string;
+  account_name: string;
+  debit: number;
+  credit: number;
+  memo: string | null;
+  reference: string | null;
+}
+
+export interface JournalEntryResponse {
+  batch: {
+    id: string;
+    source_module: string;
+    batch_label: string;
+    status: string;
+    workflow_status: string;
+    total_debits: number;
+    total_credits: number;
+    balanced: boolean;
+    created_at: string | null;
+    period: {
+      id: string;
+      period_label: string;
+      period_start: string;
+      period_end: string;
+      status: string;
+    };
+  };
+  lines: JournalEntryLine[];
+  has_documents: boolean;
+}
+
+export async function getJournalEntry(input: {
+  entity_code: string;
+  journal_batch_id: string;
+}): Promise<JournalEntryResponse> {
+  const res = await api.get<JournalEntryResponse>(
+    `/api/reports/journal-entry/${input.journal_batch_id}`,
+    { params: { entity_code: input.entity_code } },
+  );
+  return res.data;
+}
+
+export interface JournalEntryDocument {
+  link_id: string;
+  link_type: string;
+  invoice_document_id: string;
+  file_name: string | null;
+  presigned_url: string | null;
+  vendor_name: string | null;
+  invoice_number: string | null;
+  invoice_type: string | null;
+  amount: number | null;
+  source: 'invoice_documents' | 'hh_ap_documents';
+}
+
+export interface JournalEntryDocumentsResponse {
+  journal_batch_id: string;
+  documents: JournalEntryDocument[];
+}
+
+export async function getJournalEntryDocuments(input: {
+  entity_code: string;
+  journal_batch_id: string;
+  journal_line_id?: string;
+}): Promise<JournalEntryDocumentsResponse> {
+  const params: Record<string, string> = { entity_code: input.entity_code };
+  if (input.journal_line_id) params.journal_line_id = input.journal_line_id;
+  const res = await api.get<JournalEntryDocumentsResponse>(
+    `/api/reports/journal-entry/${input.journal_batch_id}/documents`,
     { params },
   );
   return res.data;
