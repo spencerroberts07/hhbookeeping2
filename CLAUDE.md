@@ -114,6 +114,64 @@ The `accounts` table now carries QBO hierarchy fields:
 - `is_sub_account` BOOLEAN.
 - `quickbooks_parent_id` TEXT — raw QBO `ParentRef.value`.
 
+## SCHEMA ADDITIONS (migration 045 — journal corrections)
+
+Supports the report drill-down write path (Slice 2). Additive only:
+
+- `journal_line_change_events` — append-only audit log for every
+  reclassify / edit_amount / add_note / correcting_entry action
+  (`entity_id`, `journal_batch_id`, `journal_line_id`,
+  `accounting_period_id`, `action`, `from_account_code`,
+  `to_account_code`, `before_json`, `after_json`, `reason`,
+  `actor_email`, `created_at`). Mirrors the
+  `journal_batch_workflow_events` domain-event pattern.
+- `journal_batches.correction_of_batch_id` UUID — links a reversal /
+  re-entry batch back to the original it corrects (NULL otherwise).
+
+## REPORT DRILL-DOWN + JOURNAL EDITS
+
+Reports (Income Statement, Balance Sheet, Trial Balance, General
+Ledger, AP/HH AP) drill: line → account GL activity → journal entry
+→ source document, in a right-side slide-over (`frontend/components/
+reports/drill-down/`, mounted by `app/(app)/reports/layout.tsx`).
+
+Read endpoints (`backend/app/routes/reports.py`):
+
+- `GET /api/reports/account-activity` — `mode=period` (IS, windowed)
+  or `mode=cumulative` (BS/TB, cutover-aware via the shared
+  `_cutover_where` helper, also used by `_account_sums`). Returns
+  `journal_batch_id` + `has_document` per line. Panel reconciles to
+  the clicked figure **by magnitude** (report sign conventions
+  differ: BS type-signed, IS `_signed_amount_by_type`, TB raw dr−cr).
+- `GET /api/reports/journal-entry/{id}` — batch header + all lines.
+- `GET /api/reports/journal-entry/{id}/documents` — via
+  `invoice_journal_links` + the HH AP branch
+  (`hh_ap_documents.r2_object_key`); empty list is normal.
+- `GET /api/hh-ap/invoices` + `/{id}/drill` — HH AP invoice list
+  (same `match_status <> 'matched'` filter as `/summary`, so rows
+  tie to the aging buckets) and the per-invoice drill resolver.
+  `invoice_journal_links` is currently EMPTY for Bridlewood, so HH AP
+  invoices drill to the document (PDF), not an entry — forward-
+  compatible via the `has_batch` flag.
+
+Write endpoints (`backend/app/routes/journal_edits.py`,
+`/api/journal-edits/*`, **admin-only, admin direct-post**):
+
+- `reclassify` / `edit-amount` — in-place UPDATE, OPEN periods only.
+- **Locked periods (`approved_to_close` / `closed_locked`) are
+  HARD-BLOCKED from any in-place write** (409 → route to `/correct`).
+- `correct` — full **REVERSAL + corrected RE-ENTRY** (two `'posted'`
+  batches, `source_module='correction'`) into the **current open
+  period**; never mutates the original; both carry
+  `correction_of_batch_id`. Refuses to post into a locked period.
+- `edit-amount` (in-place AND in `/correct`) supports **only genuine
+  2-line entries** — the counter line is mirrored to keep balance;
+  >2 lines → 409 (never guess the offset line).
+- reclassify validates the target account is active (409 if not).
+- Balance guard raises → `db_session` rolls back (commits only on
+  clean return), so nothing unbalanced ever commits. Every action
+  writes a `journal_line_change_events` row.
+
 ## GL IMPORT PARSER
 
 Parser priority order in `parse_gl_file()`:
