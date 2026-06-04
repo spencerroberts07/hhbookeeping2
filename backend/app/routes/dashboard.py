@@ -10,6 +10,7 @@ from ..schemas import DashboardResponse
 from ..services import get_entity_by_code
 from ..services_auth import require_role
 from ..services_period_close import LOCKED_STATUSES
+from .reports import _account_type, _find_opening_balance_cutover
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -534,16 +535,27 @@ def _same_day_prior_year(d: DateType) -> DateType:
         return d.replace(year=d.year - 1, day=28)
 
 
+# Period statuses that mean the month's P&L is final (matches the income
+# statement's recognized-closed set). Months not in this set are "not yet
+# closed" — their GL totals are incomplete and must not be plotted as $0.
+_CLOSED_PERIOD_STATUSES = ("closed_locked", "approved_to_close")
+
+
 def _monthly_sales_map(session, entity_id: str, months_back: int) -> dict[tuple[int, int], dict]:
-    """{(year, month): {period_end, period_label, sales, cogs}} from the GL."""
+    """{(year, month): {period_end, period_label, status, closed, sales, cogs,
+    opex, other_income}} from the GL."""
     rows = session.execute(
         text(
             """
-            SELECT ap.period_end, ap.period_label,
+            SELECT ap.period_end, ap.period_label, ap.status,
                    COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1)='4'
                                      THEN jl.credit_amount - jl.debit_amount ELSE 0 END),0) AS sales,
                    COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1)='5'
-                                     THEN jl.debit_amount - jl.credit_amount ELSE 0 END),0) AS cogs
+                                     THEN jl.debit_amount - jl.credit_amount ELSE 0 END),0) AS cogs,
+                   COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1)='6'
+                                     THEN jl.debit_amount - jl.credit_amount ELSE 0 END),0) AS opex,
+                   COALESCE(SUM(CASE WHEN LEFT(jl.account_code,1) IN ('7','8','9')
+                                     THEN jl.credit_amount - jl.debit_amount ELSE 0 END),0) AS other_income
               FROM accounting_periods ap
               LEFT JOIN journal_batches jb
                 ON jb.accounting_period_id = ap.id AND jb.status IN :statuses
@@ -551,7 +563,7 @@ def _monthly_sales_map(session, entity_id: str, months_back: int) -> dict[tuple[
              WHERE ap.entity_id = :eid
                AND ap.period_end <= CURRENT_DATE
                AND ap.period_end > (CURRENT_DATE - make_interval(months => :months))
-             GROUP BY ap.period_end, ap.period_label
+             GROUP BY ap.period_end, ap.period_label, ap.status
              ORDER BY ap.period_end ASC
             """
         ).bindparams(bindparam("statuses", expanding=True)),
@@ -563,8 +575,12 @@ def _monthly_sales_map(session, entity_id: str, months_back: int) -> dict[tuple[
         out[(pe.year, pe.month)] = {
             "period_end": pe.isoformat(),
             "period_label": r["period_label"],
+            "status": r["status"],
+            "closed": r["status"] in _CLOSED_PERIOD_STATUSES,
             "sales": float(r["sales"] or 0),
             "cogs": float(r["cogs"] or 0),
+            "opex": float(r["opex"] or 0),
+            "other_income": float(r["other_income"] or 0),
         }
     return out
 
@@ -600,6 +616,7 @@ def sales_monthly(
         series.append({
             "period_end": cur["period_end"],
             "period_label": cur["period_label"],
+            "closed": cur["closed"],
             "sales": sales,
             "cogs": cogs,
             "margin_pct": round((sales - cogs) / sales * 100, 1) if sales else 0.0,
@@ -753,3 +770,147 @@ def sales_mtd(
         "py_mtd_sales": round(pyv, 2),
         "yoy_growth_pct": _pct_growth(cur, pyv),
     }
+
+
+# --------------------------------------------------------------------------
+# Metric drill-downs (Phase 2B) — cash, inventory, AR balance trends + margin
+# trend. All GL-net and cutover-aware: the per-account balance series
+# reproduces _account_sums' cumulative+cutover logic for a single account, so
+# each point reconciles to the balance sheet as-of that month-end.
+# --------------------------------------------------------------------------
+
+
+def _account_trend_series(session, entity_id, account_code, month_ends):
+    """Cutover-aware cumulative balance for one account at each month-end.
+    Mirrors _account_sums: opening_balance batch + post-cutover activity once
+    the as-of date reaches the cutover; legacy cumulative before it. Signed to
+    the account's natural balance (assets/COGS/opex debit-positive)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT ap.period_end, ap.period_start, jb.source_module,
+                   SUM(jl.debit_amount - jl.credit_amount) AS net
+              FROM journal_lines jl
+              JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+              JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+             WHERE jb.entity_id = :e AND jl.account_code = :code
+               AND jb.status NOT IN ('draft', 'voided', 'rejected')
+             GROUP BY ap.period_end, ap.period_start, jb.source_module
+            """
+        ),
+        {"e": entity_id, "code": account_code},
+    ).mappings().all()
+    movements = [dict(r) for r in rows]
+    cutover = _find_opening_balance_cutover(session, entity_id)
+    t = _account_type(account_code)
+    sign = 1 if t in ("asset", "cogs", "operating_expense") else -1
+
+    def balance_asof(me) -> float:
+        total = Decimal("0")
+        use_cutover = cutover is not None and me >= cutover
+        for m in movements:
+            if m["period_end"] > me:
+                continue
+            if use_cutover:
+                included = (
+                    (m["source_module"] == "opening_balance" and m["period_end"] <= cutover)
+                    or m["period_start"] > cutover
+                )
+            else:
+                included = True
+            if included:
+                total += Decimal(str(m["net"] or 0))
+        return float(total * sign)
+
+    return [balance_asof(me) for me in month_ends]
+
+
+@router.get("/metric/account-trend")
+def account_trend(
+    entity_code: str = Query(...),
+    account_code: str = Query(...),
+    months: int = Query(default=24, ge=1, le=60),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Month-end balance of one account over time, current vs prior year.
+    Cutover-aware (reconciles to the balance sheet). For cash (1020),
+    inventory (1120), AR (1090), etc."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        periods = session.execute(
+            text(
+                """
+                SELECT period_end, period_label FROM accounting_periods
+                 WHERE entity_id = :e AND period_end <= CURRENT_DATE
+              ORDER BY period_end DESC LIMIT :n
+                """
+            ),
+            {"e": entity["id"], "n": months},
+        ).mappings().all()
+        periods = list(reversed(periods))
+        month_ends = [p["period_end"] for p in periods]
+        if not month_ends:
+            return {"entity_code": entity_code, "account_code": account_code,
+                    "source": "gl_net", "series": []}
+        cur = _account_trend_series(session, entity["id"], account_code, month_ends)
+        py_ends = [_same_day_prior_year(me) for me in month_ends]
+        pyv = _account_trend_series(session, entity["id"], account_code, py_ends)
+
+    series = []
+    for i, p in enumerate(periods):
+        series.append({
+            "period_end": p["period_end"].isoformat(),
+            "period_label": p["period_label"],
+            "balance": round(cur[i], 2),
+            "py_balance": round(pyv[i], 2),
+            "yoy_growth_pct": _pct_growth(cur[i], pyv[i]),
+        })
+    return {"entity_code": entity_code, "account_code": account_code,
+            "source": "gl_net", "series": series}
+
+
+@router.get("/metric/margin-trend")
+def margin_trend(
+    entity_code: str = Query(...),
+    months: int = Query(default=24, ge=1, le=60),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Gross / operating / net margin % by month, current vs prior year.
+    Unclosed months are returned null (not 0) so the chart doesn't mislead."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        m = _monthly_sales_map(session, entity["id"], months + 12)
+
+    def margins(c):
+        s = c["sales"]
+        if not s or not c["closed"]:
+            return (None, None, None)
+        gp = s - c["cogs"]
+        op = gp - c["opex"]
+        ni = op + c["other_income"]
+        return (round(gp / s * 100, 1), round(op / s * 100, 1), round(ni / s * 100, 1))
+
+    keys = sorted(m.keys())
+    recent = keys[-months:]
+    series = []
+    for k in recent:
+        cur = m[k]
+        py = m.get((k[0] - 1, k[1]))
+        gm, om, nm = margins(cur)
+        pgm, pom, pnm = margins(py) if py else (None, None, None)
+        series.append({
+            "period_end": cur["period_end"],
+            "period_label": cur["period_label"],
+            "closed": cur["closed"],
+            "gross_margin_pct": gm,
+            "operating_margin_pct": om,
+            "net_margin_pct": nm,
+            "py_gross_margin_pct": pgm,
+            "py_operating_margin_pct": pom,
+            "py_net_margin_pct": pnm,
+        })
+    return {"entity_code": entity_code, "source": "gl_net", "months": months, "series": series}

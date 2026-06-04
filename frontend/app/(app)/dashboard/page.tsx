@@ -273,6 +273,12 @@ export default function DashboardPage() {
                   </Link>
                 </>
               )}
+              <Link
+                href="/dashboard/cash"
+                className="text-xs text-ledger-blue hover:underline mt-3 inline-block"
+              >
+                Cash trend →
+              </Link>
             </CardContent>
           </Card>
 
@@ -338,6 +344,12 @@ export default function DashboardPage() {
                 </p>
               )}
               <GrossMarginSparkline />
+              <Link
+                href="/dashboard/margin"
+                className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
+              >
+                Margin trend →
+              </Link>
             </CardContent>
           </Card>
 

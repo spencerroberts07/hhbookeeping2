@@ -27,6 +27,7 @@ import {
   getSalesDaily,
   getSalesMtd,
 } from '@/lib/api/dashboard';
+import { AnalyticsNav } from '../_components/analytics-nav';
 
 function SourcePill({ source }: { source: 'gl_net' | 'pos_gross' }) {
   const isGl = source === 'gl_net';
@@ -89,13 +90,19 @@ export default function SalesAnalyticsPage() {
     queryFn: () => getSalesDaily(entityCode!, days),
   });
 
+  // Unclosed months have incomplete GL totals — render them as gaps (null),
+  // not $0 bars, so the chart doesn't look broken. Prior-year bars still show.
   const monthlyData = (monthly.data?.series ?? []).map((p) => ({
     label: formatMonthLabel(parseLocalDate(p.period_end)),
-    sales: p.sales,
+    sales: p.closed ? p.sales : null,
     py_sales: p.py_sales,
-    margin_pct: p.margin_pct,
+    margin_pct: p.closed ? p.margin_pct : null,
   }));
-  const latest = monthly.data?.series.at(-1);
+  const unclosed = (monthly.data?.series ?? [])
+    .filter((p) => !p.closed)
+    .map((p) => formatMonthLabel(parseLocalDate(p.period_end)));
+  // Latest CLOSED month drives the headline YoY/MoM (unclosed = incomplete).
+  const latest = [...(monthly.data?.series ?? [])].reverse().find((p) => p.closed);
 
   const rollingData = (rolling.data?.series ?? []).map((p) => ({
     label: formatMonthLabel(parseLocalDate(p.period_end)),
@@ -116,6 +123,7 @@ export default function SalesAnalyticsPage() {
         <Link href="/dashboard" className="inline-flex items-center gap-1.5 text-sm text-ledger-blue hover:underline">
           <ArrowLeft className="h-4 w-4" /> Back to dashboard
         </Link>
+        <AnalyticsNav />
 
         {/* MTD — POS gross, same source as the dashboard Sales card */}
         <Card>
@@ -182,9 +190,14 @@ export default function SalesAnalyticsPage() {
                   <Legend wrapperStyle={{ fontSize: 12 }} />
                   <Bar yAxisId="left" dataKey="sales" name="This year" fill={THIS_YR} radius={[6, 6, 0, 0]} />
                   <Bar yAxisId="left" dataKey="py_sales" name="Last year" fill={LAST_YR} radius={[6, 6, 0, 0]} />
-                  <Line yAxisId="right" type="monotone" dataKey="margin_pct" name="Margin %" stroke={ACCENT} strokeWidth={2} dot={false} />
+                  <Line yAxisId="right" type="monotone" dataKey="margin_pct" name="Margin %" stroke={ACCENT} strokeWidth={2} dot={false} connectNulls={false} />
                 </ComposedChart>
               </ResponsiveContainer>
+            )}
+            {unclosed.length > 0 && (
+              <p className="mt-2 text-xs text-slate">
+                Not yet closed (excluded from the GL line): {unclosed.join(', ')}. Use POS daily/MTD above for current-month sales.
+              </p>
             )}
           </CardContent>
         </Card>

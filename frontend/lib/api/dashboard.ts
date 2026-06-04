@@ -146,6 +146,9 @@ export type SalesSource = 'gl_net' | 'pos_gross';
 export interface SalesMonthlyPoint {
   period_end: string;
   period_label: string;
+  /** False when the accounting period isn't closed yet — GL totals are
+   *  incomplete; the UI renders these as gaps, not $0. */
+  closed: boolean;
   sales: number;
   cogs: number;
   margin_pct: number;
@@ -237,6 +240,63 @@ export interface SalesMtdResponse {
 export async function getSalesMtd(entityCode: string): Promise<SalesMtdResponse> {
   const res = await api.get<SalesMtdResponse>('/api/dashboard/sales/mtd', {
     params: { entity_code: entityCode },
+  });
+  return res.data;
+}
+
+// --- 2B: metric trends (cash / inventory / AR balance, margin) ---
+
+export interface AccountTrendPoint {
+  period_end: string;
+  period_label: string;
+  balance: number;
+  py_balance: number;
+  yoy_growth_pct: number | null;
+}
+
+export interface AccountTrendResponse {
+  entity_code: string;
+  account_code: string;
+  source: SalesSource;
+  series: AccountTrendPoint[];
+}
+
+export async function getAccountTrend(
+  entityCode: string,
+  accountCode: string,
+  months = 24,
+): Promise<AccountTrendResponse> {
+  const res = await api.get<AccountTrendResponse>('/api/dashboard/metric/account-trend', {
+    params: { entity_code: entityCode, account_code: accountCode, months },
+  });
+  return res.data;
+}
+
+export interface MarginTrendPoint {
+  period_end: string;
+  period_label: string;
+  closed: boolean;
+  gross_margin_pct: number | null;
+  operating_margin_pct: number | null;
+  net_margin_pct: number | null;
+  py_gross_margin_pct: number | null;
+  py_operating_margin_pct: number | null;
+  py_net_margin_pct: number | null;
+}
+
+export interface MarginTrendResponse {
+  entity_code: string;
+  source: SalesSource;
+  months: number;
+  series: MarginTrendPoint[];
+}
+
+export async function getMarginTrend(
+  entityCode: string,
+  months = 24,
+): Promise<MarginTrendResponse> {
+  const res = await api.get<MarginTrendResponse>('/api/dashboard/metric/margin-trend', {
+    params: { entity_code: entityCode, months },
   });
   return res.data;
 }
