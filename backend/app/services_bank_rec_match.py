@@ -35,6 +35,11 @@ def _D(v) -> Decimal:
     return Decimal(str(v or 0))
 
 
+def _is_payroll_desc(desc: str | None) -> bool:
+    d = (desc or "").lower()
+    return "enet" in d or "payroll" in d or "e net" in d
+
+
 def _load_bank(session, entity_id, account_code, period_start, period_end) -> list[dict]:
     rows = session.execute(
         text(
@@ -53,6 +58,11 @@ def _load_bank(session, entity_id, account_code, period_start, period_end) -> li
 
 
 def _load_book(session, entity_id, account_code, period_start, period_end) -> list[dict]:
+    # Candidate window is widened ~1 month each side: book and bank routinely
+    # straddle the period boundary (payroll booked in the prior month clears the
+    # bank early next month, and vice versa). The bank side stays scoped to the
+    # statement period; only the book CANDIDATES widen so cross-boundary items
+    # can match instead of being mis-flagged as outstanding/bank-only.
     rows = session.execute(
         text(
             f"""
@@ -60,13 +70,15 @@ def _load_book(session, entity_id, account_code, period_start, period_end) -> li
                    (jl.debit_amount - jl.credit_amount) AS signed_amount,
                    jl.memo, jl.source_json,
                    (jl.source_json->>'bank_transaction_id') AS linked_bank_txn_id,
-                   ap.period_end AS period_end
+                   ap.period_end AS period_end,
+                   (ap.period_start >= :ps AND ap.period_end <= :pe) AS in_period
               FROM journal_lines jl
               JOIN journal_batches jb ON jb.id = jl.journal_batch_id
               JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
              WHERE jb.entity_id = :e AND jl.account_code = :ac
                AND jb.status NOT IN {_POSTED}
-               AND ap.period_start >= :ps AND ap.period_end <= :pe
+               AND ap.period_end >= (CAST(:ps AS date) - INTERVAL '31 days')
+               AND ap.period_start <= (CAST(:pe AS date) + INTERVAL '31 days')
             """
         ),
         {"e": entity_id, "ac": account_code, "ps": period_start, "pe": period_end},
@@ -140,7 +152,8 @@ def run_match(session, *, entity_id: str, source_account_code: str,
             continue
         if bid not in matched_bank:
             links.append({"bank_id": bid, "book_id": str(ln["id"]), "match_type": "direct_link",
-                          "confidence": 100, "group_id": None, "amount": float(bank_by_id[bid]["amount"])})
+                          "confidence": 100, "group_id": None, "status": "cleared",
+                          "amount": float(bank_by_id[bid]["amount"])})
             matched_bank.add(bid)
             matched_book.add(str(ln["id"]))
 
@@ -149,6 +162,39 @@ def run_match(session, *, entity_id: str, source_account_code: str,
         if bid and bid in bank_by_id:
             return bank_by_id[bid]["transaction_date"], False
         return ln["period_end"], True  # month-bucketed
+
+    # ---- Tier 0.5: payroll gross-vs-net (eNet bank draw <-> book net-pay) ----
+    # The bank draw is GROSS (net pay + source deductions); the book credits
+    # 1020 only the NET pay (EI/CPP/tax accrue to 2320). Pair them; the residual
+    # (gross - net) is the deduction drawn from the bank but never credited to
+    # 1020 -> a 3D CRA-remittance candidate (Dr 2320 / Cr 1020).
+    payroll_residual = Decimal("0")
+    bank_pay = sorted(
+        [b for b in bank if str(b["id"]) not in matched_bank
+         and _D(b["amount"]) < 0 and _is_payroll_desc(b["description"])],
+        key=lambda b: b["transaction_date"],
+    )
+    book_pay = [ln for ln in book if str(ln["id"]) not in matched_book
+                and ln["source_module"] == "payroll" and _D(ln["signed_amount"]) < 0]
+    for b in bank_pay:
+        gross = -_D(b["amount"])
+        cand = None
+        for ln in book_pay:
+            if str(ln["id"]) in matched_book:
+                continue
+            net = -_D(ln["signed_amount"])
+            if net <= gross and (gross - net) <= net * Decimal("0.4"):
+                if cand is None or net > -_D(cand["signed_amount"]):
+                    cand = ln
+        if cand is not None:
+            net = -_D(cand["signed_amount"])
+            residual = gross - net
+            payroll_residual += residual
+            links.append({"bank_id": str(b["id"]), "book_id": str(cand["id"]),
+                          "match_type": "payroll_gross_net", "confidence": 75, "group_id": None,
+                          "status": "suggested", "amount": float(-net), "residual": float(residual)})
+            matched_bank.add(str(b["id"]))
+            matched_book.add(str(cand["id"]))
 
     # ---- Tier 1: exact amount + same direction + date window ----
     book_un = [ln for ln in book if str(ln["id"]) not in matched_book]
@@ -173,30 +219,63 @@ def run_match(session, *, entity_id: str, source_account_code: str,
         if best and best[0] >= _AUTO_CLEAR:
             conf, ln = best
             links.append({"bank_id": str(b["id"]), "book_id": str(ln["id"]), "match_type": "exact",
-                          "confidence": conf, "group_id": None, "amount": float(amt)})
+                          "confidence": conf, "group_id": None, "status": "cleared", "amount": float(amt)})
             matched_bank.add(str(b["id"]))
             matched_book.add(str(ln["id"]))
 
-    # ---- Tier 2: one-to-many aggregate (book lump <-> set of bank deposits) ----
-    for ln in book:
-        if str(ln["id"]) in matched_book:
+    # ---- Tier 1b: contra / reclass pairs (same magnitude, OPPOSITE sign) ----
+    # A bank movement offset by a book reclassification of the same amount (e.g.
+    # a rebate netted against an AP payment). They offset on 1020, so they are
+    # NOT genuine bank-only / outstanding — pair them (flagged for review).
+    book_un = [ln for ln in book if str(ln["id"]) not in matched_book]
+    for b in bank:
+        if str(b["id"]) in matched_bank:
             continue
-        target = _D(ln["signed_amount"])
-        if abs(target) < Decimal("1"):
+        amt = _D(b["amount"])
+        if abs(amt) <= _CENT:
             continue
-        pool = [b for b in bank if str(b["id"]) not in matched_bank
-                and (_D(b["amount"]) >= 0) == (target >= 0)]
-        if len(pool) < 2:
-            continue
-        subset = _greedy_subset(pool, target)
-        if subset and len(subset) >= 2:
-            gid = str(uuid.uuid4())
-            for b in subset:
-                links.append({"bank_id": str(b["id"]), "book_id": str(ln["id"]),
-                              "match_type": "aggregate_group", "confidence": 78,
-                              "group_id": gid, "amount": float(b["amount"])})
+        for ln in book_un:
+            if str(ln["id"]) in matched_book:
+                continue
+            sa = _D(ln["signed_amount"])
+            if abs(sa - (-amt)) <= _CENT:  # equal magnitude, opposite sign
+                links.append({"bank_id": str(b["id"]), "book_id": str(ln["id"]), "match_type": "contra",
+                              "confidence": 70, "group_id": None, "status": "suggested", "amount": float(amt)})
                 matched_bank.add(str(b["id"]))
+                matched_book.add(str(ln["id"]))
+                break
+
+    # ---- Tier 2: deposit-stream BULK reconciliation (not subset-sum) ----
+    # The cash_balancing deposit lump (book) reconciles in bulk to the whole
+    # unmatched daily bank deposit stream. We clear the stream as a block and
+    # surface the residual (Σ lump - Σ stream = deposits in transit / timing)
+    # rather than classifying in-lump deposits as bank-only (which double-counts).
+    stream_summary: dict[str, Any] | None = None
+    # All cash_balancing 1020 lines for the period (net of the small over/short
+    # credit) form the deposit lump.
+    lump_lines = [ln for ln in book if str(ln["id"]) not in matched_book
+                  and ln["source_module"] == "cash_balancing"]
+    stream_bank = [b for b in bank if str(b["id"]) not in matched_bank and _D(b["amount"]) > 0]
+    if lump_lines and stream_bank and sum((_D(ln["signed_amount"]) for ln in lump_lines), Decimal("0")) > 0:
+        lump_total = sum((_D(ln["signed_amount"]) for ln in lump_lines), Decimal("0"))
+        stream_total = sum((_D(b["amount"]) for b in stream_bank), Decimal("0"))
+        residual = lump_total - stream_total
+        within = abs(residual) <= max(Decimal("2000"), lump_total * Decimal("0.10"))
+        gid = str(uuid.uuid4())
+        anchor = str(lump_lines[0]["id"])
+        status = "cleared" if within else "suggested"
+        for b in stream_bank:
+            links.append({"bank_id": str(b["id"]), "book_id": anchor, "match_type": "deposit_stream",
+                          "confidence": 80 if within else 55, "group_id": gid, "status": status,
+                          "amount": float(b["amount"])})
+            matched_bank.add(str(b["id"]))
+        for ln in lump_lines:
             matched_book.add(str(ln["id"]))
+        stream_summary = {
+            "group_id": gid, "bank_count": len(stream_bank),
+            "bank_total": float(stream_total), "lump_total": float(lump_total),
+            "residual_deposits_in_transit": float(residual), "within_tolerance": within,
+        }
 
     # ---- Tier 3: fuzzy (amount within tolerance + date + description overlap) ----
     book_un = [ln for ln in book if str(ln["id"]) not in matched_book]
@@ -226,19 +305,20 @@ def run_match(session, *, entity_id: str, source_account_code: str,
         if best and 30 <= best[0] < _AUTO_CLEAR:
             score, ln = best
             links.append({"bank_id": str(b["id"]), "book_id": str(ln["id"]), "match_type": "fuzzy",
-                          "confidence": score, "group_id": None, "amount": float(amt)})
+                          "confidence": score, "group_id": None, "status": "suggested", "amount": float(amt)})
             # fuzzy is a suggestion: mark book consumed for this pass but not auto-clear
             matched_book.add(str(ln["id"]))
 
     _persist(session, entity_id, bank, links)
 
-    auto = [l for l in links if l["match_type"] in ("direct_link", "exact")]
+    cleared = [l for l in links if l["status"] == "cleared"]
     return {
         "bank_count": len(bank), "book_count": len(book),
         "pre_cleared": len(pre_matched),
-        "auto_cleared": len(auto),
-        "aggregate_groups": len({l["group_id"] for l in links if l["group_id"]}),
-        "suggested": len([l for l in links if l["match_type"] in ("aggregate_group", "fuzzy")]),
+        "auto_cleared": len([l for l in cleared if l["match_type"] in ("direct_link", "exact")]),
+        "deposit_stream": stream_summary,
+        "payroll_deduction_residual": float(payroll_residual),
+        "suggested": len([l for l in links if l["status"] == "suggested"]),
         "unmatched_bank": [str(b["id"]) for b in bank if str(b["id"]) not in matched_bank],
         "unmatched_book": [str(ln["id"]) for ln in book if str(ln["id"]) not in matched_book],
         "links": links,
@@ -257,10 +337,9 @@ def _persist(session, entity_id, bank, links) -> None:
             ),
             {"e": entity_id, "ids": bank_ids},
         )
-    auto_clear_types = {"direct_link", "exact"}
     cleared_bank: set[str] = set()
     for l in links:
-        status = "cleared" if l["match_type"] in auto_clear_types else "suggested"
+        status = l["status"]
         session.execute(
             text(
                 """
@@ -281,7 +360,7 @@ def _persist(session, entity_id, bank, links) -> None:
                 "gid": l["group_id"], "pj": json.dumps({"confidence": l["confidence"]}),
             },
         )
-        if l["match_type"] in auto_clear_types:
+        if status == "cleared":
             cleared_bank.add(l["bank_id"])
     # update review_status for auto-cleared bank txns + audit event
     for bid in cleared_bank:

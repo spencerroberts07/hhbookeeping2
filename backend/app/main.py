@@ -13,6 +13,7 @@ from .routes.bank_auto_journal import router as bank_auto_journal_router
 from .routes.bank_csv import router as bank_csv_router
 from .routes.bank_pdf import router as bank_pdf_router
 from .routes.bank_import import router as bank_import_router
+from .routes.bank_rec import router as bank_rec_router
 from .routes.billing import router as billing_router, webhook_router as stripe_webhook_router
 from .routes.card_settlement import router as card_settlement_router
 from .routes.cash_balancing import router as cash_balancing_router
@@ -126,6 +127,7 @@ app.include_router(pos_import_router)
 app.include_router(gl_import_router)
 app.include_router(bank_pdf_router)
 app.include_router(bank_import_router)
+app.include_router(bank_rec_router)
 app.include_router(depreciation_router)
 app.include_router(accruals_router)
 app.include_router(bank_auto_journal_router)

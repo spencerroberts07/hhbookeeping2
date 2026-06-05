@@ -674,6 +674,82 @@ def _section_bank_review(
 
 
 # ----------------------------------------------------------------------
+# Section: bank reconciliation (Phase 3C) — a locked, tied rec on the
+# cash account is required to close. Draft/untied is a warning.
+# ----------------------------------------------------------------------
+
+
+def _section_bank_reconciliation(
+    session,
+    entity_id: UUID,
+    accounting_period_id: UUID,
+) -> dict[str, Any]:
+    if not _has_table(session, "bank_reconciliations"):
+        return {"status": "no_data", "module_present": False, "summary": "no bank_reconciliations table"}
+
+    rows = session.execute(
+        text(
+            """
+            SELECT source_account_code, status, ties, variance, statement_date,
+                   statement_closing_balance, locked_at
+              FROM bank_reconciliations
+             WHERE entity_id = :e AND accounting_period_id = :pid
+          ORDER BY source_account_code
+            """
+        ),
+        {"e": entity_id, "pid": accounting_period_id},
+    ).mappings().all()
+
+    recs = [
+        {
+            "source_account_code": r["source_account_code"],
+            "status": r["status"],
+            "ties": r["ties"],
+            "variance": _money_float(r["variance"]),
+            "statement_date": _iso(r["statement_date"]),
+            "statement_closing_balance": _money_float(r["statement_closing_balance"]),
+            "locked_at": _iso(r["locked_at"]),
+        }
+        for r in rows
+    ]
+
+    if not recs:
+        return {
+            "status": "blocked",
+            "module_present": True,
+            "summary": "No bank reconciliation for this period — reconcile the cash account before close",
+            "reconciliations": [],
+        }
+
+    locked_tied = [r for r in recs if r["status"] == "locked" and r["ties"]]
+    untied = [r for r in recs if not r["ties"]]
+    draft = [r for r in recs if r["status"] != "locked"]
+
+    if untied:
+        status = "blocked"
+        summary = (
+            f"{len(untied)} reconciliation(s) do not tie "
+            f"(account {', '.join(r['source_account_code'] for r in untied)})"
+        )
+    elif draft:
+        status = "needs_review"
+        summary = (
+            f"{len(draft)} tied reconciliation(s) still in draft — lock before close "
+            f"(account {', '.join(r['source_account_code'] for r in draft)})"
+        )
+    else:
+        status = "ready"
+        summary = f"{len(locked_tied)} reconciliation(s) locked and tied"
+
+    return {
+        "status": status,
+        "module_present": True,
+        "summary": summary,
+        "reconciliations": recs,
+    }
+
+
+# ----------------------------------------------------------------------
 # Section: bank data sources (QBO sync + CSV imports)
 # ----------------------------------------------------------------------
 
@@ -1197,6 +1273,9 @@ def get_month_end_close_status(
         ),
         "bank_review": _section_bank_review(
             session, entity["id"], period_start, period_end_date
+        ),
+        "bank_reconciliation": _section_bank_reconciliation(
+            session, entity["id"], accounting_period_id
         ),
         "bank_data_sources": _section_bank_data_sources(
             session, entity["id"], period_start, period_end_date

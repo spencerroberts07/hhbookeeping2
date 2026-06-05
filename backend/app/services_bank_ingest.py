@@ -109,7 +109,7 @@ def ingest(
                 "stid": stid, "stt": t.signed_direction(), "td": t.transaction_date,
                 "desc": t.description, "ref": t.reference_number, "amt": t.amount,
                 "dir": t.signed_direction(), "ndesc": t.normalized_description,
-                "cp": t.counterparty_name, "raw": json.dumps(raw), "run": source_import_run_id,
+                "cp": t.counterparty_name, "raw": json.dumps(raw, default=str), "run": source_import_run_id,
             },
         )
         if res.rowcount:

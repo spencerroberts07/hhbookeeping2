@@ -29,6 +29,7 @@ import { useUploadDefaults } from '@/lib/hooks/use-upload-defaults';
 import { CashBalancingDailyTab } from './_components/cash-balancing-tab';
 import { CashBalancingJournalTab } from './_components/cash-balancing-journal';
 import { CashBalancingSyncTab } from './_components/cash-balancing-sync';
+import { ReconciliationTab } from './_components/reconciliation-tab';
 
 const MATCH_LABEL: Record<BankMatchState, string> = {
   matched: 'Matched',
@@ -51,6 +52,7 @@ export default function BankPage() {
         <Tabs defaultValue="statements">
           <TabsList>
             <TabsTrigger value="statements">Statements</TabsTrigger>
+            <TabsTrigger value="reconciliation">Reconciliation</TabsTrigger>
             <TabsTrigger value="cash-daily">Cash balancing — Daily</TabsTrigger>
             <TabsTrigger value="cash-journal">Cash balancing — Month-end journal</TabsTrigger>
             <TabsTrigger value="cash-sync">Sync history</TabsTrigger>
@@ -58,6 +60,9 @@ export default function BankPage() {
 
           <TabsContent value="statements">
             <StatementsTab />
+          </TabsContent>
+          <TabsContent value="reconciliation">
+            <ReconciliationTab />
           </TabsContent>
           <TabsContent value="cash-daily">
             <CashBalancingDailyTab />
