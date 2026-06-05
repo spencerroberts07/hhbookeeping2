@@ -12,6 +12,8 @@ name heuristics, with admin override.
 """
 from __future__ import annotations
 
+import ast
+import operator
 from datetime import date as DateType
 from decimal import Decimal
 from typing import Any
@@ -47,17 +49,33 @@ SEEDABLE_ROLE_RULES: dict[str, str] = {
         "a.account_type IN ('Expense','Other Expense') "
         "AND a.account_name ILIKE '%income tax%'"
     ),
+    "rent_expense": (
+        "a.account_type IN ('Expense','Other Expense') "
+        "AND a.account_name ILIKE '%rent%'"
+    ),
+    "percentage_rent_accrual": "a.account_name ILIKE '%accrued rent%'",
 }
 
 ALL_ROLES = list(SEEDABLE_ROLE_RULES.keys()) + ["current_portion_ltd"]
 
 
-def seed_account_roles(session, entity_id: str) -> dict[str, int]:
-    """Insert auto-classified role rows for an entity. Idempotent and
-    non-destructive: ON CONFLICT DO NOTHING preserves any admin edits.
-    Returns {role: rows_inserted}."""
+def seed_account_roles(session, entity_id: str, *, force: bool = False) -> dict[str, int]:
+    """Auto-classify account roles for an entity. INITIAL-ONLY by default:
+    if the entity already has any role rows, this is a no-op so admin edits
+    (e.g. removing 2510/2520/2525 from debt) are never resurrected. Pass
+    force=True to seed only roles that have no rows yet (e.g. newly-added
+    roles) without touching existing ones."""
+    existing = session.execute(
+        text("SELECT DISTINCT role FROM ratio_account_roles WHERE entity_id = :e"),
+        {"e": entity_id},
+    ).scalars().all()
+    if existing and not force:
+        return {}
+    skip = set(existing) if force else set()
     inserted: dict[str, int] = {}
     for role, rule in SEEDABLE_ROLE_RULES.items():
+        if role in skip:
+            continue
         res = session.execute(
             text(
                 f"""
@@ -335,6 +353,69 @@ def resolve_annual_debt_service(session, entity_id, period_end: DateType) -> tup
     return breakdown["annual_debt_service"], "gl_derived", breakdown
 
 
+def _ttm_window(period_end: DateType):
+    from datetime import timedelta
+    try:
+        start = period_end.replace(year=period_end.year - 1)
+    except ValueError:
+        start = period_end.replace(year=period_end.year - 1, day=28)
+    return start + timedelta(days=1), period_end
+
+
+def derive_fixed_charges(session, entity_id, period_end: DateType,
+                         roles: dict[str, list[str]] | None = None) -> dict[str, float]:
+    """Trailing-12 annual rent for fixed-charge coverage: rent expense
+    (rent_expense role, debit-natural) + the percentage-rent accrual
+    (percentage_rent_accrual role, credit-natural increase). Posted +
+    historical_import basis."""
+    roles = roles or get_account_roles(session, entity_id)
+    start, end = _ttm_window(period_end)
+    rent_codes = roles.get("rent_expense", [])
+    accrual_codes = roles.get("percentage_rent_accrual", [])
+
+    def _sum(codes, signed_expr):
+        if not codes:
+            return Decimal("0")
+        row = session.execute(
+            text(
+                f"""
+                SELECT COALESCE(SUM({signed_expr}), 0) AS v
+                  FROM journal_lines jl
+                  JOIN journal_batches jb ON jb.id = jl.journal_batch_id
+                  JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+                 WHERE jb.entity_id = :e AND jb.status = ANY(:statuses)
+                   AND jl.account_code = ANY(:codes)
+                   AND ap.period_end >= :start AND ap.period_end <= :end
+                """
+            ),
+            {"e": entity_id, "statuses": list(_PNL_STATUSES), "codes": codes,
+             "start": start, "end": end},
+        ).mappings().first()
+        return _D((row or {}).get("v"))
+
+    rent_expense = _sum(rent_codes, "jl.debit_amount - jl.credit_amount")
+    pct_rent_accrual = _sum(accrual_codes, "jl.credit_amount - jl.debit_amount")
+    annual_rent = rent_expense + pct_rent_accrual
+    return {
+        "ttm_start": start.isoformat(), "ttm_end": end.isoformat(),
+        "rent_expense": float(rent_expense),
+        "percentage_rent_accrual": float(pct_rent_accrual),
+        "annual_rent": float(annual_rent),
+    }
+
+
+def resolve_fixed_charges(session, entity_id, period_end: DateType,
+                          roles: dict | None = None) -> tuple[float, str, dict]:
+    breakdown = derive_fixed_charges(session, entity_id, period_end, roles)
+    override = session.execute(
+        text("SELECT value FROM entity_ratio_inputs WHERE entity_id=:e AND key='fixed_charges'"),
+        {"e": entity_id},
+    ).scalar()
+    if override is not None:
+        return float(override), "override", breakdown
+    return breakdown["annual_rent"], "gl_derived", breakdown
+
+
 def build_financials_context(
     session, *, entity_id: str, period_start: DateType, period_end: DateType,
     roles: dict[str, list[str]] | None = None,
@@ -385,7 +466,8 @@ RATIO_META: dict[str, dict[str, str]] = {
     "interest_coverage": {"label": "Interest coverage (TTM)", "category": "Leverage", "format": "ratio"},
     "dscr": {"label": "DSCR (TTM)", "category": "Leverage", "format": "ratio"},
     "dscr_excl_dgip": {"label": "DSCR (TTM, excl DGIP)", "category": "Leverage", "format": "ratio"},
-    "fixed_charge_coverage": {"label": "Fixed charge coverage", "category": "Leverage", "format": "ratio"},
+    "fixed_charge_coverage": {"label": "Fixed charge coverage (TTM)", "category": "Leverage", "format": "ratio"},
+    "fixed_charge_coverage_excl_dgip": {"label": "Fixed charge coverage (TTM, excl DGIP)", "category": "Leverage", "format": "ratio"},
     # profitability
     "gross_margin_pct": {"label": "Gross margin", "category": "Profitability", "format": "percent"},
     "operating_margin_pct": {"label": "Operating margin", "category": "Profitability", "format": "percent"},
@@ -432,7 +514,14 @@ def compute_builtin_ratios(c: dict[str, Any], inputs: dict[str, float] | None = 
     out["interest_coverage"] = _div(c["ttm_ebit"], c["ttm_interest_expense"])
     out["dscr"] = _div(c["ttm_ebitda"], ads)
     out["dscr_excl_dgip"] = _div(c["ttm_ebitda_excl_dgip"], ads)
-    out["fixed_charge_coverage"] = None  # needs a lease/rent input — not yet mapped
+    # FCCR = EBITDAR / (debt service + rent) = (EBITDA + rent) / (ADS + rent)
+    rent = inputs.get("fixed_charges")
+    if rent is not None and ads is not None:
+        out["fixed_charge_coverage"] = _div(c["ttm_ebitda"] + rent, ads + rent)
+        out["fixed_charge_coverage_excl_dgip"] = _div(c["ttm_ebitda_excl_dgip"] + rent, ads + rent)
+    else:
+        out["fixed_charge_coverage"] = None
+        out["fixed_charge_coverage_excl_dgip"] = None
     # profitability — TTM basis, the same window as EBITDA (one coherent basis)
     out["gross_margin_pct"] = _pct(_div(c["ttm_gross_profit"], c["ttm_revenue"]))
     out["operating_margin_pct"] = _pct(_div(c["ttm_gross_profit"] - c["ttm_opex"], c["ttm_revenue"]))
@@ -461,3 +550,127 @@ def _pct(v):
 
 def _mul(v, k):
     return None if v is None else v * k
+
+
+# --------------------------------------------------------------------------
+# Custom formula builder — SAFE ast evaluator (no eval, no builtins). Only
+# numeric literals, + - * /, unary minus, parentheses, and whitelisted tokens
+# resolved from the financials context / account balances.
+# --------------------------------------------------------------------------
+
+_ALLOWED_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul}
+
+
+def safe_eval(expr: str, namespace: dict[str, float]) -> float | None:
+    if not expr or not expr.strip():
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"invalid expression: {exc.msg}")
+    return _eval_node(tree.body, namespace)
+
+
+def _eval_node(node, ns):
+    if isinstance(node, ast.BinOp) and type(node.op) in (*_ALLOWED_BINOPS, ast.Div):
+        left, right = _eval_node(node.left, ns), _eval_node(node.right, ns)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Div):
+            return None if right == 0 else left / right
+        return _ALLOWED_BINOPS[type(node.op)](left, right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _eval_node(node.operand, ns)
+        if v is None:
+            return None
+        return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        if node.id not in ns:
+            raise ValueError(f"unknown token: {node.id}")
+        return ns[node.id]
+    raise ValueError("expression contains a disallowed element")
+
+
+# Friendly token -> financials-context key. Tokens reference computed totals;
+# accounts are referenced as acct_<code>; debt-service / rent as named tokens.
+_TOKEN_MAP = {
+    "revenue": "revenue", "cogs": "cogs", "gross_profit": "gross_profit",
+    "opex": "opex", "net_income": "net_income", "other_income": "other_income",
+    "ebitda": "ttm_ebitda", "ebitda_excl_dgip": "ttm_ebitda_excl_dgip", "ebit": "ttm_ebit",
+    "interest_expense": "ttm_interest_expense",
+    "ttm_revenue": "ttm_revenue", "ttm_cogs": "ttm_cogs",
+    "ttm_gross_profit": "ttm_gross_profit", "ttm_net_income": "ttm_net_income",
+    "total_current_assets": "current_assets", "total_current_liabilities": "current_liabilities",
+    "fixed_assets": "fixed_assets", "long_term_liabilities": "long_term_liabilities",
+    "total_assets": "total_assets", "total_liabilities": "total_liabilities",
+    "total_equity": "total_equity", "total_debt": "total_debt",
+    "tangible_net_worth": "tangible_net_worth", "working_capital": "working_capital",
+    "cash": "cash", "inventory": "inventory",
+    "accounts_receivable": "accounts_receivable", "accounts_payable": "accounts_payable",
+}
+
+
+def _account_balance_map(session, entity_id, as_of) -> dict[str, float]:
+    rows = _account_sums(session, entity_id=entity_id, period_end_from=None, period_end_to=as_of)
+    out: dict[str, float] = {}
+    for r in rows:
+        code = r["account_code"]
+        t = _account_type(code)
+        dr, cr = _D(r["sum_debit"]), _D(r["sum_credit"])
+        bal = (dr - cr) if t in ("asset", "cogs", "operating_expense") else (cr - dr)
+        out[code] = float(bal)
+    return out
+
+
+def build_token_namespace(session, entity_id, ctx, period_end, inputs=None) -> dict[str, float]:
+    inputs = inputs or {}
+    ns: dict[str, float] = {}
+    for tok, key in _TOKEN_MAP.items():
+        if key in ctx and ctx[key] is not None:
+            ns[tok] = ctx[key]
+    if inputs.get("annual_debt_service") is not None:
+        ns["annual_debt_service"] = inputs["annual_debt_service"]
+    if inputs.get("fixed_charges") is not None:
+        ns["annual_rent"] = inputs["fixed_charges"]
+    for code, bal in _account_balance_map(session, entity_id, period_end).items():
+        ns[f"acct_{code}"] = bal
+    return ns
+
+
+def evaluate_custom_ratio(defn: dict[str, Any], ns: dict[str, float]) -> float | None:
+    num = safe_eval(defn["numerator_expr"], ns)
+    den_expr = defn.get("denominator_expr")
+    if den_expr:
+        den = safe_eval(den_expr, ns)
+        value = None if (num is None or den in (None, 0)) else num / den
+    else:
+        value = num
+    if value is not None and defn.get("output_type") == "percent":
+        value *= 100.0
+    return value
+
+
+def list_tokens(session, entity_id, period_end) -> dict[str, list[str]]:
+    """Token picker contents for the custom-formula UI."""
+    return {
+        "totals": sorted(_TOKEN_MAP.keys()) + ["annual_debt_service", "annual_rent"],
+        "accounts": sorted(f"acct_{c}" for c in _account_balance_map(session, entity_id, period_end)),
+    }
+
+
+# Built-in formulas expressed in the token language, so the UI can CLONE a
+# built-in into an editable custom ratio.
+BUILTIN_FORMULAS: dict[str, dict[str, str]] = {
+    "current_ratio": {"numerator_expr": "total_current_assets", "denominator_expr": "total_current_liabilities", "output_type": "ratio"},
+    "quick_ratio": {"numerator_expr": "total_current_assets - inventory", "denominator_expr": "total_current_liabilities", "output_type": "ratio"},
+    "cash_ratio": {"numerator_expr": "cash", "denominator_expr": "total_current_liabilities", "output_type": "ratio"},
+    "debt_to_equity": {"numerator_expr": "total_debt", "denominator_expr": "total_equity", "output_type": "ratio"},
+    "debt_to_ebitda": {"numerator_expr": "total_debt", "denominator_expr": "ebitda", "output_type": "ratio"},
+    "gross_margin_pct": {"numerator_expr": "ttm_gross_profit", "denominator_expr": "ttm_revenue", "output_type": "percent"},
+    "net_margin_pct": {"numerator_expr": "ttm_net_income", "denominator_expr": "ttm_revenue", "output_type": "percent"},
+    "interest_coverage": {"numerator_expr": "ebit", "denominator_expr": "interest_expense", "output_type": "ratio"},
+    "working_capital": {"numerator_expr": "total_current_assets - total_current_liabilities", "denominator_expr": "", "output_type": "dollar"},
+    "dscr": {"numerator_expr": "ebitda", "denominator_expr": "annual_debt_service", "output_type": "ratio"},
+}
