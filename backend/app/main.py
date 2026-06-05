@@ -41,6 +41,7 @@ from .routes.month_end_close import router as month_end_close_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
 from .routes.month_end_workflow import router as month_end_workflow_router
 from .routes.payroll import router as payroll_router
+from .routes.payroll_t4 import router as payroll_t4_router
 from .routes.period_close import router as period_close_router
 from .routes.pos_import import router as pos_import_router
 from .routes.reports import router as reports_router
@@ -120,6 +121,7 @@ app.include_router(hh_ap_overrides.router)
 app.include_router(period_close_router)
 app.include_router(auto_match_router)
 app.include_router(payroll_router)
+app.include_router(payroll_t4_router)
 
 # v0.8 module: month-end POS imports + inventory adjustment journal builders.
 app.include_router(pos_import_router)
