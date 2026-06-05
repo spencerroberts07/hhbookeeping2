@@ -40,6 +40,7 @@ interface NavItem {
 const ITEMS: NavItem[] = [
   { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
   { label: 'Month-end', href: '/month-end', icon: CalendarCheck2 },
+  { label: 'Year-end', href: '/year-end', icon: ListChecks, minRole: 'approver' },
   { label: 'Reports', href: '/reports', icon: FileBarChart },
   { label: 'Transactions', href: '/transactions', icon: Receipt },
   { label: 'Documents', href: '/documents', icon: Files },

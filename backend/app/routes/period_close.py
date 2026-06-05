@@ -136,6 +136,18 @@ def post_approve(
             body.entity_code, body.period_end,
         )
 
+    # Year-end trigger (Phase 5A). When the September fiscal year-end period
+    # closes, stamp year_end_status='draft'. Non-fatal; no-op for other months.
+    try:
+        from ..services_year_end import trigger_year_end
+        with db_session() as session:
+            trigger_year_end(session, entity_code=body.entity_code, period_end=body.period_end)
+    except Exception:
+        _log.exception(
+            "year-end trigger failed for %s/%s — non-fatal",
+            body.entity_code, body.period_end,
+        )
+
     return result
 
 
