@@ -895,6 +895,74 @@ EFT_RETURN_TRANSIT = "10202"
 EFT_RETURN_ACCOUNT = "06905660371"
 
 
+def _resolve_eft_settings(session, entity_id) -> dict[str, str]:
+    """TD origination values from entity_settings (Phase 6B), falling back to the
+    hard-coded Bridlewood constants so behaviour is unchanged until populated."""
+    from sqlalchemy import text as _t
+    row = session.execute(
+        _t("""SELECT td_originator_id, td_short_name, td_long_name,
+                     td_return_institution, td_return_transit, td_return_account
+                FROM entity_settings WHERE entity_id=:e"""),
+        {"e": entity_id},
+    ).mappings().first()
+    row = dict(row) if row else {}
+    return {
+        "originator_id": row.get("td_originator_id") or EFT_ORIGINATOR_ID,
+        "short_name": row.get("td_short_name") or EFT_SHORT_NAME,
+        "long_name": row.get("td_long_name") or EFT_LONG_NAME,
+        "return_institution": row.get("td_return_institution") or EFT_RETURN_INSTITUTION,
+        "return_transit": row.get("td_return_transit") or EFT_RETURN_TRANSIT,
+        "return_account": row.get("td_return_account") or EFT_RETURN_ACCOUNT,
+    }
+
+
+def _create_cra_remittance_draft(session, *, entity_id, run, actor_email) -> dict[str, Any]:
+    """D6-3: on EFT generation, create a DRAFT Dr 2320 / Cr 1020 batch for the
+    run's CRA remittance amount. source_module='payroll_remittance', status
+    'draft' — NEVER auto-posted; an approver posts it explicitly. Idempotent per
+    run. Closes the Phase 3 bank-rec reconciling item once posted."""
+    from sqlalchemy import text as _t
+    amt = Decimal(str(run.get("cra_remittance_amount") or 0))
+    if amt <= 0:
+        return {"created": False, "reason": "no CRA remittance amount on run"}
+    pid = run.get("accounting_period_id")
+    if not pid:
+        return {"created": False, "reason": "run has no accounting_period_id"}
+    existing = session.execute(
+        _t("""SELECT id FROM journal_batches
+                WHERE entity_id=:e AND source_module='payroll_remittance'
+                  AND summary_json->>'payroll_run_id' = :rid
+                  AND status NOT IN ('voided','rejected')"""),
+        {"e": entity_id, "rid": str(run["id"])},
+    ).scalar()
+    if existing:
+        return {"created": False, "batch_id": str(existing), "reason": "already exists"}
+    label = f"CRA payroll remittance — {run['pay_run_number']}"
+    bid = session.execute(
+        _t("""INSERT INTO journal_batches (
+                  entity_id, accounting_period_id, source_module, batch_label,
+                  status, workflow_status, total_debits, total_credits, summary_json)
+              VALUES (:e,:pid,'payroll_remittance',:label,'draft','draft',:amt,:amt,CAST(:sj AS jsonb))
+              RETURNING id"""),
+        {"e": entity_id, "pid": pid, "label": label, "amt": amt,
+         "sj": json.dumps({"payroll_run_id": str(run["id"]),
+                           "pay_run_number": run["pay_run_number"],
+                           "cra_remittance": True, "actor": actor_email})},
+    ).scalar()
+    for n, (code, d, c, memo) in enumerate([
+        ("2320", amt, Decimal("0"), "CRA source deductions remittance"),
+        ("1020", Decimal("0"), amt, "CRA remittance payment (TD)"),
+    ], start=1):
+        session.execute(
+            _t("""INSERT INTO journal_lines (journal_batch_id, line_number, account_code,
+                      debit_amount, credit_amount, memo, source_json)
+                  VALUES (:b,:n,:code,:d,:c,:memo,CAST(:sj AS jsonb))"""),
+            {"b": bid, "n": n, "code": code, "d": d, "c": c, "memo": memo,
+             "sj": json.dumps({"payroll_remittance": True})},
+        )
+    return {"created": True, "batch_id": str(bid), "amount": float(amt), "status": "draft"}
+
+
 class GenerateEftRequest(BaseModel):
     entity_code: str
     actor_email: str
@@ -934,7 +1002,8 @@ def post_generate_eft(
             _text(
                 """
                 SELECT id, pay_run_number, period_start, period_end, pay_date,
-                       status, workflow_status, total_net_pay
+                       status, workflow_status, total_net_pay,
+                       cra_remittance_amount, accounting_period_id
                   FROM payroll_runs
                  WHERE id = :id AND entity_id = :eid
                 """
@@ -993,15 +1062,16 @@ def post_generate_eft(
         ).mappings().first()
         file_creation_number = int(next_num_row["n"])
 
+        eft_cfg = _resolve_eft_settings(session, entity["id"])
         header = _eft.EFTHeader(
-            originator_id=EFT_ORIGINATOR_ID,
+            originator_id=eft_cfg["originator_id"],
             file_creation_number=file_creation_number,
             creation_date=DateType.today(),
-            originator_short_name=EFT_SHORT_NAME,
-            originator_long_name=EFT_LONG_NAME,
-            return_institution=EFT_RETURN_INSTITUTION,
-            return_transit=EFT_RETURN_TRANSIT,
-            return_account=EFT_RETURN_ACCOUNT,
+            originator_short_name=eft_cfg["short_name"],
+            originator_long_name=eft_cfg["long_name"],
+            return_institution=eft_cfg["return_institution"],
+            return_transit=eft_cfg["return_transit"],
+            return_account=eft_cfg["return_account"],
         )
         employees = [
             _eft.EFTEmployee(
@@ -1060,13 +1130,17 @@ def post_generate_eft(
                 "fcn": file_creation_number,
                 "sj": json.dumps({
                     "credit_count": built.credit_count,
-                    "originator_id": EFT_ORIGINATOR_ID,
+                    "originator_id": eft_cfg["originator_id"],
                     "business_number": PAYROLL_BUSINESS_NUMBER,
                     "pay_run_number": run["pay_run_number"],
                 }),
                 "ae": body.actor_email,
             },
         ).mappings().first()
+
+        # D6-3: CRA remittance DRAFT batch (Dr 2320 / Cr 1020). Never auto-posted.
+        remittance = _create_cra_remittance_draft(
+            session, entity_id=entity["id"], run=run, actor_email=body.actor_email)
 
         return {
             "id": str(eft_row["id"]),
@@ -1078,7 +1152,11 @@ def post_generate_eft(
             "credit_count": built.credit_count,
             "total_amount": float(built.total_amount),
             "file_creation_number": file_creation_number,
+            "originator_id": eft_cfg["originator_id"],
             "generated_at": eft_row["generated_at"].isoformat(),
+            "cra_remittance_draft": remittance,
+            "dry_run": True,
+            "submission_note": "EFT file generated for manual review. NOT submitted to the bank.",
         }
 
 
