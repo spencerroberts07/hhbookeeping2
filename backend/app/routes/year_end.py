@@ -32,6 +32,17 @@ def get_status(fy: int, entity_code: str = Query(...),
             raise HTTPException(400, str(exc)) from exc
 
 
+@router.get("/{fy}/statements")
+def get_statements(fy: int, entity_code: str = Query(...),
+                   _user: Any = Depends(require_role("viewer"))) -> dict[str, Any]:
+    from ..services_year_end_reports import get_year_end_statements
+    with db_session() as session:
+        try:
+            return get_year_end_statements(session, entity_code=entity_code, fy=fy)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
 class StatusRequest(BaseModel):
     entity_code: str
     status: str
