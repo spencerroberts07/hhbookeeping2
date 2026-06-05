@@ -43,6 +43,19 @@ def get_statements(fy: int, entity_code: str = Query(...),
             raise HTTPException(400, str(exc)) from exc
 
 
+@router.get("/{fy}/tax-package")
+def get_tax_package(fy: int, entity_code: str = Query(...),
+                    _user: Any = Depends(require_role("viewer"))) -> dict[str, Any]:
+    from ..services_year_end_tax import generate_tax_package
+    with db_session() as session:
+        try:
+            res = generate_tax_package(session, entity_code=entity_code, fy=fy)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    res.pop("pdf_bytes", None)  # don't serialize raw bytes to the API
+    return res
+
+
 class StatusRequest(BaseModel):
     entity_code: str
     status: str
