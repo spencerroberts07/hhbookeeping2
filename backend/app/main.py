@@ -41,6 +41,7 @@ from .routes.payroll import router as payroll_router
 from .routes.period_close import router as period_close_router
 from .routes.pos_import import router as pos_import_router
 from .routes.reports import router as reports_router
+from .routes.ratios import router as ratios_router
 from .routes.qbo import router as qbo_router
 from .routes.qbo_auth import router as qbo_auth_router
 from .routes.qbo_bank_sync import router as qbo_bank_sync_router
@@ -145,6 +146,10 @@ app.include_router(reports_router)
 # Report drill-down write path (Slice 2): reclassify / edit-amount / correct
 # / note. Admin-only; locked periods route to reversal + re-entry.
 app.include_router(journal_edits_router)
+
+# Ratio engine (Phase 2C): lender-ratio tracker computed off the cutover-aware
+# sums, current vs prior-year, with per-entity role mapping + thresholds.
+app.include_router(ratios_router)
 
 # BookWize AI assistant — conversational classifier + entity memory.
 app.include_router(assistant_router)
