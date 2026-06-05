@@ -10,6 +10,7 @@ import { useIsAdmin } from '@/lib/store/user';
 import { getPeriodStatus, submitPeriodForClose, approvePeriodClose } from '@/lib/api/month_end';
 import { toast } from 'sonner';
 import { formatDate } from '@/lib/utils';
+import { MonthEndDocumentCard } from './month-end-document-card';
 
 interface Props {
   entityCode: string;
@@ -124,6 +125,10 @@ export function StepClose({ entityCode, periodEnd }: Props) {
           )}
         </div>
       )}
+
+      {/* Month-end financial package (Phase 4B) — auto-generated on close;
+          manual (re)generate + email here. */}
+      <MonthEndDocumentCard entityCode={entityCode} periodEnd={periodEnd} />
     </div>
   );
 }

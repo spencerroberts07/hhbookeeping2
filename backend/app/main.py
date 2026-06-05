@@ -35,6 +35,7 @@ from .routes.hh_ap_remittance_bank_match import (
     router as hh_ap_remittance_bank_match_router,
 )
 from .routes.month_end import router as month_end_router
+from .routes.month_end_documents import router as month_end_documents_router
 from .routes.onboarding import router as onboarding_router
 from .routes.month_end_close import router as month_end_close_router
 from .routes.month_end_hh_ap import router as month_end_hh_ap_router
@@ -146,6 +147,7 @@ app.include_router(invoice_documents_router)
 
 # Live financial reports (Income Statement, Balance Sheet, Trial Balance).
 app.include_router(reports_router)
+app.include_router(month_end_documents_router)
 
 # Report drill-down write path (Slice 2): reclassify / edit-amount / correct
 # / note. Admin-only; locked periods route to reversal + re-entry.

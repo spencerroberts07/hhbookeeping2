@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db import db_session
@@ -89,6 +89,7 @@ def post_submit(
 @router.post("/approve")
 def post_approve(
     body: ApproveRequest,
+    background: BackgroundTasks,
     _user: dict = Depends(require_role("approver")),
 ) -> dict[str, Any]:
     import logging as _logging
@@ -120,6 +121,18 @@ def post_approve(
     except Exception:
         _log.exception(
             "learn_from_period_close failed for %s/%s — non-fatal",
+            body.entity_code, body.period_end,
+        )
+
+    # Month-end document hook (Phase 4B). Generated as a background task after the
+    # response is sent; fully non-fatal — never blocks or rolls back the close.
+    try:
+        from .month_end_documents import trigger_month_end_document
+        background.add_task(
+            trigger_month_end_document, body.entity_code, body.period_end, body.actor_email)
+    except Exception:
+        _log.exception(
+            "scheduling month-end document failed for %s/%s — non-fatal",
             body.entity_code, body.period_end,
         )
 
