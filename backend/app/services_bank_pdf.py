@@ -61,6 +61,11 @@ _CLASSIFIER_RULES: list[tuple[re.Pattern[str], str, str]] = [
     # Note: pypdf often concatenates the merchant id directly onto FEE/DEP
     # (e.g. "AMX FEE12593422", "VSA DEP14350"). Patterns must NOT require
     # a trailing word-boundary because between 'E' and '1' there is none.
+    #
+    # TD statement PDFs do not preserve column positions (CHEQUE/DEBIT vs
+    # DEPOSIT/CREDIT) after pypdf text extraction — all amounts land at the
+    # same horizontal position. Direction must be inferred entirely from the
+    # description. Specific patterns must come BEFORE the generic catch-alls.
     (re.compile(r"\bAMX\s*FEE"), "outflow", "amex_fee"),
     (re.compile(r"\bAMEX\s+\d+"), "inflow", "amex_settlement"),
     (re.compile(r"\bCASH\s+DEP\s*FEE"), "outflow", "cash_deposit_fee"),
@@ -90,6 +95,20 @@ _CLASSIFIER_RULES: list[tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"\bLN\s*PYMT\b"), "outflow", "loan_principal_payment"),
     (re.compile(r"\bD/?L\s*INT\b"), "outflow", "loan_interest"),
     (re.compile(r"\bCHQ#\d+"), "outflow", "cheque"),
+    # -------------------------------------------------------------------
+    # TD bill-pay and transfer outflows.
+    # BPY = TD "bill payment" service — always a debit on the account.
+    # TFR-TO = transfer to another TD account (e.g. line of credit paydown,
+    # credit-card sweep); always a debit.
+    # Standalone FEES / FEE at end of description = bank-administered fee.
+    # Billing = third-party subscription billing service (always a debit).
+    # These generalise across all months/years and must come AFTER the more
+    # specific patterns above that also mention "FEE" in different forms.
+    # -------------------------------------------------------------------
+    (re.compile(r"\bBPY\b"), "outflow", "bill_payment"),
+    (re.compile(r"\bTFR-?TO\b"), "outflow", "transfer_to"),
+    (re.compile(r"\bFEES?\b\s*$"), "outflow", "service_fee"),
+    (re.compile(r"\bBilling\b", re.IGNORECASE), "outflow", "billing_service"),
 ]
 
 _INFLOW_FALLBACK_HINTS = (
@@ -251,8 +270,25 @@ def _parse_page_summary(text_block: str) -> dict[str, Any]:
     return summary
 
 
+_RE_BALANCE_FORWARD = re.compile(
+    r"^\s*BALANCE\s+FORWARD\b.*?(\d{1,3}(?:,\d{3})*\.\d{2})(OD)?",
+    re.IGNORECASE,
+)
+
+
 def _is_balance_forward(line: str) -> bool:
-    return bool(re.match(r"^\s*BALANCE\s+FORWARD\b", line, re.IGNORECASE))
+    return bool(_RE_BALANCE_FORWARD.match(line))
+
+
+def _parse_balance_forward(line: str) -> tuple[Decimal | None, bool]:
+    """Return (balance_magnitude, is_overdraft) from a BALANCE FORWARD line,
+    or (None, False) if the line doesn't match."""
+    m = _RE_BALANCE_FORWARD.match(line)
+    if not m:
+        return None, False
+    bal = _to_decimal(m.group(1))
+    od = bool(m.group(2))
+    return bal, od
 
 
 def parse_td_statement_pdf(file_bytes: bytes) -> dict[str, Any]:
@@ -308,6 +344,10 @@ def parse_td_statement_pdf(file_bytes: bytes) -> dict[str, Any]:
 
     transactions: list[dict[str, Any]] = []
     row_counter = 0
+    # Opening balance from the first BALANCE FORWARD line on page 1 only.
+    # Used for the post-parse balance invariant.
+    opening_balance: Decimal | None = None
+    opening_balance_is_od: bool = False
 
     for page_idx, page_text in enumerate(pages):
         page_no = page_idx + 1
@@ -316,6 +356,12 @@ def parse_td_statement_pdf(file_bytes: bytes) -> dict[str, Any]:
             if not line.strip():
                 continue
             if _is_balance_forward(line):
+                # Capture the opening balance from page 1's BALANCE FORWARD.
+                if page_idx == 0 and opening_balance is None:
+                    bal_mag, bal_od = _parse_balance_forward(line)
+                    if bal_mag is not None:
+                        opening_balance = bal_mag
+                        opening_balance_is_od = bal_od
                 continue
 
             # Find the date token (pattern like 'FEB02') from the right side.
@@ -401,6 +447,44 @@ def parse_td_statement_pdf(file_bytes: bytes) -> dict[str, Any]:
                     "running_balance_is_overdraft": is_od,
                 }
             )
+
+    # ------------------------------------------------------------------
+    # Balance invariant: sum of all parsed (signed) amounts must equal
+    # closing_balance − opening_balance within $0.01.
+    #
+    # opening_balance = BALANCE FORWARD on page 1 (negated when OD).
+    # closing_balance = running_balance on the last transaction that
+    #   carries one (also negated when OD).
+    #
+    # A non-trivial discrepancy almost always means some transactions
+    # have the wrong sign — typically outflows stored positive because
+    # the description didn't match any classifier rule.
+    # ------------------------------------------------------------------
+    if opening_balance is not None and transactions:
+        signed_opening = (
+            -opening_balance if opening_balance_is_od else opening_balance
+        )
+        # Find closing balance from the last transaction with a running_balance.
+        closing_bal_mag: Decimal | None = None
+        closing_bal_od: bool = False
+        for t in reversed(transactions):
+            if t.get("running_balance") is not None:
+                closing_bal_mag = t["running_balance"]
+                closing_bal_od = t.get("running_balance_is_overdraft", False)
+                break
+        if closing_bal_mag is not None:
+            signed_closing = -closing_bal_mag if closing_bal_od else closing_bal_mag
+            expected_net = signed_closing - signed_opening
+            parsed_net = sum(t["amount"] for t in transactions)
+            discrepancy = parsed_net - expected_net
+            if abs(discrepancy) > Decimal("0.01"):
+                warnings.append(
+                    f"Balance invariant failed: parsed amounts sum to "
+                    f"{parsed_net:,.2f} but statement balance changed by "
+                    f"{expected_net:,.2f} (discrepancy {discrepancy:+,.2f}). "
+                    f"Some transactions may have the wrong sign — review "
+                    f"'unknown' direction rows before ingesting."
+                )
 
     return {
         "account_branch": branch,
