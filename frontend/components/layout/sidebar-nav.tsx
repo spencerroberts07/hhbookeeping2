@@ -15,6 +15,7 @@ import {
   Settings,
   ShieldCheck,
   ListChecks,
+  Building2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -52,6 +53,7 @@ const ITEMS: NavItem[] = [
   },
   { label: 'AP', href: '/ap', icon: CircleDollarSign },
   { label: 'Bank', href: '/bank', icon: Banknote },
+  { label: 'Fixed Assets', href: '/fixed-assets', icon: Building2 },
   { label: 'Settings', href: '/settings', icon: Settings },
   {
     label: 'BookWize Admin',

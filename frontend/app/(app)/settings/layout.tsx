@@ -14,6 +14,8 @@ const TABS = [
   { href: '/settings/integrations', label: 'Integrations' },
   { href: '/settings/data-import', label: 'Data import' },
   { href: '/settings/notifications', label: 'Notifications' },
+  { href: '/settings/recurring-entries', label: 'Recurring entries' },
+  { href: '/settings/fixed-assets', label: 'Asset classes' },
 ];
 
 export default function SettingsLayout({

@@ -22,6 +22,7 @@ from .routes.cogs import router as cogs_router
 from .routes.dashboard import router as dashboard_router
 from .routes.data_import import router as data_import_router
 from .routes.depreciation import router as depreciation_router
+from .routes.recurring_entries import router as recurring_entries_router
 from .routes.documents import router as documents_router
 from .routes.direct_vendor_ap import router as direct_vendor_ap_router
 from .routes.entities import me_router as me_router, router as entities_router
@@ -133,6 +134,7 @@ app.include_router(bank_pdf_router)
 app.include_router(bank_import_router)
 app.include_router(bank_rec_router)
 app.include_router(depreciation_router)
+app.include_router(recurring_entries_router)
 app.include_router(accruals_router)
 app.include_router(bank_auto_journal_router)
 

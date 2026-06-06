@@ -1147,6 +1147,23 @@ def _section_cogs_wrapper(
     )
 
 
+def _section_recurring_entries_wrapper(
+    session,
+    entity_id: UUID,
+    period_end: date,
+) -> dict[str, Any]:
+    """Close-readiness section: recurring journal-entry engine (Module A)."""
+    if not _has_table(session, "recurring_entry_templates"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "recurring_entry_templates table not present",
+        }
+    from .services_recurring_entries import get_month_end_status  # noqa: WPS433
+
+    return get_month_end_status(session, entity_id=entity_id, period_end=period_end)
+
+
 # ----------------------------------------------------------------------
 # Roll-up
 # ----------------------------------------------------------------------
@@ -1304,6 +1321,9 @@ def get_month_end_close_status(
         "cogs": _section_cogs_wrapper(
             session, entity["id"], accounting_period_id,
             period_start, period_end_date,
+        ),
+        "recurring_entries": _section_recurring_entries_wrapper(
+            session, entity["id"], period_end_date
         ),
     }
 
