@@ -137,21 +137,21 @@ def run(entity_code: str, write: bool) -> None:
 
         # --- WRITE (requires explicit --write flag) ---
         print("\nWriting split values to payroll_run_lines ...")
-        with conn.begin():
-            for row in to_update:
-                conn.execute(
-                    text(
-                        """
-                        UPDATE payroll_run_lines
-                           SET federal_tax    = :ft,
-                               provincial_tax = :pt
-                         WHERE id = :id
-                           AND federal_tax  = 0
-                           AND provincial_tax = 0
-                        """
-                    ),
-                    {"id": row["id"], "ft": row["federal_tax"], "pt": row["provincial_tax"]},
-                )
+        for row in to_update:
+            conn.execute(
+                text(
+                    """
+                    UPDATE payroll_run_lines
+                       SET federal_tax    = :ft,
+                           provincial_tax = :pt
+                     WHERE id = :id
+                       AND federal_tax  = 0
+                       AND provincial_tax = 0
+                    """
+                ),
+                {"id": row["id"], "ft": row["federal_tax"], "pt": row["provincial_tax"]},
+            )
+        conn.commit()
         print(f"Done. {len(to_update)} rows updated.")
 
 
