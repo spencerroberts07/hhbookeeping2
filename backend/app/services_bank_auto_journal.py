@@ -37,6 +37,7 @@ from .services import (
     get_entity_by_code,
     get_or_create_accounting_period,
 )
+from .services_period_close import PeriodLockedError, assert_period_not_locked
 from .services_vendor_classification import (
     LAYER_CLAUDE,
     LAYER_RULES,
@@ -593,6 +594,9 @@ def run_auto_journal(
     accounting_period_id = get_or_create_accounting_period(
         session, entity["id"], period_end
     )
+
+    # Refuse to post into a locked period — raises PeriodLockedError (→ 409).
+    assert_period_not_locked(session, entity_id=entity["id"], when=period_end)
 
     rules = session.execute(
         text(

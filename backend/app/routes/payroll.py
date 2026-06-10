@@ -24,6 +24,7 @@ from ..services_payroll import (
     get_payroll_summary,
     list_employees,
     list_payroll_runs,
+    PayrollJournalMissingError,
     schedule_withdrawals,
     section_payroll as section_payroll_impl,
     seed_employees,
@@ -685,6 +686,8 @@ def post_approve(
             )
     except HTTPException:
         raise
+    except PayrollJournalMissingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

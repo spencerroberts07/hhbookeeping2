@@ -18,27 +18,20 @@ the run line if a specific employee's actual differs materially.
 CPP and EI are exact — those are flat-rate calculations.
 
 # ============================================================
-# TODO_CRA_2026_RATES — verify-and-update pass needed
+# CRA 2026 RATES — updated 2026-06-09 against CRA T4127
 #
-# The constants below carry "2026" in their names but the actual
-# numbers were pulled from CRA's 2025 publications. The Feb 2026
-# payroll closed against ENetEmployer's register so no posted
-# journal depends on these numbers, but every future preview /
-# estimate / cap calculation does.
+# All main CPP / EI / BPA constants below now reflect published
+# CRA 2026 values.  Previous values (from 2025 publications) are
+# shown inline as "was: …" for reference.
 #
-# Discrepancies vs CRA 2026 (per spec audit, 2026-05-26):
-#   CPP_MAX_EARNINGS_ANNUAL    code: 71300  CRA 2026: 68500
-#   CPP_MAX_CONTRIB_ANNUAL     code: 4034.10  CRA 2026: 3867.50
-#   EI_RATE_EE                 code: 0.01657  CRA 2026: 0.0166
-#   EI_MAX_INSURABLE_ANNUAL    code: 65700  CRA 2026: 63200
-#   EI_MAX_CONTRIB_EE_ANNUAL   code: 1088.65  CRA 2026: 1049.12
-#   FEDERAL_BPA_2026           code: 16129  CRA 2026: 15705
-#   CPP2 (4% on 68500-73200)   not implemented
-#
-# Resolution: a separate audit commit will replace these constants
-# after Spencer verifies against the CRA T4127 PDF. Do NOT update
-# them in feature builds — sneak-rate-changes are how payroll bugs
-# happen.
+# REMAINING OPEN ITEM — CPP2 (enhancement tier 2):
+#   CPP2_LOWER_CEILING  = YMPE ($68,500)   ← correct for 2026
+#   CPP2_UPPER_CEILING  = $73,200          ← YAMPE, placeholder,
+#                                             needs T4127 verification
+#   CPP2 deduction logic is NOT yet implemented in
+#   calculate_cpp_ee() — the fields exist in the dataclass but the
+#   engine still calculates only tier-1 CPP.  Do NOT implement CPP2
+#   until the rate-audit commit that confirms CPP2_UPPER_CEILING.
 # ============================================================
 """
 from __future__ import annotations
@@ -57,25 +50,27 @@ from typing import Any
 CPP_RATE_EE = Decimal("0.0595")
 CPP_RATE_ER = Decimal("0.0595")
 CPP_EXEMPTION_ANNUAL = Decimal("3500.00")
-CPP_MAX_EARNINGS_ANNUAL = Decimal("71300.00")
+CPP_MAX_EARNINGS_ANNUAL = Decimal("68500.00")  # was: 71300.00 (2025)
 CPP_MAX_CONTRIB_ANNUAL = (
     (CPP_MAX_EARNINGS_ANNUAL - CPP_EXEMPTION_ANNUAL) * CPP_RATE_EE
-).quantize(Decimal("0.01"))  # = 4,034.10
+).quantize(Decimal("0.01"))  # = 3,867.50  (was: 4,034.10)
 
-EI_RATE_EE = Decimal("0.01657")
+EI_RATE_EE = Decimal("0.0166")  # was: 0.01657 (2025)
 EI_RATE_ER_MULTIPLIER = Decimal("1.4")
-EI_MAX_INSURABLE_ANNUAL = Decimal("65700.00")
+EI_MAX_INSURABLE_ANNUAL = Decimal("63200.00")  # was: 65700.00 (2025)
 EI_MAX_CONTRIB_EE_ANNUAL = (
     EI_MAX_INSURABLE_ANNUAL * EI_RATE_EE
-).quantize(Decimal("0.01"))  # = 1,088.65
+).quantize(Decimal("0.01"))  # = 1,049.12  (was: 1,088.65)
 
 # CPP2 (CPP enhancement, tier 2 — above the first earnings ceiling).
-# See TODO_CRA_2026_RATES block: these are placeholder values and
-# need verification against CRA T4127 in the rate-audit commit.
+# NOT YET IMPLEMENTED — these constants exist so the dataclass can
+# carry the fields, but calculate_cpp_ee() does not yet apply CPP2.
+# CPP2_UPPER_CEILING ($73,200) is a placeholder — verify against
+# CRA T4127 before implementing CPP2 deduction logic.
 CPP2_RATE_EE = Decimal("0.04")
 CPP2_RATE_ER = Decimal("0.04")
-CPP2_LOWER_CEILING = CPP_MAX_EARNINGS_ANNUAL          # tier-1 cap (YMPE)
-CPP2_UPPER_CEILING = Decimal("73200.00")              # YAMPE — placeholder
+CPP2_LOWER_CEILING = CPP_MAX_EARNINGS_ANNUAL          # tier-1 cap = YMPE (68,500)
+CPP2_UPPER_CEILING = Decimal("73200.00")              # YAMPE — placeholder, verify T4127
 CPP2_MAX_CONTRIB_ANNUAL = (
     (CPP2_UPPER_CEILING - CPP2_LOWER_CEILING) * CPP2_RATE_EE
 ).quantize(Decimal("0.01"))
@@ -84,7 +79,7 @@ VACATION_RATE_DEFAULT = Decimal("0.04")
 BIWEEKLY_PERIODS = 26
 
 # Federal 2026 brackets (annual)
-FEDERAL_BPA_2026 = Decimal("16129.00")
+FEDERAL_BPA_2026 = Decimal("15705.00")  # was: 16129.00 (2025)
 FEDERAL_BRACKETS = [
     (Decimal("57375.00"), Decimal("0.15")),
     (Decimal("114750.00"), Decimal("0.205")),

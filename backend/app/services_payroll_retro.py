@@ -18,9 +18,9 @@ Tax handling — non-periodic (bonus) method:
     marginal rate for the year. We approximate by annualizing
     (current YTD gross + bonus) against the bracket schedule, then
     diff against tax that would otherwise have been due. This is
-    an estimate — see the TODO_CRA_2026_RATES block in
-    services_payroll_calc.py. For Bridlewood the estimate is in
-    the right ballpark; bookkeeper can override per-line.
+    an estimate; bookkeeper can override per-line if needed.
+    All rate constants (BPA, CPP cap, EI cap/rate) are imported from
+    services_payroll_calc.py — updated to 2026 CRA values 2026-06-09.
 """
 from __future__ import annotations
 

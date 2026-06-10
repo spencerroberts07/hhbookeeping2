@@ -55,6 +55,10 @@ from .services_payroll_calc import (
 SOURCE_MODULE_PAYROLL = "payroll"
 BATCH_LABEL_PAYROLL = "biweekly_payroll"
 
+
+class PayrollJournalMissingError(ValueError):
+    """Raised when approve_payroll_run is called but no journal batch exists."""
+
 ACCOUNT_WAGES = "6120"
 ACCOUNT_GROUP_INSURANCE = "6130"
 ACCOUNT_VACATION_PAYABLE = "2220"
@@ -2411,6 +2415,24 @@ def approve_payroll_run(
     if not entity:
         raise ValueError(f"Unknown entity code: {entity_code}")
     run_uuid = _parse_uuid(payroll_run_id, "payroll_run_id")
+
+    # JE gate — must have a journal batch before approval.
+    je_check = session.execute(
+        text(
+            """
+            SELECT journal_batch_id
+              FROM payroll_runs
+             WHERE id = :id AND entity_id = :entity_id
+            """
+        ),
+        {"id": run_uuid, "entity_id": entity["id"]},
+    ).mappings().first()
+    if not je_check or je_check["journal_batch_id"] is None:
+        raise PayrollJournalMissingError(
+            "Cannot approve: no journal entry found for this payroll run. "
+            "Generate the journal first."
+        )
+
     row = session.execute(
         text(
             """

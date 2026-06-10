@@ -27,6 +27,7 @@ from ..services_bank_auto_journal import (
     run_auto_journal,
     seed_rules,
 )
+from ..services_period_close import PeriodLockedError
 
 
 router = APIRouter(prefix="/api/bank-auto-journal", tags=["bank-auto-journal"])
@@ -97,6 +98,8 @@ def post_run(
                 period_end=period_end,
                 actor_email=body.actor_email,
             )
+    except PeriodLockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
