@@ -1073,6 +1073,36 @@ def on_payroll_run_finalized(
                 },
             )
 
+        # Auto-forward: ensure period N+1 exists so the next run is never missing.
+        # Guard pn < 26: period 26 rolls to the next calendar year's P01, which has
+        # a different fiscal_year; that year's backfill covers it at onboarding.
+        if pn < 26:
+            next_ps = run["period_end"] + timedelta(days=1)
+            next_pe = next_ps + timedelta(days=13)
+            next_fy = _fiscal_year_for_date(next_ps, run["fy_end_month"], run["fy_end_day"])
+            session.execute(
+                text(
+                    """
+                    INSERT INTO payroll_pay_periods
+                        (entity_id, fiscal_year, period_number, period_start,
+                         period_end, source)
+                    VALUES (:eid, :fy, :pn, :ps, :pe, 'auto:payroll_approved')
+                    ON CONFLICT (entity_id, fiscal_year, period_number) DO NOTHING
+                    """
+                ),
+                {
+                    "eid": entity_id,
+                    "fy": next_fy,
+                    "pn": pn + 1,
+                    "ps": next_ps,
+                    "pe": next_pe,
+                },
+            )
+            _log.info(
+                "wage_planner hook: ensured next calendar period FY%s P%s (%s - %s)",
+                next_fy, pn + 1, next_ps, next_pe,
+            )
+
         # Only refresh actuals if planner settings exist for this FY
         settings_row = get_settings(session, entity_id=entity_id, fiscal_year=fy)
         if not settings_row:
