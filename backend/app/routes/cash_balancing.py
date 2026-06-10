@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import json
+import logging
 import secrets as _secrets_mod
 from typing import Any
 
@@ -15,6 +16,7 @@ from ..services_auth import (
     enforce_entity_code,
     require_role,
 )
+from ..services import ensure_accounting_period_for_date
 from ..google_sheets import (
     DailyCashLine,
     GoogleSheetsClient,
@@ -23,6 +25,8 @@ from ..google_sheets import (
     parse_weekly_cash_sheet,
     safe_decimal,
 )
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/cash-balancing", tags=["cash-balancing"])
 
@@ -189,29 +193,20 @@ def build_daily_groups(
     return grouped
 
 
-def get_accounting_period_for_date(session, entity_id: str, business_date: str):
-    period = session.execute(
-        text(
-            """
-            SELECT id, period_label, period_start, period_end, fiscal_year, fiscal_period_number
-            FROM accounting_periods
-            WHERE entity_id = :entity_id
-              AND :business_date BETWEEN period_start AND period_end
-            LIMIT 1
-            """
-        ),
-        {
-            "entity_id": entity_id,
-            "business_date": business_date,
-        },
-    ).mappings().first()
+def get_accounting_period_for_date(session, entity_row: dict, business_date: str):
+    """Return the accounting_periods row for *business_date*.
 
-    if not period:
-        raise RuntimeError(
-            f"No accounting period found for entity_id={entity_id} and business_date={business_date}"
-        )
-
-    return period
+    Delegates to ``ensure_accounting_period_for_date`` which auto-creates
+    an empty draft period when the date crosses into a new calendar month
+    that has no period row yet (e.g. the first day of data for a new month).
+    Raises ``RuntimeError`` for dates that pre-date all known periods (data
+    error guard — never backfills history).
+    """
+    return ensure_accounting_period_for_date(
+        session=session,
+        entity_row=entity_row,
+        business_date=business_date,
+    )
 
 
 @router.post("/sync")
@@ -227,7 +222,13 @@ async def sync_cash_balancing(
 
     with db_session() as session:
         entity = session.execute(
-            text("SELECT id, entity_code FROM entities WHERE entity_code = :entity_code"),
+            text(
+                """
+                SELECT id, entity_code, fiscal_year_end_month, fiscal_year_end_day
+                FROM entities
+                WHERE entity_code = :entity_code
+                """
+            ),
             {"entity_code": payload.entity_code},
         ).mappings().first()
         if not entity:
@@ -445,7 +446,7 @@ async def sync_cash_balancing(
                 for business_date, day_data in daily_groups.items():
                     accounting_period = get_accounting_period_for_date(
                         session=session,
-                        entity_id=entity["id"],
+                        entity_row=entity,
                         business_date=business_date,
                     )
                     accounting_period_id = accounting_period["id"]
@@ -648,32 +649,82 @@ async def sync_cash_balancing(
             }
 
         except Exception as e:
-            session.execute(
-                text(
-                    """
-                    UPDATE cash_balancing_import_runs
-                    SET status = 'failed',
-                        finished_at = NOW(),
-                        tabs_read = CAST(:tabs_read AS jsonb),
-                        summary_json = CAST(:summary_json AS jsonb),
-                        error_text = :error_text
-                    WHERE id = :id
-                    """
-                ),
-                {
-                    "id": import_run["id"],
-                    "tabs_read": json.dumps(selected_tabs),
-                    "summary_json": json.dumps(
+            # Write a failed import_run in a SEPARATE committed session.
+            #
+            # The main db_session context manager (db.py:19) calls
+            # session.rollback() when any exception propagates out of the
+            # `with` block, which previously erased the status='failed' UPDATE
+            # that was written on the same session — leaving zero DB trace of
+            # every failed run.  Opening a fresh db_session() here commits the
+            # failure record independently before the outer rollback fires.
+            #
+            # Pattern matches services_month_end_pdf.py:739-748.
+            try:
+                with db_session() as fail_session:
+                    # Re-resolve the source so source_id FK is satisfiable even
+                    # if the main session's upsert was rolled back (first-ever
+                    # run with no prior committed source row).
+                    fail_source = fail_session.execute(
+                        text(
+                            """
+                            INSERT INTO cash_balancing_sources (
+                                entity_id, source_name, spreadsheet_id, lookback_days
+                            ) VALUES (
+                                :entity_id, 'Cash Balancing', :spreadsheet_id, :lookback_days
+                            )
+                            ON CONFLICT (entity_id, source_name)
+                            DO UPDATE SET
+                                spreadsheet_id = EXCLUDED.spreadsheet_id,
+                                lookback_days = EXCLUDED.lookback_days,
+                                updated_at = NOW()
+                            RETURNING id
+                            """
+                        ),
                         {
-                            "tabs": selected_tabs,
-                            "tabs_source": tabs_source,
+                            "entity_id": str(entity["id"]),
+                            "spreadsheet_id": integration["spreadsheet_id"],
                             "lookback_days": payload.lookback_days,
-                            "failed_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    ),
-                    "error_text": str(e),
-                },
-            )
+                        },
+                    ).mappings().first()
+                    fail_session.execute(
+                        text(
+                            """
+                            INSERT INTO cash_balancing_import_runs (
+                                entity_id, source_id, run_type, status,
+                                started_at, finished_at,
+                                tabs_read, summary_json, error_text
+                            ) VALUES (
+                                :entity_id, :source_id, :run_type, 'failed',
+                                NOW(), NOW(),
+                                CAST(:tabs_read AS jsonb),
+                                CAST(:summary_json AS jsonb),
+                                :error_text
+                            )
+                            """
+                        ),
+                        {
+                            "entity_id": str(entity["id"]),
+                            "source_id": str(fail_source["id"]),
+                            "run_type": "cron" if _user.get("is_cron") else "manual",
+                            "tabs_read": json.dumps(selected_tabs),
+                            "summary_json": json.dumps(
+                                {
+                                    "tabs": selected_tabs,
+                                    "tabs_source": tabs_source,
+                                    "lookback_days": payload.lookback_days,
+                                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                            ),
+                            "error_text": str(e),
+                        },
+                    )
+            except Exception:
+                # Best-effort: a failure in the logging path must never mask
+                # the original error.
+                _log.exception(
+                    "cash_balancing sync: could not persist failed import_run "
+                    "for entity %s", payload.entity_code
+                )
             raise HTTPException(status_code=500, detail=str(e))
 
 

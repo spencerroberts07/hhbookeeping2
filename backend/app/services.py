@@ -1,10 +1,14 @@
+import calendar
 import json
+import logging
 from datetime import date, datetime, time, timezone, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
+
+_log = logging.getLogger(__name__)
 
 from .quickbooks import (
     BANK_ACCOUNT_TYPES,
@@ -72,6 +76,159 @@ def get_or_create_accounting_period(session, entity_id: str, txn_date: date | No
     ).mappings().first()
 
     return row["id"] if row else None
+
+
+def ensure_accounting_period_for_date(
+    session,
+    entity_row: dict,
+    business_date: str,
+) -> dict:
+    """Return the accounting_periods row that covers *business_date* for the
+    given entity.
+
+    If no period exists AND the date falls in a current or future month
+    (i.e. >= the period_start of the entity's most-recent period), a new
+    empty draft period is AUTO-CREATED using the entity's fiscal calendar
+    (``fiscal_year_end_month`` / ``fiscal_year_end_day`` from *entity_row*).
+
+    If the date pre-dates the most-recent period start, a ``RuntimeError``
+    is raised rather than silently backfilling a historical gap — that
+    situation almost always indicates a data-entry mistake in the source
+    sheet.
+
+    *entity_row* must carry: ``id``, ``entity_code``,
+    ``fiscal_year_end_month``, ``fiscal_year_end_day``.
+
+    **Hard constraints** — this function only ever:
+    - INSERTs an empty ``status='draft'`` accounting_periods row stamped
+      ``created_via='auto:cash_balancing_sync'``.
+    - Never posts, modifies, or deletes any other data.
+    - Never creates a ``closed_locked`` period.
+    - Idempotent: concurrent inserts resolve via the UNIQUE constraint on
+      ``(entity_id, period_start, period_end)``; both paths return the same row.
+
+    Scoped by ``entity_id`` — multi-tenant safe.
+    """
+    entity_id = str(entity_row["id"])
+
+    # --- Fast path: period already exists ---
+    row = session.execute(
+        text(
+            """
+            SELECT id, period_label, period_start, period_end,
+                   fiscal_year, fiscal_period_number, status
+            FROM accounting_periods
+            WHERE entity_id = :entity_id
+              AND :business_date BETWEEN period_start AND period_end
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity_id, "business_date": business_date},
+    ).mappings().first()
+    if row:
+        return dict(row)
+
+    # --- Period not found: safety guard before auto-creating ---
+    # Fetch the most-recent period start to reject obviously wrong dates.
+    most_recent = session.execute(
+        text(
+            """
+            SELECT period_start
+            FROM accounting_periods
+            WHERE entity_id = :entity_id
+            ORDER BY period_start DESC
+            LIMIT 1
+            """
+        ),
+        {"entity_id": entity_id},
+    ).mappings().first()
+
+    bd = date.fromisoformat(business_date)
+
+    if most_recent and bd < most_recent["period_start"]:
+        raise RuntimeError(
+            f"No accounting period found for entity_id={entity_id} and "
+            f"business_date={business_date} — date pre-dates the most-recent "
+            f"period start ({most_recent['period_start']}). Looks like a data "
+            f"error; refusing to auto-create a historical period."
+        )
+
+    # --- Compute fiscal calendar fields from entity config ---
+    fy_end_month = int(entity_row.get("fiscal_year_end_month") or 9)
+    fy_end_day = int(entity_row.get("fiscal_year_end_day") or 30)
+
+    # Fiscal year is labelled by the calendar year in which it ends.
+    # (same rule as _fiscal_year_for_period in services_depreciation.py)
+    if (bd.month, bd.day) <= (fy_end_month, fy_end_day):
+        fiscal_year = bd.year
+    else:
+        fiscal_year = bd.year + 1
+
+    # Period 1 = first month after fiscal year-end.
+    # For fy_end_month=9 (Sep): Oct=1, Nov=2, …, Sep=12.
+    fiscal_period_number = ((bd.month - fy_end_month - 1) % 12) + 1
+
+    period_start = date(bd.year, bd.month, 1)
+    last_day = calendar.monthrange(bd.year, bd.month)[1]
+    period_end = date(bd.year, bd.month, last_day)
+    month_abbr = calendar.month_abbr[bd.month]   # e.g. 'Jun'
+    period_label = f"FY{fiscal_year}-P{fiscal_period_number:02d} {month_abbr} {bd.year}"
+
+    # --- Idempotent INSERT ---
+    session.execute(
+        text(
+            """
+            INSERT INTO accounting_periods (
+                entity_id, period_label, period_start, period_end, status,
+                fiscal_period_number, fiscal_year, created_via
+            ) VALUES (
+                :entity_id, :period_label, :period_start, :period_end, 'draft',
+                :fiscal_period_number, :fiscal_year, 'auto:cash_balancing_sync'
+            )
+            ON CONFLICT (entity_id, period_start, period_end) DO NOTHING
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_label": period_label,
+            "period_start": period_start,
+            "period_end": period_end,
+            "fiscal_period_number": fiscal_period_number,
+            "fiscal_year": fiscal_year,
+        },
+    )
+
+    # SELECT back — handles both fresh insert and a lost race with a
+    # concurrent insert (both produce the same committed row).
+    new_row = session.execute(
+        text(
+            """
+            SELECT id, period_label, period_start, period_end,
+                   fiscal_year, fiscal_period_number, status
+            FROM accounting_periods
+            WHERE entity_id = :entity_id
+              AND period_start = :period_start AND period_end = :period_end
+            LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+
+    entity_code = entity_row.get("entity_code", entity_id)
+    _log.info(
+        "auto-created accounting period entity=%s label=%s %s→%s "
+        "status=draft created_via=auto:cash_balancing_sync",
+        entity_code,
+        period_label,
+        period_start,
+        period_end,
+    )
+
+    return dict(new_row)
 
 
 async def import_chart_of_accounts(session, entity_code: str) -> dict[str, Any]:
