@@ -28,19 +28,11 @@ _log = logging.getLogger(__name__)
 # Parameterized as vendors.eft_transaction_type; this is the entity-level default.
 VENDOR_EFT_TRANSACTION_TYPE_DEFAULT = "470"
 
-# Bridlewood fallback EFT settings (mirrors routes/payroll.py constants)
-_EFT_ORIGINATOR_ID = "TPBHC10203"
-_EFT_SHORT_NAME = "BRIDLEWOOD HH"
-_EFT_LONG_NAME = "BRIDLEWOOD HOME HARDWARE"
-_EFT_RETURN_INSTITUTION = "0004"
-_EFT_RETURN_TRANSIT = "10202"
-_EFT_RETURN_ACCOUNT = "06905660371"
-
-
 def _resolve_eft_settings(session, entity_id: UUID) -> dict[str, str]:
-    """Read TD origination values from entity_settings, falling back to
-    the Bridlewood constants. Mirrors routes/payroll.py:_resolve_eft_settings.
-    TODO: lift both copies into a shared services_eft_shared.py module."""
+    """Read TD origination values from entity_settings. Raises HTTPException(400)
+    if any required field is missing — never silently falls back to another
+    entity's originator ID. Mirrors routes/payroll.py:_resolve_eft_settings."""
+    from fastapi import HTTPException
     row = session.execute(
         text("""
             SELECT td_originator_id, td_short_name, td_long_name,
@@ -51,14 +43,32 @@ def _resolve_eft_settings(session, entity_id: UUID) -> dict[str, str]:
         {"eid": str(entity_id)},
     ).mappings().first()
     row = dict(row) if row else {}
-    return {
-        "originator_id": row.get("td_originator_id") or _EFT_ORIGINATOR_ID,
-        "short_name": row.get("td_short_name") or _EFT_SHORT_NAME,
-        "long_name": row.get("td_long_name") or _EFT_LONG_NAME,
-        "return_institution": row.get("td_return_institution") or _EFT_RETURN_INSTITUTION,
-        "return_transit": row.get("td_return_transit") or _EFT_RETURN_TRANSIT,
-        "return_account": row.get("td_return_account") or _EFT_RETURN_ACCOUNT,
-    }
+    _REQUIRED = [
+        ("originator_id", "td_originator_id"),
+        ("short_name",    "td_short_name"),
+        ("long_name",     "td_long_name"),
+        ("return_institution", "td_return_institution"),
+        ("return_transit",     "td_return_transit"),
+        ("return_account",     "td_return_account"),
+    ]
+    result: dict[str, str] = {}
+    missing = []
+    for key, col in _REQUIRED:
+        val = row.get(col)
+        if not val:
+            missing.append(col)
+        else:
+            result[key] = val
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"EFT originator not configured for entity {entity_id}; "
+                f"missing entity_settings fields: {', '.join(missing)}. "
+                "Seed entity_settings before generating EFT files."
+            ),
+        )
+    return result
 
 
 def _next_file_creation_number(session, entity_id: UUID) -> int:

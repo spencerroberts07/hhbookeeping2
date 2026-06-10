@@ -19,8 +19,6 @@ from typing import Any
 
 from sqlalchemy import text
 
-FY_END_MONTH = 9
-FY_END_DAY = 30
 YE_DRAFT = "draft"
 YE_IN_REVIEW = "in_review"
 YE_FINAL_LOCKED = "final_locked"
@@ -37,26 +35,37 @@ def _D(v) -> Decimal:
     return Decimal(str(v or 0))
 
 
-def fy_of(d: date) -> int:
-    """Fiscal year a date falls in. Oct-Dec -> next calendar year; else same."""
-    return d.year + 1 if d.month >= (FY_END_MONTH + 1) else d.year
+def fy_of(d: date, fy_end_month: int = 9) -> int:
+    """Fiscal year a date falls in, given the fiscal year-end month.
+    Oct (month > 9) with default Sep FY → next calendar year; else same."""
+    return d.year + 1 if d.month >= (fy_end_month + 1) else d.year
 
 
-def is_fiscal_year_end(period_end: date) -> bool:
-    return period_end.month == FY_END_MONTH and period_end.day == FY_END_DAY
+def is_fiscal_year_end(period_end: date, fy_end_month: int = 9, fy_end_day: int = 30) -> bool:
+    return period_end.month == fy_end_month and period_end.day == fy_end_day
 
 
-def _entity_id(session, entity_code: str) -> str:
-    eid = session.execute(
-        text("SELECT id FROM entities WHERE entity_code=:ec"), {"ec": entity_code}
-    ).scalar()
-    if not eid:
+def _entity_fiscal(session, entity_code: str) -> tuple[str, int, int]:
+    """Return (entity_id, fiscal_year_end_month, fiscal_year_end_day).
+    Falls back to 9/30 if columns are NULL (shouldn't happen — NOT NULL with default)."""
+    row = session.execute(
+        text(
+            "SELECT id, fiscal_year_end_month, fiscal_year_end_day "
+            "FROM entities WHERE entity_code=:ec"
+        ),
+        {"ec": entity_code},
+    ).mappings().first()
+    if not row:
         raise YearEndError(f"entity {entity_code} not found")
-    return str(eid)
+    return (
+        str(row["id"]),
+        int(row["fiscal_year_end_month"] or 9),
+        int(row["fiscal_year_end_day"] or 30),
+    )
 
 
-def _september_period(session, entity_id: str, fy: int) -> dict[str, Any] | None:
-    ye_date = date(fy, FY_END_MONTH, FY_END_DAY)
+def _september_period(session, entity_id: str, fy: int, fy_end_month: int = 9, fy_end_day: int = 30) -> dict[str, Any] | None:
+    ye_date = date(fy, fy_end_month, fy_end_day)
     row = session.execute(
         text(
             """
@@ -71,12 +80,12 @@ def _september_period(session, entity_id: str, fy: int) -> dict[str, Any] | None
 
 
 def trigger_year_end(session, *, entity_code: str, period_end: str) -> dict[str, Any]:
-    """Called when a period closes. If it's the Sep year-end period, stamp
+    """Called when a period closes. If it's the fiscal year-end period, stamp
     year_end_status='draft' (only when currently NULL). No-op otherwise."""
     pe = date.fromisoformat(period_end)
-    if not is_fiscal_year_end(pe):
+    entity_id, fy_end_month, fy_end_day = _entity_fiscal(session, entity_code)
+    if not is_fiscal_year_end(pe, fy_end_month, fy_end_day):
         return {"triggered": False, "reason": "not a fiscal year-end period"}
-    entity_id = _entity_id(session, entity_code)
     updated = session.execute(
         text(
             """
@@ -88,14 +97,17 @@ def trigger_year_end(session, *, entity_code: str, period_end: str) -> dict[str,
         ),
         {"ye": YE_DRAFT, "e": entity_id, "pe": pe},
     ).first()
-    return {"triggered": bool(updated), "fy": fy_of(pe), "year_end_status": YE_DRAFT}
+    return {"triggered": bool(updated), "fy": fy_of(pe, fy_end_month), "year_end_status": YE_DRAFT}
 
 
 def get_year_end_status(session, *, entity_code: str, fy: int) -> dict[str, Any]:
-    entity_id = _entity_id(session, entity_code)
-    sep = _september_period(session, entity_id, fy)
-    fy_start = date(fy - 1, 10, 1)
-    fy_end = date(fy, 9, 30)
+    entity_id, fy_end_month, fy_end_day = _entity_fiscal(session, entity_code)
+    sep = _september_period(session, entity_id, fy, fy_end_month, fy_end_day)
+    # Fiscal year spans from (fy_end_month+1) of year fy-1 to fy_end_month/day of year fy
+    fy_start_month = fy_end_month % 12 + 1
+    fy_start_year = fy - 1 if fy_end_month < 12 else fy
+    fy_start = date(fy_start_year, fy_start_month, 1)
+    fy_end = date(fy, fy_end_month, fy_end_day)
     # all periods in the FY + how many are closed
     periods = session.execute(
         text(
@@ -137,10 +149,10 @@ def set_year_end_status(session, *, entity_code: str, fy: int, new_status: str,
                         actor: str | None = None) -> dict[str, Any]:
     if new_status not in _VALID_YE:
         raise YearEndError(f"invalid year_end_status {new_status!r}")
-    entity_id = _entity_id(session, entity_code)
-    sep = _september_period(session, entity_id, fy)
+    entity_id, fy_end_month, fy_end_day = _entity_fiscal(session, entity_code)
+    sep = _september_period(session, entity_id, fy, fy_end_month, fy_end_day)
     if not sep:
-        raise YearEndError(f"no September period for FY{fy}")
+        raise YearEndError(f"no fiscal year-end period for FY{fy}")
     current = sep["year_end_status"]
     if current is None:
         raise YearEndError("year-end not triggered yet (close the September period first)")
@@ -169,10 +181,10 @@ def post_adjusting_je(
     move to in_review first). Never posts to 3900 equity. Posts directly (status
     'posted') into the closed September period — the soft-close flag is the gate,
     not the normal period lock."""
-    entity_id = _entity_id(session, entity_code)
-    sep = _september_period(session, entity_id, fy)
+    entity_id, fy_end_month, fy_end_day = _entity_fiscal(session, entity_code)
+    sep = _september_period(session, entity_id, fy, fy_end_month, fy_end_day)
     if not sep:
-        raise YearEndError(f"no September period for FY{fy}")
+        raise YearEndError(f"no fiscal year-end period for FY{fy}")
     if sep["year_end_status"] != YE_IN_REVIEW:
         raise YearEndError(
             f"year-end is '{sep['year_end_status']}'; adjusting entries require 'in_review'"

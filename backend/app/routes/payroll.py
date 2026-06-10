@@ -890,21 +890,10 @@ def put_update_employee(
 # ----------------------------------------------------------------------
 
 
-# TD-issued 10-character originator ID. Provided by Spencer / TD's
-# EFT origination setup. Must be exactly 10 chars for CPA-005.
-EFT_ORIGINATOR_ID = "TPBHC10203"
-EFT_SHORT_NAME = "BRIDLEWOOD HH"
-EFT_LONG_NAME = "BRIDLEWOOD HOME HARDWARE"
-# Return-credit routing — where TD credits funds back if an EFT is
-# undeliverable. Bridlewood's operating account at TD.
-EFT_RETURN_INSTITUTION = "0004"
-EFT_RETURN_TRANSIT = "10202"
-EFT_RETURN_ACCOUNT = "06905660371"
-
-
 def _resolve_eft_settings(session, entity_id) -> dict[str, str]:
-    """TD origination values from entity_settings (Phase 6B), falling back to the
-    hard-coded Bridlewood constants so behaviour is unchanged until populated."""
+    """TD origination values from entity_settings. Raises HTTP 400 if any
+    required field is missing — never silently falls back to another entity's
+    originator ID."""
     from sqlalchemy import text as _t
     row = session.execute(
         _t("""SELECT td_originator_id, td_short_name, td_long_name,
@@ -913,14 +902,32 @@ def _resolve_eft_settings(session, entity_id) -> dict[str, str]:
         {"e": entity_id},
     ).mappings().first()
     row = dict(row) if row else {}
-    return {
-        "originator_id": row.get("td_originator_id") or EFT_ORIGINATOR_ID,
-        "short_name": row.get("td_short_name") or EFT_SHORT_NAME,
-        "long_name": row.get("td_long_name") or EFT_LONG_NAME,
-        "return_institution": row.get("td_return_institution") or EFT_RETURN_INSTITUTION,
-        "return_transit": row.get("td_return_transit") or EFT_RETURN_TRANSIT,
-        "return_account": row.get("td_return_account") or EFT_RETURN_ACCOUNT,
-    }
+    _REQUIRED = [
+        ("originator_id", "td_originator_id"),
+        ("short_name",    "td_short_name"),
+        ("long_name",     "td_long_name"),
+        ("return_institution", "td_return_institution"),
+        ("return_transit",     "td_return_transit"),
+        ("return_account",     "td_return_account"),
+    ]
+    result: dict[str, str] = {}
+    missing = []
+    for key, col in _REQUIRED:
+        val = row.get(col)
+        if not val:
+            missing.append(col)
+        else:
+            result[key] = val
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"EFT originator not configured for entity {entity_id}; "
+                f"missing entity_settings fields: {', '.join(missing)}. "
+                "Seed entity_settings before generating EFT files."
+            ),
+        )
+    return result
 
 
 def _create_cra_remittance_draft(session, *, entity_id, run, actor_email) -> dict[str, Any]:
@@ -1266,7 +1273,9 @@ _FEB_PERIOD_5_TARGETS = {
 
 
 @router.get("/validate-feb-2026")
-def get_validate_feb_2026(entity_code: str = Query(default="1877-8")) -> dict[str, Any]:
+def get_validate_feb_2026(entity_code: str | None = Query(default=None)) -> dict[str, Any]:
+    if not entity_code:
+        raise HTTPException(status_code=400, detail="entity_code query parameter is required")
     """
     Compare the latest stored payroll_runs in Feb 2026 against the
     known register actuals. Reports per-line variance for the

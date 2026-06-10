@@ -69,18 +69,20 @@ def is_professional(plan_tier: str | None) -> bool:
     return plan_tier in {"professional", "internal"}
 
 
-def _is_internal_by_code(entity_code: str | None) -> bool:
-    """Safety-net check against the INTERNAL_ENTITY_CODES list and the
-    DEMO-* prefix. Lets an entity be treated as internal even when no
-    billing_subscriptions row has been seeded yet.
+def _is_internal_by_code(session, entity_code: str | None) -> bool:
+    """Check entities.is_internal from DB + DEMO-* prefix guard.
+    An entity with is_internal=TRUE bypasses Stripe. DEMO-* prefix
+    is a secondary guard for ad-hoc demo entities without a DB row.
     """
     if not entity_code:
         return False
-    if entity_code in (settings.internal_entity_codes or []):
-        return True
     if entity_code.upper().startswith("DEMO-"):
         return True
-    return False
+    row = session.execute(
+        text("SELECT is_internal FROM entities WHERE entity_code = :code"),
+        {"code": entity_code},
+    ).mappings().first()
+    return bool(row and row["is_internal"])
 
 
 def _internal_subscription_payload(entity_code: str) -> dict[str, Any]:
@@ -277,14 +279,14 @@ def get_subscription_for_entity(
     has no subscription yet (e.g. mid-trial-signup or post-cancel).
 
     Internal-tier entities short-circuit before any Stripe state is
-    consulted: any entity in settings.internal_entity_codes (or with a
-    'DEMO-' prefix) gets a synthetic internal payload even if no
-    billing_subscriptions row exists. This is the safety net for owner
-    + demo stores that should never hit Stripe.
+    consulted: entities with is_internal=TRUE in the DB (or a 'DEMO-' prefix)
+    get a synthetic internal payload even if no billing_subscriptions row
+    exists. This is the safety net for owner + demo stores that should never
+    hit Stripe.
     """
-    # Safety-net fallback — checked first so configuration drift can't
-    # accidentally bill an owner/demo entity.
-    if _is_internal_by_code(entity_code):
+    # Safety-net fallback — checked first so a misconfigured entity can't
+    # accidentally be billed as a real dealer.
+    if _is_internal_by_code(session, entity_code):
         return _internal_subscription_payload(entity_code)
 
     entity = session.execute(

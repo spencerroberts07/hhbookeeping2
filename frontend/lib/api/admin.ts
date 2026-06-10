@@ -17,8 +17,10 @@ export interface DealerListRow {
 }
 
 // TODO: backend endpoint not built — GET /api/admin/dealers
+// When built, the real endpoint must query entities from the DB — entity_code must NOT be hardcoded here.
 export async function listDealers(): Promise<{ dealers: DealerListRow[] }> {
   await new Promise((r) => setTimeout(r, 250));
+  // STUB: hardcoded until GET /api/admin/dealers is implemented
   return {
     dealers: [
       {

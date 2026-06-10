@@ -115,12 +115,12 @@ def _internal_guard_payload(entity_code: str) -> dict[str, Any] | None:
     """Return the internal-tier short-circuit payload when the entity
     should never touch Stripe. None means "carry on with normal flow."
 
-    Checks the safety-net list first (covers entities without a DB
-    row), then the explicit billing_subscriptions row.
+    Checks entities.is_internal (DB flag from migration 066) first,
+    then the explicit billing_subscriptions plan_tier row.
     """
-    if _is_internal_by_code(entity_code):
-        return _internal_subscription_payload(entity_code)
     with db_session() as session:
+        if _is_internal_by_code(session, entity_code):
+            return _internal_subscription_payload(entity_code)
         row = session.execute(
             text(
                 """

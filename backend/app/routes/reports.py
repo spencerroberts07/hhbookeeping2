@@ -46,18 +46,12 @@ from ..services_storage import storage_service
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
-# Bridlewood fiscal year ends Sep 30 — months Oct-Dec roll into the
-# next FY number (e.g., Oct 2025 is FY2026 P01). Hardcoded for now;
-# per-entity FY config can come later.
-_FY_END_MONTH = 9
+def _fy_of(d: DateType, fy_end_month: int = 9) -> int:
+    return d.year + 1 if d.month > fy_end_month else d.year
 
 
-def _fy_of(d: DateType) -> int:
-    return d.year + 1 if d.month > _FY_END_MONTH else d.year
-
-
-def _fy_start(fy: int) -> DateType:
-    return DateType(fy - 1, _FY_END_MONTH + 1, 1)
+def _fy_start(fy: int, fy_end_month: int = 9) -> DateType:
+    return DateType(fy - 1, fy_end_month % 12 + 1, 1)
 
 
 def _last_day_of_month(d: DateType) -> DateType:
@@ -323,7 +317,10 @@ def _account_sums(
 
 def _resolve_entity(session, entity_code: str) -> dict[str, Any]:
     entity = session.execute(
-        text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code = :ec"),
+        text(
+            "SELECT id, entity_code, entity_name, fiscal_year_end_month, fiscal_year_end_day "
+            "FROM entities WHERE entity_code = :ec"
+        ),
         {"ec": entity_code},
     ).mappings().first()
     if not entity:
@@ -367,6 +364,7 @@ def _resolve_preset_range(
     period_end: DateType | None,
     date_from: DateType | None,
     date_to: DateType | None,
+    fy_end_month: int = 9,
 ) -> tuple[DateType, DateType, str, str]:
     """Returns (current_start, current_end, current_label, prior_label).
     Prior range is always the same span shifted back 12 months."""
@@ -392,9 +390,9 @@ def _resolve_preset_range(
         return cur_start, pe, month_name, _shift_by_months(pe, -12).strftime("%b %Y")
 
     if preset == "ytd":
-        fy = _fy_of(pe)
-        cur_start = _fy_start(fy)
-        prior_start = _fy_start(fy - 1)
+        fy = _fy_of(pe, fy_end_month)
+        cur_start = _fy_start(fy, fy_end_month)
+        prior_start = _fy_start(fy - 1, fy_end_month)
         prior_end = _shift_by_months(pe, -12)
         return (
             cur_start,
@@ -415,7 +413,7 @@ def _resolve_preset_range(
     if preset == "qtd":
         cur_start = _fiscal_quarter_start(pe)
         q = _fiscal_quarter_number(pe)
-        fy = _fy_of(pe)
+        fy = _fy_of(pe, fy_end_month)
         return (
             cur_start,
             pe,
@@ -693,14 +691,14 @@ def get_income_statement(
     if dt and df and dt < df:
         raise HTTPException(400, "date_to must be on or after date_from")
 
-    cur_start, cur_end, period_label, prior_label = _resolve_preset_range(
-        preset, pe, df, dt,
-    )
-    prior_start = _shift_by_months(cur_start, -12)
-    prior_end = _shift_by_months(cur_end, -12)
-
     with db_session() as session:
         entity = _resolve_entity(session, entity_code)
+        fy_end_month = int(entity.get("fiscal_year_end_month") or 9)
+        cur_start, cur_end, period_label, prior_label = _resolve_preset_range(
+            preset, pe, df, dt, fy_end_month,
+        )
+        prior_start = _shift_by_months(cur_start, -12)
+        prior_end = _shift_by_months(cur_end, -12)
         cur_rows = _is_account_sums(
             session, entity_id=entity["id"],
             period_start=cur_start, period_end=cur_end,

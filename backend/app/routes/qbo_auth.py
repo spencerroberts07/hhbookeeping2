@@ -27,7 +27,9 @@ router = APIRouter(prefix="/api/auth/quickbooks", tags=["quickbooks-auth"])
 
 
 @router.get("/connect", response_model=ConnectResponse)
-def start_connect(entity_code: str = Query(default="1877-8")) -> ConnectResponse:
+def start_connect(entity_code: str | None = Query(default=None)) -> ConnectResponse:
+    if not entity_code:
+        raise HTTPException(status_code=400, detail="entity_code query parameter is required")
     qb = QuickBooksClient()
     state = qb.new_state()
     with db_session() as session:
@@ -57,8 +59,10 @@ async def callback(
     code: str,
     realmId: str,
     state: str,
-    entity_code: str = Query(default="1877-8"),
+    entity_code: str | None = Query(default=None),
 ):
+    if not entity_code:
+        raise HTTPException(status_code=400, detail="entity_code query parameter is required")
     try:
         with db_session() as session:
             # Verify-and-consume the state row. A missing or expired

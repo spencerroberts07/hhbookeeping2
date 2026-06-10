@@ -16,7 +16,9 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
 @router.get("/quickbooks-status", response_model=DashboardResponse)
-def quickbooks_status(entity_code: str = Query(default="1877-8")) -> DashboardResponse:
+def quickbooks_status(entity_code: str | None = Query(default=None)) -> DashboardResponse:
+    if not entity_code:
+        raise HTTPException(status_code=400, detail="entity_code query parameter is required")
     try:
         with db_session() as session:
             entity = get_entity_by_code(session, entity_code)

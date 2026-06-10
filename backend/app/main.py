@@ -58,7 +58,17 @@ from .routes.ap_alerts import router as ap_alerts_router
 from .routes.wage_planner import router as wage_planner_router
 from .schemas import HealthResponse
 
-app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.7.0")
+app = FastAPI(title="BookWize API", version="0.7.0")
+
+from fastapi import Request  # noqa: E402 — placed here to stay near the handler
+from fastapi.responses import JSONResponse
+from .services_payroll_calc import UnsupportedProvinceError
+
+
+@app.exception_handler(UnsupportedProvinceError)
+async def _unsupported_province_handler(request: Request, exc: UnsupportedProvinceError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
 
 # --------------------------------------------------------------------------
 # CORS — Clerk-issued session tokens come from a browser. The frontend

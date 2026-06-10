@@ -99,6 +99,11 @@ ON_BRACKETS = [
 ]
 
 
+class UnsupportedProvinceError(Exception):
+    """Raised when a payroll calculation is requested for a province that
+    does not yet have a provincial tax bracket table. Surfaces as HTTP 400."""
+
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -340,8 +345,9 @@ def calculate_federal_tax(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
 
-    # Provincial (Ontario only for Bridlewood)
-    if province.upper() == "ON":
+    # Provincial tax — Ontario only (Phase 1). Non-ON raises loudly.
+    prov_upper = province.upper()
+    if prov_upper == "ON":
         prov_gross_tax = _apply_brackets(annual_taxable, ON_BRACKETS)
         prov_credit = (
             _claim_amount(ON_BPA_2026, provincial_td1_claim_code) * Decimal("0.0505")
@@ -351,7 +357,11 @@ def calculate_federal_tax(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
     else:
-        prov_periodic = Decimal("0.00")
+        raise UnsupportedProvinceError(
+            f"provincial tax not implemented for province '{prov_upper}'; "
+            "only ON is supported (Phase 1). Add provincial bracket table before "
+            "running payroll for non-Ontario employees."
+        )
 
     total_before_cap = fed_periodic + prov_periodic + addl_fed + addl_prov
     # Hard cap: never withhold more than gross.

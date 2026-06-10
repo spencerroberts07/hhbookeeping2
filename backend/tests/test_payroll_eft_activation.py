@@ -41,7 +41,23 @@ def test_eft_settings_resolved_from_entity_settings():
     with db_session() as s:
         eid = s.execute(text("SELECT id FROM entities WHERE entity_code='1877-8'")).scalar()
         cfg = _resolve_eft_settings(s, eid)
-    # seeded in migration 051 — sourced from the table, not the hard-coded fallback
+    # seeded in migration 051 — values come from entity_settings row, not constants
     assert cfg["originator_id"] == "TPBHC10203"
     assert cfg["short_name"] == "BRIDLEWOOD HH"
     assert cfg["return_account"] == "06905660371"
+
+
+@pytest.mark.skipif(not _has_db(), reason="no live DB connection")
+def test_eft_settings_missing_raises_400():
+    """Entity with no entity_settings row must raise HTTP 400 (not silently use Bridlewood's originator)."""
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    from app.db import db_session
+    from app.routes.payroll import _resolve_eft_settings
+    with db_session() as s:
+        # Use a synthetic UUID that will never match an entity_settings row
+        fake_eid = "00000000-0000-0000-0000-000000000001"
+        with pytest.raises(HTTPException) as exc_info:
+            _resolve_eft_settings(s, fake_eid)
+    assert exc_info.value.status_code == 400
+    assert "EFT originator not configured" in exc_info.value.detail

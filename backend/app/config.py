@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # for explicit sandbox testing against an Intuit-issued sandbox realm.
     qbo_api_base_url: str = "https://quickbooks.api.intuit.com"
     qbo_minor_version: str = "75"
-    default_entity_code: str = "1877-8"
+
     google_sheets_service_account_email: str = "replace_me"
     google_sheets_private_key: str = "replace_me"
     google_sheets_spreadsheet_id: str = "replace_me"
@@ -91,19 +91,6 @@ class Settings(BaseSettings):
     # entirely (any X-Cron-Secret header is then rejected).
     cron_secret: str = ""
 
-    # Internal-tier entities. Any entity in this list is treated as
-    # plan_tier='internal' (all Professional features, no Stripe) even
-    # if no billing_subscriptions row exists — fallback safety net.
-    #
-    # Add new owner/demo entity codes here. The DB seed in migration 031
-    # also marks the explicit billing_subscriptions row for Bridlewood
-    # as 'internal'; this list is the second line of defence.
-    #
-    # TODO: Replace with real Stripe subscription when an entity in this
-    # list is ready to be billed. Remove the code from this list AND
-    # delete its billing_subscriptions row with plan_tier='internal',
-    # then run the dealer through /settings/billing checkout flow.
-    internal_entity_codes: list[str] = ["1877-8"]
 
     @property
     def r2_enabled(self) -> bool:
