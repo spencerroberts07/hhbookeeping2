@@ -450,6 +450,8 @@ class PayrollLineResult:
     gross_pay: Decimal = Decimal("0.00")
     taxable_gross: Decimal = Decimal("0.00")
     fed_tax: Decimal = Decimal("0.00")
+    federal_tax: Decimal = Decimal("0.00")
+    provincial_tax: Decimal = Decimal("0.00")
     cpp_ee: Decimal = Decimal("0.00")
     cpp_er: Decimal = Decimal("0.00")
     ei_ee: Decimal = Decimal("0.00")
@@ -579,6 +581,8 @@ def calculate_employee_payroll(
         province=str(employee.get("province") or "ON"),
     )
     line.fed_tax = tax["fed_tax"]
+    line.federal_tax = tax["federal_only"]
+    line.provincial_tax = tax["provincial_only"]
 
     # ------------------------------------------------------------------
     # Vacation accrual + net pay

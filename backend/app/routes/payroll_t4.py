@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from ..db import db_session
+from ..services import get_entity_by_code
 from ..services_auth import require_role
 from ..services_payroll_t4 import compute_t4_figures, generate_t4_pdf
 
@@ -28,8 +29,9 @@ _BOX_DERIVABILITY = [
     ("16", "Employee CPP", "derivable", "SUM(cpp_ee)."),
     ("17", "Employee CPP2", "missing", "Engine does not compute CPP2 yet — reported as 0.00."),
     ("18", "Employee EI premiums", "derivable", "SUM(ei_ee)."),
-    ("22", "Income tax deducted", "partial",
-     "FEDERAL ONLY — provincial (ON) income tax is not stored separately; Box 22 is understated."),
+    ("22", "Income tax deducted", "derivable",
+     "SUM(fed_tax) — combined federal + Ontario provincial. "
+     "Individual federal_tax / provincial_tax split stored in migration 064 for reporting."),
     ("24", "EI insurable earnings", "derivable", "SUM(gross - life benefit), capped."),
     ("26", "CPP pensionable earnings", "derivable", "SUM(taxable_gross), capped."),
     ("40", "Other taxable benefits", "derivable", "SUM(life_taxable_benefit)."),
@@ -38,17 +40,14 @@ _BOX_DERIVABILITY = [
 ]
 
 _T4_CAVEATS = [
-    "Box 22 income tax is FEDERAL ONLY — provincial (ON) income tax is not available; review before filing.",
+    "Box 22 income tax is the combined federal + provincial amount — correct for CRA T4 filing.",
     "Box 17 CPP2 = $0.00 — not computed by the engine.",
     "SIN is not included — add before CRA filing.",
 ]
 
 
 def _entity(session, entity_code: str) -> dict[str, Any]:
-    row = session.execute(
-        text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code=:ec"),
-        {"ec": entity_code},
-    ).mappings().first()
+    row = get_entity_by_code(session, entity_code)
     if not row:
         raise HTTPException(404, "entity not found")
     return dict(row)

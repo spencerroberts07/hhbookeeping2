@@ -31,14 +31,11 @@ from typing import Any
 
 from sqlalchemy import text
 
+from .services import format_entity_address
 from .services_payroll_calc import (
     CPP_MAX_EARNINGS_ANNUAL,
     EI_MAX_INSURABLE_ANNUAL,
 )
-
-
-BRIDLEWOOD_ADDRESS_LINE = "90 Michael Cowpland Dr, Kanata ON K2M 1P6"
-PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
 
 
 @dataclass
@@ -200,8 +197,8 @@ def generate_t4_pdf(
             [
                 Paragraph(
                     f"<b>Employer:</b><br/>{entity_name}<br/>"
-                    f"{BRIDLEWOOD_ADDRESS_LINE}<br/>"
-                    f"BN: {PAYROLL_BUSINESS_NUMBER}",
+                    f"{format_entity_address(entity)}<br/>"
+                    f"BN: {entity.get('payroll_business_number') or ''}",
                     body,
                 ),
                 Paragraph(

@@ -21,9 +21,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
+from .services import format_entity_address
 
-BRIDLEWOOD_ADDRESS_LINE = "90 Michael Cowpland Dr, Kanata ON K2M 1P6"
-PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
 HISTORY_PERIODS_ON_LETTER = 12
 
 
@@ -95,8 +94,8 @@ def generate_employment_record(
     entity_name = entity.get("entity_name") or "Employer"
     el.append(Paragraph(entity_name.upper(), h1))
     el.append(Paragraph("Employment &amp; Income Verification", body))
-    el.append(Paragraph(BRIDLEWOOD_ADDRESS_LINE, addr))
-    el.append(Paragraph(f"BN: {PAYROLL_BUSINESS_NUMBER}", addr))
+    el.append(Paragraph(format_entity_address(entity), addr))
+    el.append(Paragraph(f"BN: {entity.get('payroll_business_number') or ''}", addr))
     el.append(Spacer(1, 14))
 
     el.append(Paragraph(

@@ -33,7 +33,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID
 
@@ -47,7 +47,11 @@ from .services import (
 )
 from .services_payroll_calc import (
     BIWEEKLY_PERIODS,
+    ON_BPA_2026,
+    ON_BRACKETS,
     PayrollLineResult,
+    _apply_brackets,
+    _claim_amount,
     calculate_employee_payroll,
 )
 
@@ -69,6 +73,23 @@ ACCOUNT_BANK = "1020"
 # Bridlewood's GL for "Income Tax Payable" (corporate income tax), so
 # we use 2320 instead.
 ACCOUNT_CRA_PAYABLE = "2320"
+
+
+def _derive_prov_tax(
+    taxable_gross: Decimal, pay_periods: int, provincial_td1_claim_code: int = 1
+) -> Decimal:
+    """Approximate Ontario provincial tax for a single pay period from taxable_gross.
+    Used on the register path where the ENetEmployer PDF only carries a combined FED TAX.
+    Caller maintains: federal_tax = max(0, fed_tax - result)."""
+    annual = (taxable_gross * Decimal(pay_periods)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    prov_gross = _apply_brackets(annual, ON_BRACKETS)
+    prov_credit = _claim_amount(ON_BPA_2026, provincial_td1_claim_code) * Decimal("0.0505")
+    prov_annual = max(Decimal("0.00"), prov_gross - prov_credit)
+    return (prov_annual / Decimal(pay_periods)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
 
 
 def _money(value: Any) -> Decimal:
@@ -981,6 +1002,8 @@ def _build_payroll_run_from_parsed(
         "gross": Decimal("0.00"),
         "net_pay": Decimal("0.00"),
         "fed_tax": Decimal("0.00"),
+        "federal_tax": Decimal("0.00"),
+        "provincial_tax": Decimal("0.00"),
         "cpp_ee": Decimal("0.00"),
         "cpp_er": Decimal("0.00"),
         "ei_ee": Decimal("0.00"),
@@ -999,6 +1022,8 @@ def _build_payroll_run_from_parsed(
         totals["gross"] += r.gross_pay
         totals["net_pay"] += r.net_pay
         totals["fed_tax"] += r.fed_tax
+        totals["federal_tax"] += r.federal_tax
+        totals["provincial_tax"] += r.provincial_tax
         totals["cpp_ee"] += r.cpp_ee
         totals["cpp_er"] += r.cpp_er
         totals["ei_ee"] += r.ei_ee
@@ -1045,6 +1070,7 @@ def _build_payroll_run_from_parsed(
                 status, workflow_status,
                 active_employees, paid_employees,
                 total_gross, total_net_pay, total_fed_tax,
+                total_federal_tax, total_provincial_tax,
                 total_cpp_ee, total_cpp_er, total_ei_ee, total_ei_er,
                 total_life_taxable, total_vacation_earned, total_vacation_paid,
                 total_stat_pay, cra_remittance_amount,
@@ -1055,6 +1081,7 @@ def _build_payroll_run_from_parsed(
                 'draft_estimated', 'draft_ready',
                 :active_employees, :paid_employees,
                 :total_gross, :total_net_pay, :total_fed_tax,
+                :total_federal_tax, :total_provincial_tax,
                 :total_cpp_ee, :total_cpp_er, :total_ei_ee, :total_ei_er,
                 :total_life_taxable, :total_vacation_earned, :total_vacation_paid,
                 :total_stat_pay, :cra_remittance_amount,
@@ -1073,6 +1100,8 @@ def _build_payroll_run_from_parsed(
                 total_gross = EXCLUDED.total_gross,
                 total_net_pay = EXCLUDED.total_net_pay,
                 total_fed_tax = EXCLUDED.total_fed_tax,
+                total_federal_tax = EXCLUDED.total_federal_tax,
+                total_provincial_tax = EXCLUDED.total_provincial_tax,
                 total_cpp_ee = EXCLUDED.total_cpp_ee,
                 total_cpp_er = EXCLUDED.total_cpp_er,
                 total_ei_ee = EXCLUDED.total_ei_ee,
@@ -1105,6 +1134,8 @@ def _build_payroll_run_from_parsed(
             "total_gross": totals["gross"],
             "total_net_pay": totals["net_pay"],
             "total_fed_tax": totals["fed_tax"],
+            "total_federal_tax": totals["federal_tax"],
+            "total_provincial_tax": totals["provincial_tax"],
             "total_cpp_ee": totals["cpp_ee"],
             "total_cpp_er": totals["cpp_er"],
             "total_ei_ee": totals["ei_ee"],
@@ -1137,7 +1168,8 @@ def _build_payroll_run_from_parsed(
                     week1_hours, week2_hours, total_hours, hourly_rate,
                     reg_hours_pay, overtime_pay, salary_pay, stat_pay,
                     vacation_paid, gross_pay, taxable_gross,
-                    fed_tax, cpp_ee, cpp_er, ei_ee, ei_er,
+                    fed_tax, federal_tax, provincial_tax,
+                    cpp_ee, cpp_er, ei_ee, ei_er,
                     life_taxable_benefit, vacation_earned, net_pay,
                     is_on_vacation, notes
                 ) VALUES (
@@ -1145,7 +1177,8 @@ def _build_payroll_run_from_parsed(
                     :week1_hours, :week2_hours, :total_hours, :hourly_rate,
                     :reg_hours_pay, :overtime_pay, :salary_pay, :stat_pay,
                     :vacation_paid, :gross_pay, :taxable_gross,
-                    :fed_tax, :cpp_ee, :cpp_er, :ei_ee, :ei_er,
+                    :fed_tax, :federal_tax, :provincial_tax,
+                    :cpp_ee, :cpp_er, :ei_ee, :ei_er,
                     :life_taxable_benefit, :vacation_earned, :net_pay,
                     :is_on_vacation, :notes
                 )
@@ -1167,6 +1200,8 @@ def _build_payroll_run_from_parsed(
                 "gross_pay": r.gross_pay,
                 "taxable_gross": r.taxable_gross,
                 "fed_tax": r.fed_tax,
+                "federal_tax": r.federal_tax,
+                "provincial_tax": r.provincial_tax,
                 "cpp_ee": r.cpp_ee,
                 "cpp_er": r.cpp_er,
                 "ei_ee": r.ei_ee,
@@ -1660,6 +1695,26 @@ def build_payroll_run_from_register(
         session, entity["id"], period_end
     )
 
+    # Pre-compute derived federal/provincial tax split per line.
+    # The register PDF carries only a combined FED TAX; we approximate
+    # provincial_tax from taxable_gross via ON brackets and derive
+    # federal_tax = max(0, fed_tax - provincial_tax).
+    _reg_derived: list[tuple[Decimal, Decimal]] = []  # (federal_tax, provincial_tax)
+    for _r, _emp in matched:
+        _gross = _r.gross_pay or (
+            _r.reg_hours_amount + _r.salary_amount + _r.overtime_amount
+            + _r.stat_pay_amount + _r.vacation_amount
+        )
+        _taxable = _gross + _r.life_taxable
+        _prov_t = _derive_prov_tax(
+            _taxable, BIWEEKLY_PERIODS,
+            int(_emp.get("provincial_td1_claim_code") or 1),
+        )
+        _fed_t = max(Decimal("0.00"), _r.fed_tax - _prov_t)
+        _reg_derived.append((_fed_t, _prov_t))
+    _total_federal_tax = sum((x[0] for x in _reg_derived), Decimal("0.00"))
+    _total_provincial_tax = sum((x[1] for x in _reg_derived), Decimal("0.00"))
+
     # Totals — use SUMMARY values from the register so we match
     # ENetEmployer's printed totals exactly. Cross-check against
     # per-employee sums as a sanity warning.
@@ -1715,6 +1770,7 @@ def build_payroll_run_from_register(
                 status, workflow_status,
                 active_employees, paid_employees,
                 total_gross, total_net_pay, total_fed_tax,
+                total_federal_tax, total_provincial_tax,
                 total_cpp_ee, total_cpp_er, total_ei_ee, total_ei_er,
                 total_life_taxable, total_vacation_earned, total_vacation_paid,
                 total_stat_pay, cra_remittance_amount,
@@ -1725,6 +1781,7 @@ def build_payroll_run_from_register(
                 'draft_confirmed', 'draft_ready',
                 :active_employees, :paid_employees,
                 :total_gross, :total_net_pay, :total_fed_tax,
+                :total_federal_tax, :total_provincial_tax,
                 :total_cpp_ee, :total_cpp_er, :total_ei_ee, :total_ei_er,
                 :total_life_taxable, :total_vacation_earned, :total_vacation_paid,
                 :total_stat_pay, :cra_remittance_amount,
@@ -1743,6 +1800,8 @@ def build_payroll_run_from_register(
                 total_gross = EXCLUDED.total_gross,
                 total_net_pay = EXCLUDED.total_net_pay,
                 total_fed_tax = EXCLUDED.total_fed_tax,
+                total_federal_tax = EXCLUDED.total_federal_tax,
+                total_provincial_tax = EXCLUDED.total_provincial_tax,
                 total_cpp_ee = EXCLUDED.total_cpp_ee,
                 total_cpp_er = EXCLUDED.total_cpp_er,
                 total_ei_ee = EXCLUDED.total_ei_ee,
@@ -1775,6 +1834,8 @@ def build_payroll_run_from_register(
             "total_gross": totals["gross"],
             "total_net_pay": totals["net_pay"],
             "total_fed_tax": totals["fed_tax"],
+            "total_federal_tax": _total_federal_tax,
+            "total_provincial_tax": _total_provincial_tax,
             "total_cpp_ee": totals["cpp_ee"],
             "total_cpp_er": totals["cpp_er"],
             "total_ei_ee": totals["ei_ee"],
@@ -1796,7 +1857,7 @@ def build_payroll_run_from_register(
         {"id": payroll_run_id},
     )
     line_records: list[dict[str, Any]] = []
-    for r, emp in matched:
+    for _idx, (r, emp) in enumerate(matched):
         gross = r.gross_pay or (
             r.reg_hours_amount + r.salary_amount + r.overtime_amount
             + r.stat_pay_amount + r.vacation_amount
@@ -1814,7 +1875,8 @@ def build_payroll_run_from_register(
                     week1_hours, week2_hours, total_hours, hourly_rate,
                     reg_hours_pay, overtime_pay, salary_pay, stat_pay,
                     vacation_paid, gross_pay, taxable_gross,
-                    fed_tax, cpp_ee, cpp_er, ei_ee, ei_er,
+                    fed_tax, federal_tax, provincial_tax,
+                    cpp_ee, cpp_er, ei_ee, ei_er,
                     life_taxable_benefit, vacation_earned, net_pay,
                     is_on_vacation, notes
                 ) VALUES (
@@ -1822,7 +1884,8 @@ def build_payroll_run_from_register(
                     :week1_hours, :week2_hours, :total_hours, :hourly_rate,
                     :reg_hours_pay, :overtime_pay, :salary_pay, :stat_pay,
                     :vacation_paid, :gross_pay, :taxable_gross,
-                    :fed_tax, :cpp_ee, :cpp_er, :ei_ee, :ei_er,
+                    :fed_tax, :federal_tax, :provincial_tax,
+                    :cpp_ee, :cpp_er, :ei_ee, :ei_er,
                     :life_taxable_benefit, :vacation_earned, :net_pay,
                     :is_on_vacation, :notes
                 )
@@ -1844,6 +1907,8 @@ def build_payroll_run_from_register(
                 "gross_pay": gross,
                 "taxable_gross": taxable,
                 "fed_tax": r.fed_tax,
+                "federal_tax": _reg_derived[_idx][0],
+                "provincial_tax": _reg_derived[_idx][1],
                 "cpp_ee": r.cpp_ee,
                 "cpp_er": r.cpp_er,
                 "ei_ee": r.ei_ee,

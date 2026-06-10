@@ -466,8 +466,13 @@ def post_build_journal(
     _user: dict = Depends(require_role("bookkeeper")),
 ) -> dict[str, Any]:
     enforce_entity_code(_user, body.entity_code)
+    from ..services import get_entity_by_code as _gec5, resolve_payroll_bn as _bn2
     try:
         with db_session() as session:
+            _ent = _gec5(session, body.entity_code)
+            if not _ent:
+                raise ValueError(f"Unknown entity: {body.entity_code}")
+            _payroll_bn = _bn2(dict(_ent))
             result = build_payroll_journal(
                 session,
                 entity_code=body.entity_code,
@@ -478,13 +483,14 @@ def post_build_journal(
             # constraint on payroll_run_id; we ON CONFLICT update so
             # rebuilds after edits stay consistent.
             _backfill_cra_breakdown(session, payroll_run_id=payroll_run_id,
-                                    entity_code=body.entity_code)
+                                    entity_code=body.entity_code,
+                                    business_number=_payroll_bn)
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _backfill_cra_breakdown(session, *, payroll_run_id: str, entity_code: str) -> None:
+def _backfill_cra_breakdown(session, *, payroll_run_id: str, entity_code: str, business_number: str) -> None:
     """Write/refresh the payroll_cra_breakdowns row for this run. Called
     after build_payroll_journal so the snapshot lines up with the
     journal totals. Best-effort: a failure here logs but does not roll
@@ -536,7 +542,7 @@ def _backfill_cra_breakdown(session, *, payroll_run_id: str, entity_code: str) -
             ),
             {
                 "eid": run["entity_id"], "rid": payroll_run_id,
-                "bn": PAYROLL_BUSINESS_NUMBER,
+                "bn": business_number,
                 "ps": run["period_start"], "pe": run["period_end"],
                 "pd": run["pay_date"],
                 "gross": run["total_gross"] or 0,
@@ -879,13 +885,11 @@ def put_update_employee(
 # audit row written to payroll_eft_files; presigned URL surfaced via
 # the matching GET endpoint.
 #
-# Bridlewood's payroll BN is the only one configured for now. When
-# additional entities go live, move this to a per-entity setting.
+# EFT settings are resolved per-entity from entity_settings (see _resolve_eft_settings).
+# Payroll BN is resolved per-entity from entities.payroll_business_number (see resolve_payroll_bn).
 # ----------------------------------------------------------------------
 
 
-# TODO: Move to entities table when additional dealers come online.
-PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
 # TD-issued 10-character originator ID. Provided by Spencer / TD's
 # EFT origination setup. Must be exactly 10 chars for CPA-005.
 EFT_ORIGINATOR_ID = "TPBHC10203"
@@ -994,12 +998,14 @@ def post_generate_eft(
     enforce_entity_code(_user, body.entity_code)
 
     with db_session() as session:
-        entity = session.execute(
-            _text("SELECT id, entity_code FROM entities WHERE entity_code = :ec"),
-            {"ec": body.entity_code},
-        ).mappings().first()
+        from ..services import get_entity_by_code as _gec4, resolve_payroll_bn as _bn
+        entity = _gec4(session, body.entity_code)
         if not entity:
             raise HTTPException(404, f"Unknown entity: {body.entity_code}")
+        try:
+            payroll_business_number = _bn(dict(entity))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
         run = session.execute(
             _text(
@@ -1134,7 +1140,7 @@ def post_generate_eft(
                 "sj": json.dumps({
                     "credit_count": built.credit_count,
                     "originator_id": eft_cfg["originator_id"],
-                    "business_number": PAYROLL_BUSINESS_NUMBER,
+                    "business_number": payroll_business_number,
                     "pay_run_number": run["pay_run_number"],
                 }),
                 "ae": body.actor_email,
@@ -1561,13 +1567,8 @@ def post_generate_paystubs(
     enforce_entity_code(_user, body.entity_code)
 
     with db_session() as session:
-        entity = session.execute(
-            _text(
-                "SELECT id, entity_code, entity_name "
-                "  FROM entities WHERE entity_code = :ec"
-            ),
-            {"ec": body.entity_code},
-        ).mappings().first()
+        from ..services import get_entity_by_code as _gec
+        entity = _gec(session, body.entity_code)
         if not entity:
             raise HTTPException(404, f"Unknown entity: {body.entity_code}")
 
@@ -2377,10 +2378,8 @@ def post_employment_record(
     from ..services_storage import storage_service as _r2
     enforce_entity_code(_user, body.entity_code)
     with db_session() as session:
-        entity = session.execute(
-            _text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code = :ec"),
-            {"ec": body.entity_code},
-        ).mappings().first()
+        from ..services import get_entity_by_code as _gec2
+        entity = _gec2(session, body.entity_code)
         if not entity:
             raise HTTPException(404, f"Unknown entity: {body.entity_code}")
         employee = session.execute(
@@ -2504,10 +2503,8 @@ def post_generate_t4s(
     if body.calendar_year < 2020 or body.calendar_year > 2100:
         raise HTTPException(400, "calendar_year out of range")
     with db_session() as session:
-        entity = session.execute(
-            _text("SELECT id, entity_code, entity_name FROM entities WHERE entity_code = :ec"),
-            {"ec": body.entity_code},
-        ).mappings().first()
+        from ..services import get_entity_by_code as _gec3
+        entity = _gec3(session, body.entity_code)
         if not entity:
             raise HTTPException(404, f"Unknown entity: {body.entity_code}")
         figures_list = _t4.compute_t4_figures(

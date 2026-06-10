@@ -32,13 +32,44 @@ def get_entity_by_code(session, entity_code: str):
     return session.execute(
         text(
             """
-            SELECT id, entity_code, entity_name, quickbooks_company_id
+            SELECT id, entity_code, entity_name, quickbooks_company_id,
+                   payroll_business_number,
+                   street_address, city, province, postal_code,
+                   fiscal_year_end_month, fiscal_year_end_day
             FROM entities
             WHERE entity_code = :entity_code
             """
         ),
         {"entity_code": entity_code},
     ).mappings().first()
+
+
+def resolve_payroll_bn(entity: dict) -> str:
+    """Return the entity's CRA payroll Business Number.
+    Raises ValueError (→ HTTP 400 at the route layer) if not configured.
+    Never falls back silently to another entity's BN."""
+    bn = (entity.get("payroll_business_number") or "").strip()
+    if not bn:
+        code = entity.get("entity_code") or entity.get("id") or "unknown"
+        raise ValueError(
+            f"payroll_business_number not configured for entity {code!r}; "
+            "seed entities.payroll_business_number before generating payroll documents or EFT files."
+        )
+    return bn
+
+
+def format_entity_address(entity: dict) -> str:
+    """Return a single-line mailing address from entity identity fields.
+    Matches the former BRIDLEWOOD_ADDRESS_LINE constant format: 'street, city PROV postal'."""
+    parts = [
+        (entity.get("street_address") or "").strip(),
+        (entity.get("city") or "").strip(),
+    ]
+    prov = (entity.get("province") or "").strip()
+    postal = (entity.get("postal_code") or "").strip()
+    city_prov_postal = " ".join(filter(None, [parts[1], prov, postal]))
+    components = [parts[0], city_prov_postal]
+    return ", ".join(c for c in components if c)
 
 
 def get_active_connection(session, entity_id: str):

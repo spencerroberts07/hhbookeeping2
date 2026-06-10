@@ -19,13 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-
-# --------------------------------------------------------------------------
-# Constants — Bridlewood-specific until entities table carries them
-# --------------------------------------------------------------------------
-
-BRIDLEWOOD_ADDRESS_LINE = "90 Michael Cowpland Dr, Kanata ON K2M 1P6"
-PAYROLL_BUSINESS_NUMBER = "753391010RP0001"
+from .services import format_entity_address
 
 
 def _money(v: Any) -> str:
@@ -130,8 +124,8 @@ def generate_pay_stub(
     # Header
     entity_name = entity.get("entity_name") or "Employer"
     elements.append(Paragraph(entity_name.upper(), h1))
-    elements.append(Paragraph(BRIDLEWOOD_ADDRESS_LINE, addr))
-    elements.append(Paragraph(f"BN: {PAYROLL_BUSINESS_NUMBER}", addr))
+    elements.append(Paragraph(format_entity_address(entity), addr))
+    elements.append(Paragraph(f"BN: {entity.get('payroll_business_number') or ''}", addr))
     elements.append(Spacer(1, 10))
 
     # Employee + period block
@@ -201,7 +195,7 @@ def generate_pay_stub(
         row("Overtime", run_line.get("overtime_pay") or 0, ytd.get("overtime_pay") or 0),
         ["GROSS PAY", _money(run_line.get("gross_pay") or 0), _money(ytd.get("gross") or 0)],
         ["DEDUCTIONS", "CURRENT", "YTD"],
-        row("Federal Tax", run_line.get("fed_tax") or 0, ytd.get("fed_tax") or 0),
+        row("Income Tax", run_line.get("fed_tax") or 0, ytd.get("fed_tax") or 0),
         row("CPP", run_line.get("cpp_ee") or 0, ytd.get("cpp_employee") or 0),
         row("EI", run_line.get("ei_ee") or 0, ytd.get("ei_employee") or 0),
         row(
