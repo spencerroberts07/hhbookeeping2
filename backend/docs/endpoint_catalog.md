@@ -515,4 +515,33 @@ This is consistent and intentional, but means /docs (OpenAPI) groups endpoints b
 
 ---
 
+### routes/wage_planner.py — prefix `/api/wage-planner`
+
+Professional tier (minimum role: `bookkeeper`; writes require `admin`).
+
+| Method | Path | Auth | entity_code | Request | Response |
+|---|---|---|---|---|---|
+| GET | `/api/wage-planner/settings` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `{settings: WagePlannerSettings \| null, fiscal_year}` |
+| PUT | `/api/wage-planner/settings` | admin + `enforce_entity_code` | body | body `SettingsRequest` {`entity_code`, `fiscal_year?`, `target_wage_pct`, `forecast_sales_change`, `avg_hourly_wage`, `benefits_pct`, `distribution_basis?`, `notes?`, `salaried_staff[]`} | `{settings, fiscal_year}` |
+| GET | `/api/wage-planner/pay-periods` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `{fiscal_year, periods[]}` |
+| PUT | `/api/wage-planner/pay-periods/{period_number}` | admin + `enforce_entity_code` | body | path `period_number`; body `PayPeriodRequest` {`entity_code`, `fiscal_year?`, `period_start`, `period_end`, `pay_date?`} | period row |
+| POST | `/api/wage-planner/pay-periods/backfill` | admin + `enforce_entity_code` | body | body `{entity_code}` | `{inserted, message}` |
+| GET | `/api/wage-planner/plan` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `WagePlannerPlan` {`settings`, `periods[]`, `summary`} |
+| POST | `/api/wage-planner/refresh` | bookkeeper + `enforce_entity_code` | body | body `RefreshRequest` {`entity_code`, `fiscal_year?`, `period_number`, `payroll_run_id`, `actor_email?`} | refreshed period row |
+| POST | `/api/wage-planner/override` | bookkeeper + `enforce_entity_code` | body | body `OverrideRequest` {`entity_code`, `fiscal_year?`, `period_number`, `actual_sales?`, `actual_gross_wages?`, `actual_stat_pay?`, `actual_hours?`} | override result |
+| POST | `/api/wage-planner/min-wage-impact` | bookkeeper + `enforce_entity_code` | body | body `{entity_code, new_min_wage}` | `MinWageImpact` {`affected_employees`, `employees[]`, totals} |
+| GET | `/api/wage-planner/snapshots` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `{fiscal_year, snapshots[]}` |
+| GET | `/api/wage-planner/snapshots/latest` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `{id, pay_period_number, status, generated_at, download_url}` |
+| GET | `/api/wage-planner/snapshots/{snapshot_id}/download` | bookkeeper | query | path `snapshot_id`; query `entity_code` | `{download_url}` or `{download_url: null, fallback}` |
+| GET | `/api/wage-planner/snapshots/{snapshot_id}/excel` | bookkeeper | query | path `snapshot_id`; query `entity_code` | inline xlsx bytes (fallback when R2 unavailable) |
+| GET | `/api/wage-planner/excel` | bookkeeper | query | query `entity_code`, `fiscal_year?` | `{url, r2_key, filename}` or inline xlsx bytes |
+
+**SQL migrations (slots 055–058):**
+- `055_payroll_pay_periods.sql` — `payroll_pay_periods` (entity_id, fiscal_year, period_number, period_start, period_end, pay_date, source). UNIQUE(entity_id, fiscal_year, period_number).
+- `056_wage_planner_settings.sql` — `wage_planner_settings` + child `wage_planner_salaried_staff`. UNIQUE(entity_id, fiscal_year).
+- `057_wage_planner_periods.sql` — `wage_planner_periods` (forecast + actual columns, locked flag). UNIQUE(entity_id, fiscal_year, period_number).
+- `058_wage_planner_snapshots.sql` — `wage_planner_snapshots` (immutable Excel archive). UNIQUE(entity_id, fiscal_year, pay_period_number).
+
+---
+
 End of catalog.

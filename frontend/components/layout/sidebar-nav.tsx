@@ -51,6 +51,12 @@ const ITEMS: NavItem[] = [
     icon: Users,
     professionalOnly: true,
   },
+  {
+    label: 'Wage Planner',
+    href: '/payroll/planner',
+    icon: CircleDollarSign,
+    professionalOnly: true,
+  },
   { label: 'AP', href: '/ap', icon: CircleDollarSign },
   { label: 'Bank', href: '/bank', icon: Banknote },
   { label: 'Fixed Assets', href: '/fixed-assets', icon: Building2 },

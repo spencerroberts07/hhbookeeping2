@@ -53,6 +53,7 @@ from .routes.qbo_auth import router as qbo_auth_router
 from .routes.qbo_bank_sync import router as qbo_bank_sync_router
 from .routes.sync import router as sync_router
 from .routes.vendor_classification import router as vendor_classification_router
+from .routes.wage_planner import router as wage_planner_router
 from .schemas import HealthResponse
 
 app = FastAPI(title="Bridlewood Bookkeeping Control Layer", version="0.7.0")
@@ -123,6 +124,7 @@ app.include_router(period_close_router)
 app.include_router(auto_match_router)
 app.include_router(payroll_router)
 app.include_router(payroll_t4_router)
+app.include_router(wage_planner_router)
 
 # v0.8 module: month-end POS imports + inventory adjustment journal builders.
 app.include_router(pos_import_router)

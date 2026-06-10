@@ -2431,6 +2431,22 @@ def approve_payroll_run(
             f"payroll_run {payroll_run_id} not found OR not in "
             "'submitted_for_review' state"
         )
+
+    # Wage Cost Planner hook — best-effort; must never block approval.
+    try:
+        from .services_wage_planner import on_payroll_run_finalized
+        on_payroll_run_finalized(
+            session,
+            entity_id=entity["id"],
+            payroll_run_id=str(row["id"]),
+            actor_email=actor_email,
+        )
+    except Exception as _wcp_exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "wage_planner hook failed for run %s: %r", payroll_run_id, _wcp_exc
+        )
+
     return {"id": str(row["id"]), "workflow_status": row["workflow_status"]}
 
 
