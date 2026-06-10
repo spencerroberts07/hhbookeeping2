@@ -53,6 +53,8 @@ from .routes.qbo_auth import router as qbo_auth_router
 from .routes.qbo_bank_sync import router as qbo_bank_sync_router
 from .routes.sync import router as sync_router
 from .routes.vendor_classification import router as vendor_classification_router
+from .routes.vendor_eft import router as vendor_eft_router
+from .routes.ap_alerts import router as ap_alerts_router
 from .routes.wage_planner import router as wage_planner_router
 from .schemas import HealthResponse
 
@@ -179,6 +181,13 @@ app.include_router(accounts_router)
 # Unified documents library — aggregates uploaded files from every
 # per-module run table for the /documents page.
 app.include_router(documents_router)
+
+# Outside-vendor AP module (v1.4):
+#   - Vendor master + learning (services_vendor_master.py)
+#   - EFT payment file generation (CPA-005, dry-run only)
+#   - Due-date alert cron engine (ap_alerts_router)
+app.include_router(vendor_eft_router)
+app.include_router(ap_alerts_router)
 
 
 @app.get("/health", response_model=HealthResponse)

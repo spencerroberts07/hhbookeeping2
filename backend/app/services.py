@@ -3351,6 +3351,24 @@ def create_direct_vendor_ap_invoice_bank_match(
     _recalculate_direct_vendor_invoice_payment_fields(session, invoice_uuid)
     refreshed = _get_direct_vendor_invoice_row(session, invoice_uuid)
 
+    # Settlement journal: Dr 2020 / Cr 1020 when invoice becomes fully paid.
+    # Best-effort — a locked-period or other error returns an error dict but
+    # never rolls back the match itself.
+    if refreshed and refreshed.get("status") == "paid":
+        try:
+            _build_vendor_payment_settlement_journal(
+                session,
+                entity_id=invoice_row["entity_id"],
+                invoice_row=refreshed,
+                actor_email=actor_email,
+            )
+        except Exception as _sj_exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "vendor settlement journal failed for invoice %s: %r",
+                invoice_uuid, _sj_exc,
+            )
+
     _insert_direct_vendor_invoice_event(
         session=session,
         entity_id=invoice_row["entity_id"],
@@ -3430,6 +3448,118 @@ def release_direct_vendor_ap_invoice_bank_match(
     )
 
     return get_direct_vendor_ap_invoice_detail(session, entity_code, invoice_id)
+
+
+# ---------------------------------------------------------------------------
+# Vendor AP settlement journal (Dr 2020 AP / Cr 1020 cash on bank-rec match)
+# ---------------------------------------------------------------------------
+
+def _build_vendor_payment_settlement_journal(
+    session,
+    *,
+    entity_id: UUID,
+    invoice_row: dict[str, Any],
+    actor_email: str | None,
+) -> dict[str, Any]:
+    """Post Dr 2020 (AP) / Cr 1020 (cash) when a vendor invoice is fully paid
+    via bank-rec match. Idempotent: one journal per invoice (keyed on invoice id).
+    Modelled on _create_cra_remittance_draft (Dr 2320 / Cr 1020).
+    Respects locked-period guard — returns error dict without raising so the
+    match itself is never rolled back."""
+    import json as _json
+    from datetime import date as _date
+    from decimal import Decimal as _Dec
+
+    invoice_id_str = str(invoice_row["id"])
+    amt = _Dec(str(invoice_row.get("total_amount") or invoice_row.get("paid_amount") or 0))
+    if amt <= 0:
+        return {"created": False, "reason": "zero amount"}
+
+    # Idempotency: skip if a non-voided settlement journal already exists
+    existing = session.execute(
+        text(
+            """
+            SELECT id FROM journal_batches
+             WHERE entity_id = :eid
+               AND source_module = 'vendor_payment'
+               AND summary_json->>'invoice_id' = :iid
+               AND status NOT IN ('voided', 'rejected')
+            LIMIT 1
+            """
+        ),
+        {"eid": entity_id, "iid": invoice_id_str},
+    ).scalar()
+    if existing:
+        return {"created": False, "batch_id": str(existing), "reason": "already exists"}
+
+    # Resolve accounting period
+    pid = invoice_row.get("accounting_period_id")
+    if not pid:
+        # Derive from invoice_date or today
+        inv_date = invoice_row.get("invoice_date") or _date.today()
+        try:
+            pid = ensure_accounting_period_for_date(session, entity_id=entity_id, target_date=inv_date)
+        except Exception:
+            pass
+    if not pid:
+        return {"created": False, "reason": "cannot resolve accounting period"}
+
+    # Locked-period guard
+    try:
+        from .services_period_close import assert_period_not_locked, PeriodLockedError
+        assert_period_not_locked(session, entity_id=entity_id, accounting_period_id=pid)
+    except Exception as exc:
+        return {"created": False, "reason": f"period locked: {exc}"}
+
+    vendor = invoice_row.get("vendor_name") or "vendor"
+    inv_number = invoice_row.get("invoice_number") or "—"
+    label = f"Vendor AP payment — {vendor} #{inv_number}"
+
+    bid = session.execute(
+        text(
+            """
+            INSERT INTO journal_batches (
+                entity_id, accounting_period_id, source_module, batch_label,
+                status, workflow_status, total_debits, total_credits, summary_json)
+            VALUES (:e, :pid, 'vendor_payment', :label,
+                    'draft', 'draft', :amt, :amt, CAST(:sj AS jsonb))
+            RETURNING id
+            """
+        ),
+        {
+            "e": entity_id,
+            "pid": pid,
+            "label": label,
+            "amt": amt,
+            "sj": _json.dumps({
+                "invoice_id": invoice_id_str,
+                "vendor_name": vendor,
+                "invoice_number": inv_number,
+                "actor": actor_email,
+                "source": "vendor_payment_settlement",
+            }),
+        },
+    ).scalar()
+
+    for n, (code, d, c, memo) in enumerate([
+        ("2020", amt, _Dec("0"), f"AP settlement — {vendor} #{inv_number}"),
+        ("1020", _Dec("0"), amt, f"Cash payment — {vendor} #{inv_number}"),
+    ], start=1):
+        session.execute(
+            text(
+                """
+                INSERT INTO journal_lines (journal_batch_id, line_number, account_code,
+                    debit_amount, credit_amount, memo, source_json)
+                VALUES (:b, :n, :code, :d, :c, :memo, CAST(:sj AS jsonb))
+                """
+            ),
+            {
+                "b": bid, "n": n, "code": code, "d": d, "c": c, "memo": memo,
+                "sj": _json.dumps({"vendor_payment_settlement": True, "invoice_id": invoice_id_str}),
+            },
+        )
+
+    return {"created": True, "batch_id": str(bid), "amount": float(amt), "status": "draft"}
 
 
 def _cash_balancing_card_totals(session, entity_id: UUID, business_date: date | None) -> dict[str, Any] | None:

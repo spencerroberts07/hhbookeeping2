@@ -17,6 +17,7 @@ const TABS = [
   { href: '/settings/recurring-entries', label: 'Recurring entries' },
   { href: '/settings/fixed-assets', label: 'Asset classes' },
   { href: '/settings/wage-planner', label: 'Wage planner' },
+  { href: '/settings/ap-alerts', label: 'AP alerts' },
 ];
 
 export default function SettingsLayout({

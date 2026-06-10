@@ -242,6 +242,8 @@ class NotificationPrefsRequest(BaseModel):
     variance_alerts: bool | None = None
     approval_requests: bool | None = None
     payment_receipts: bool | None = None
+    # AP alert sub-object: {email_enabled, remittance_advice_enabled, thresholds}
+    ap_alerts: dict | None = None
 
 
 @router.patch("/{entity_code}/notifications")

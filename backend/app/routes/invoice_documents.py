@@ -355,6 +355,64 @@ async def upload_invoice_documents(
                     entity_code=entity_code,
                 )
 
+                # Vendor master bridge (outside_vendor only — never HH AP).
+                # Best-effort: never blocks upload on failure.
+                vendor_master_id: str | None = None
+                if invoice_type == "outside_vendor" and parsed_vendor:
+                    try:
+                        _eid_row = session.execute(
+                            text("SELECT id FROM entities WHERE entity_code = :ec"),
+                            {"ec": entity_code},
+                        ).mappings().first()
+                        if _eid_row:
+                            from ..services_vendor_master import ensure_vendor as _ensure_vendor
+                            from uuid import UUID as _UUID
+                            _vendor_row = _ensure_vendor(
+                                session,
+                                entity_id=_UUID(str(_eid_row["id"])),
+                                vendor_name=parsed_vendor,
+                                invoice_date=parsed_date,
+                                due_date=None,  # due_date not parsed at upload time
+                                invoice_id=str(invoice_dict["id"]),
+                            )
+                            vendor_master_id = str(_vendor_row["id"])
+
+                            # Bridge: create / update the direct_vendor_ap_invoices
+                            # spine row so the invoice enters the payment lifecycle.
+                            # Uses the upsert (idempotent on vendor_name+invoice_number).
+                            _inv_number = parsed_number or f"INV-{str(invoice_dict['id'])[:8]}"
+                            _actor = clerk_user_id or f"upload:{entity_code}"
+                            if parsed_date:  # invoice_date is required by upsert
+                                from ..services import upsert_direct_vendor_ap_invoice as _upsert_dvap
+                                _spine = _upsert_dvap(
+                                    session,
+                                    entity_code=entity_code,
+                                    actor_email=_actor,
+                                    vendor_name=parsed_vendor,
+                                    invoice_number=_inv_number,
+                                    invoice_date=parsed_date,
+                                    total_amount=parsed_amount,
+                                    source_document_name=filename,
+                                )
+                                # Stamp vendor_id + source_invoice_document_id
+                                # (new columns from migration 060, not in the upsert).
+                                session.execute(
+                                    text("""
+                                        UPDATE direct_vendor_ap_invoices
+                                           SET vendor_id                   = COALESCE(vendor_id, :vid),
+                                               source_invoice_document_id  = COALESCE(source_invoice_document_id, :sid),
+                                               updated_at                  = NOW()
+                                         WHERE id = :iid
+                                    """),
+                                    {
+                                        "vid": vendor_master_id,
+                                        "sid": str(invoice_dict["id"]),
+                                        "iid": str(_spine["id"]),
+                                    },
+                                )
+                    except Exception as _ve:
+                        logger.warning("vendor master bridge failed: %r", _ve)
+
             processed.append({
                 "invoice_document_id": str(invoice_dict["id"]),
                 "file_name": filename,

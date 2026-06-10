@@ -405,6 +405,40 @@ def dashboard_alerts(
                 "href": "/bank",
             })
 
+        # AP due-date alerts (outside-vendor only — HH AP excluded at query).
+        # Shows the most-urgent unfired / recently-fired alert group.
+        # Overdue = threshold_days=0, 3-day = threshold_days=3, 7-day = 7.
+        ap_due_rows = session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS c,
+                       MIN(al.due_date) AS earliest_due,
+                       MAX(CASE WHEN al.threshold_days = 0 THEN 1 ELSE 0 END) AS has_overdue,
+                       MAX(CASE WHEN al.threshold_days <= 3 THEN 1 ELSE 0 END) AS has_urgent
+                FROM ap_alert_log al
+                WHERE al.entity_id = :eid
+                  AND al.due_date >= :today - INTERVAL '30 days'
+                """
+            ),
+            {"eid": str(entity["id"]), "today": today},
+        ).mappings().first()
+        if ap_due_rows and int(ap_due_rows["c"] or 0) > 0:
+            has_overdue = bool(ap_due_rows["has_overdue"])
+            has_urgent = bool(ap_due_rows["has_urgent"])
+            count = int(ap_due_rows["c"])
+            alerts.append({
+                "type": "ap_due",
+                "severity": "error" if has_overdue else ("warning" if has_urgent else "info"),
+                "label": (
+                    f"{count} vendor invoice{'s' if count != 1 else ''} overdue or due soon"
+                ),
+                "detail": (
+                    "Overdue invoices require payment" if has_overdue
+                    else "Invoices due within 7 days"
+                ),
+                "href": "/ap/payments",
+            })
+
         return {
             "entity_code": entity_code,
             "alerts": alerts,
