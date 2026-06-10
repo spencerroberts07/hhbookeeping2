@@ -25,7 +25,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel
 
-from ..auth import CurrentUser, enforce_entity_code, require_role
+from ..services_auth import CurrentUser, enforce_entity_code, require_role
 from ..database import db_session
 from ..services_vendor_eft import (
     build_vendor_payment_file,
