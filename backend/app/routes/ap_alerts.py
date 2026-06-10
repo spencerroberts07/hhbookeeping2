@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 
-from ..database import db_session
+from ..db import db_session
 from ..services_ap_alerts import run_ap_due_alerts, run_all_entities_ap_alerts
 from .cash_balancing import verify_sync_auth
 
