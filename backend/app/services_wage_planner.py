@@ -1086,7 +1086,7 @@ def on_payroll_run_finalized(
                     INSERT INTO payroll_pay_periods
                         (entity_id, fiscal_year, period_number, period_start,
                          period_end, source)
-                    VALUES (:eid, :fy, :pn, :ps, :pe, 'auto:payroll_approved')
+                    VALUES (:eid, :fy, :pn, :ps, :pe, 'auto')
                     ON CONFLICT (entity_id, fiscal_year, period_number) DO NOTHING
                     """
                 ),

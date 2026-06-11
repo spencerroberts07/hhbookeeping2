@@ -2520,7 +2520,9 @@ def approve_payroll_run(
         )
 
     # Wage Cost Planner hook — best-effort; must never block approval.
+    # Savepoint isolates any DB error so the approval transaction stays healthy.
     try:
+        session.execute(text("SAVEPOINT wcp_hook"))
         from .services_wage_planner import on_payroll_run_finalized
         on_payroll_run_finalized(
             session,
@@ -2528,11 +2530,16 @@ def approve_payroll_run(
             payroll_run_id=str(row["id"]),
             actor_email=actor_email,
         )
+        session.execute(text("RELEASE SAVEPOINT wcp_hook"))
     except Exception as _wcp_exc:
         import logging as _logging
         _logging.getLogger(__name__).error(
             "wage_planner hook failed for run %s: %r", payroll_run_id, _wcp_exc
         )
+        try:
+            session.execute(text("ROLLBACK TO SAVEPOINT wcp_hook"))
+        except Exception:
+            pass
 
     return {"id": str(row["id"]), "workflow_status": row["workflow_status"]}
 
