@@ -10,7 +10,8 @@ import {
   getUnmatchedQueue,
   listInvoiceDocuments,
 } from '@/lib/api/invoices';
-import { formatMoney, formatPercent } from '@/lib/utils';
+import { formatMoney, formatPercent, formatDate } from '@/lib/utils';
+import { getArAging } from '@/lib/api/ar';
 
 interface Props {
   entityCode: string;
@@ -53,6 +54,12 @@ export function StepValidation({ entityCode, periodEnd }: Props) {
       getTrialBalance(entityCode, latestGlRun!.id, /* onlyVariance */ true),
   });
 
+  const arAging = useQuery({
+    queryKey: ['ar-aging', entityCode],
+    queryFn: () => getArAging(entityCode),
+    retry: false,
+  });
+
   // Invoice match status — unmatched count is the main signal here.
   const unmatched = useQuery({
     queryKey: ['unmatched-queue', entityCode],
@@ -73,8 +80,12 @@ export function StepValidation({ entityCode, periodEnd }: Props) {
       ).length,
   });
 
+  const periodMonth = periodEnd.slice(0, 7); // YYYY-MM
+  const arSnapshotInPeriod =
+    arAging.data?.current?.snapshot_date?.startsWith(periodMonth) ?? false;
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
       <div className="rounded-xl border border-border bg-white p-4">
         <div className="text-sm font-semibold text-deep-navy mb-2">
           POS validation
@@ -161,6 +172,44 @@ export function StepValidation({ entityCode, periodEnd }: Props) {
               className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
             >
               Open unmatched queue →
+            </Link>
+          </div>
+        )}
+      </div>
+
+      {/* AR aging — warns if no snapshot was uploaded for this period. */}
+      <div className="rounded-xl border border-border bg-white p-4">
+        <div className="text-sm font-semibold text-deep-navy mb-2">
+          AR aging snapshot
+        </div>
+        {arAging.isLoading ? (
+          <Skeleton className="h-10" />
+        ) : arSnapshotInPeriod && arAging.data?.current ? (
+          <div className="text-sm">
+            <Badge variant="complete">Ready</Badge>
+            <p className="text-xs text-slate mt-2">
+              as of {formatDate(arAging.data.current.snapshot_date!)} ·{' '}
+              {formatMoney(arAging.data.current.total_ar)} total AR
+            </p>
+            <Link
+              href="/ar"
+              className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
+            >
+              View AR aging →
+            </Link>
+          </div>
+        ) : (
+          <div className="text-sm">
+            <Badge variant="warning">Needs review</Badge>
+            <p className="text-xs text-slate mt-2">
+              No AR aging snapshot for this period. Upload one in Document
+              upload above, or skip if not applicable.
+            </p>
+            <Link
+              href="/ar"
+              className="text-xs text-ledger-blue hover:underline mt-2 inline-block"
+            >
+              View AR →
             </Link>
           </div>
         )}

@@ -17,6 +17,7 @@ import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
 import { getLatestInventoryValue } from '@/lib/api/pos';
 import { getRatios, type RatioRow } from '@/lib/api/ratios';
+import { getArAging } from '@/lib/api/ar';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
@@ -120,6 +121,13 @@ export default function DashboardPage() {
     enabled: !!entityCode,
     queryFn: () => getRatios(entityCode!),
     // Ratios can 500 when GL data is thin — keep the card from crashing.
+    retry: false,
+  });
+  // AR aging — latest snapshot for the dashboard card.
+  const arAging = useQuery({
+    queryKey: ['ar-aging', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getArAging(entityCode!),
     retry: false,
   });
   // Sales MTD comes from cash balancing (POS gross) — the SAME source as the
@@ -333,6 +341,48 @@ export default function DashboardPage() {
                       )}
                     </p>
                   </>
+                )}
+              </CardContent>
+            </Card>
+          </Link>
+
+          {/* Accounts Receivable — latest aging snapshot */}
+          <Link href="/ar" className="block transition hover:ring-2 hover:ring-ledger-blue/30 rounded-xl">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
+                  Accounts receivable
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {arAging.isLoading ? (
+                  <Skeleton className="h-9 w-32" />
+                ) : arAging.data?.current ? (
+                  <>
+                    <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
+                      {formatMoney(arAging.data.current.total_ar)}
+                    </div>
+                    <div className="flex gap-1.5 flex-wrap mt-2">
+                      {arAging.data.current.buckets.over_90 > 0 && (
+                        <span className="text-xs font-medium text-red-600">
+                          {formatMoney(arAging.data.current.buckets.over_90 + arAging.data.current.buckets.over_120)} 90+ days
+                        </span>
+                      )}
+                      {arAging.data.current.buckets.over_60 > 0 &&
+                        arAging.data.current.buckets.over_90 === 0 && (
+                        <span className="text-xs font-medium text-orange-600">
+                          {formatMoney(arAging.data.current.buckets.over_60)} 60+ days
+                        </span>
+                      )}
+                    </div>
+                    {arAging.data.current.snapshot_date && (
+                      <p className="text-[10px] text-slate mt-1">
+                        as of {formatDate(arAging.data.current.snapshot_date)}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-sm text-slate">No snapshot yet</p>
                 )}
               </CardContent>
             </Card>

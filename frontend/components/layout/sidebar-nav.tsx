@@ -58,6 +58,7 @@ const ITEMS: NavItem[] = [
     professionalOnly: true,
   },
   { label: 'AP', href: '/ap', icon: CircleDollarSign },
+  { label: 'AR', href: '/ar', icon: CircleDollarSign },
   { label: 'Bank', href: '/bank', icon: Banknote },
   { label: 'Fixed Assets', href: '/fixed-assets', icon: Building2 },
   { label: 'Settings', href: '/settings', icon: Settings },
