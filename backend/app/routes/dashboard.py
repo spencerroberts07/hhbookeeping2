@@ -727,7 +727,7 @@ def sales_daily(
                 SELECT business_date, total_sales
                   FROM cash_balancing_days
                  WHERE entity_id = :e
-                   AND business_date <= CURRENT_DATE
+                   AND business_date < CURRENT_DATE
                    AND business_date > (CURRENT_DATE - make_interval(days => :days))
               ORDER BY business_date ASC
                 """
@@ -950,3 +950,50 @@ def margin_trend(
             "py_net_margin_pct": pnm,
         })
     return {"entity_code": entity_code, "source": "gl_net", "months": months, "series": series}
+
+
+# --------------------------------------------------------------------------
+# As-of reference date
+#
+# Returns the most recent closed_locked accounting period end/label for an
+# entity.  Dashboard cards that show period-bound figures (AP, Margin, Ratios)
+# all use this single endpoint so their labels stay consistent.
+# --------------------------------------------------------------------------
+
+
+@router.get("/as-of")
+def as_of(
+    entity_code: str = Query(...),
+    _user: Any = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Most recent closed_locked period end + label for this entity.
+    Returns null fields when no closed_locked period exists yet."""
+    with db_session() as session:
+        entity = get_entity_by_code(session, entity_code)
+        if not entity:
+            raise HTTPException(404, f"Unknown entity code: {entity_code}")
+        row = session.execute(
+            text(
+                """
+                SELECT period_end, period_label
+                  FROM accounting_periods
+                 WHERE entity_id = :e
+                   AND status = 'closed_locked'
+                   AND period_end <= CURRENT_DATE
+              ORDER BY period_end DESC
+                 LIMIT 1
+                """
+            ),
+            {"e": entity["id"]},
+        ).mappings().first()
+    if row:
+        return {
+            "entity_code": entity_code,
+            "last_closed_period_end": row["period_end"].isoformat(),
+            "last_closed_period_label": row["period_label"],
+        }
+    return {
+        "entity_code": entity_code,
+        "last_closed_period_end": None,
+        "last_closed_period_label": None,
+    }

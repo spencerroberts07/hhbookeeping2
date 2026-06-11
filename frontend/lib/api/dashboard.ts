@@ -300,3 +300,22 @@ export async function getMarginTrend(
   });
   return res.data;
 }
+
+// --- As-of reference date ---
+// Single source of truth for the "last closed_locked period" label used
+// by AP, Margin, Ratios, and any other period-bound dashboard card.
+
+export interface AsOfResponse {
+  entity_code: string;
+  /** ISO date string, null when no closed_locked period exists. */
+  last_closed_period_end: string | null;
+  /** Human label like "Feb 2026", null when no closed_locked period exists. */
+  last_closed_period_label: string | null;
+}
+
+export async function getAsOf(entityCode: string): Promise<AsOfResponse> {
+  const res = await api.get<AsOfResponse>('/api/dashboard/as-of', {
+    params: { entity_code: entityCode },
+  });
+  return res.data;
+}

@@ -9,12 +9,14 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useEntityStore } from '@/lib/store/entity';
-import { formatMoney, formatPercent, formatMonthLabel } from '@/lib/utils';
-import { getGlCashBalance, getGrossMargin, getSalesMtd } from '@/lib/api/dashboard';
+import { formatMoney, formatPercent, formatMonthLabel, formatDate } from '@/lib/utils';
+import { getGlCashBalance, getGrossMargin, getSalesMtd, getAsOf } from '@/lib/api/dashboard';
 import { getQboBankBalances } from '@/lib/api/qbo';
 import { getOnboardingStatus } from '@/lib/api/onboarding';
 import { getHHAPSummary } from '@/lib/api/hh_ap';
 import { getCurrentPeriod, getPeriodStatus } from '@/lib/api/month_end';
+import { getLatestInventoryValue } from '@/lib/api/pos';
+import { getRatios, type RatioRow } from '@/lib/api/ratios';
 import { SalesChart } from './_components/sales-chart';
 import { ApAgingChart } from './_components/ap-aging-chart';
 import { GrossMarginSparkline } from './_components/gross-margin-sparkline';
@@ -98,6 +100,27 @@ export default function DashboardPage() {
     queryKey: ['gross-margin', entityCode],
     enabled: !!entityCode,
     queryFn: () => getGrossMargin(entityCode!),
+  });
+  // Last closed_locked period — single source for AP / Margin / Ratios "as of" labels.
+  const asOf = useQuery({
+    queryKey: ['dashboard-as-of', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getAsOf(entityCode!),
+    staleTime: 5 * 60 * 1000,
+  });
+  // Inventory latest snapshot (POS import).
+  const inventoryValue = useQuery({
+    queryKey: ['inventory-value-latest', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getLatestInventoryValue(entityCode!),
+  });
+  // Ratios — compact subset for the dashboard card.
+  const ratiosData = useQuery({
+    queryKey: ['ratios', entityCode],
+    enabled: !!entityCode,
+    queryFn: () => getRatios(entityCode!),
+    // Ratios can 500 when GL data is thin — keep the card from crashing.
+    retry: false,
   });
   // Sales MTD comes from cash balancing (POS gross) — the SAME source as the
   // sales drill-down's MTD, so the card and the drill always agree.
@@ -187,7 +210,7 @@ export default function DashboardPage() {
             </Link>
           </div>
         )}
-        <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {/* Cash position */}
           <Card>
             <CardHeader>
@@ -338,9 +361,10 @@ export default function DashboardPage() {
                   <span className="text-slate text-base">No data</span>
                 )}
               </div>
-              {grossMargin.data?.period_label && (
-                <p className="text-xs text-slate mt-1">
-                  Trailing 12 months · ending {grossMargin.data.period_label}
+              {(grossMargin.data?.period_label || asOf.data?.last_closed_period_label) && (
+                <p className="text-[10px] text-slate mt-1">
+                  Trailing 12 months · as of{' '}
+                  {asOf.data?.last_closed_period_label ?? grossMargin.data?.period_label}
                 </p>
               )}
               <GrossMarginSparkline />
@@ -391,6 +415,81 @@ export default function DashboardPage() {
               )}
             </CardContent>
           </Card>
+
+          {/* Inventory — latest POS snapshot value */}
+          <Link href="/dashboard/inventory" className="block transition hover:ring-2 hover:ring-ledger-blue/30 rounded-xl">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
+                  Inventory
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {inventoryValue.isLoading ? (
+                  <Skeleton className="h-9 w-32" />
+                ) : inventoryValue.data?.inventory_value != null ? (
+                  <>
+                    <div className="text-3xl font-extrabold text-deep-navy tabular-nums">
+                      {formatMoney(inventoryValue.data.inventory_value)}
+                    </div>
+                    <p className="text-[10px] text-slate mt-1">
+                      {inventoryValue.data.snapshot_date
+                        ? `POS snapshot · as of ${formatDate(inventoryValue.data.snapshot_date)}`
+                        : 'POS snapshot'}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-sm text-slate">No snapshot yet</p>
+                )}
+              </CardContent>
+            </Card>
+          </Link>
+
+          {/* Key ratios — headline DSCR / FCCR from the ratio engine */}
+          <Link href="/settings/ratios" className="block transition hover:ring-2 hover:ring-ledger-blue/30 rounded-xl">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-slate">
+                  Key ratios
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {ratiosData.isLoading ? (
+                  <Skeleton className="h-9 w-32" />
+                ) : ratiosData.data ? (
+                  <>
+                    <div className="space-y-1">
+                      {ratiosData.data.ratios
+                        .filter((r: RatioRow) => r.enabled && r.value !== null)
+                        .slice(0, 3)
+                        .map((r: RatioRow) => (
+                          <div key={r.key} className="flex justify-between items-baseline text-sm">
+                            <span className="text-slate truncate pr-2">{r.label}</span>
+                            <span className={
+                              'font-semibold tabular-nums ' +
+                              (r.breached ? 'text-red-600' : 'text-ink')
+                            }>
+                              {r.format === 'percent'
+                                ? `${(r.value! * 100).toFixed(1)}%`
+                                : r.format === 'dollar'
+                                  ? formatMoney(r.value!)
+                                  : r.format === 'days'
+                                    ? `${r.value!.toFixed(0)}d`
+                                    : r.value!.toFixed(2) + 'x'}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                    <p className="text-[10px] text-slate mt-2">
+                      as of {ratiosData.data.period_label}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-sm text-slate">No ratio data yet</p>
+                )}
+              </CardContent>
+            </Card>
+          </Link>
         </section>
 
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -410,10 +509,17 @@ export default function DashboardPage() {
               {apSummary.isLoading ? (
                 <Skeleton className="h-48" />
               ) : apSummary.data ? (
-                <ApAgingChart
-                  aging={apSummary.data.aging}
-                  total={apSummary.data.current_balance}
-                />
+                <>
+                  <ApAgingChart
+                    aging={apSummary.data.aging}
+                    total={apSummary.data.current_balance}
+                  />
+                  {asOf.data?.last_closed_period_label && (
+                    <p className="text-[10px] text-slate mt-2">
+                      as of {asOf.data.last_closed_period_label}
+                    </p>
+                  )}
+                </>
               ) : (
                 <p className="text-sm text-slate">No HH AP data yet</p>
               )}

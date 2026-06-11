@@ -228,12 +228,29 @@ export default function SalesAnalyticsPage() {
           </CardContent>
         </Card>
 
-        {/* Daily — POS gross, current vs same calendar day prior year */}
+        {/* Daily — POS gross, current vs same calendar day prior year.
+            Today is excluded (cash_balancing_days for today is incomplete
+            until the overnight sync runs). */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle className="flex items-center gap-2">
-              Daily sales <SourcePill source="pos_gross" />
-            </CardTitle>
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                Daily sales <SourcePill source="pos_gross" />
+              </CardTitle>
+              {daily.data && daily.data.series.length > 0 && (() => {
+                const first = daily.data.series[0]!;
+                const last = daily.data.series[daily.data.series.length - 1]!;
+                const fmt = (iso: string) =>
+                  parseLocalDate(iso).toLocaleDateString('en-CA', {
+                    month: 'short', day: 'numeric', year: 'numeric',
+                  });
+                return (
+                  <p className="text-[10px] text-slate mt-0.5">
+                    {fmt(first.date)} – {fmt(last.date)}
+                  </p>
+                );
+              })()}
+            </div>
             <div className="flex gap-1">
               {[30, 90, 180].map((d) => (
                 <button
