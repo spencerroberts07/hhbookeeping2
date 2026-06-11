@@ -56,6 +56,7 @@ from .routes.vendor_classification import router as vendor_classification_router
 from .routes.vendor_eft import router as vendor_eft_router
 from .routes.ap_alerts import router as ap_alerts_router
 from .routes.wage_planner import router as wage_planner_router
+from .routes.ar import router as ar_router
 from .schemas import HealthResponse
 
 app = FastAPI(title="BookWize API", version="0.7.0")
@@ -198,6 +199,9 @@ app.include_router(documents_router)
 #   - Due-date alert cron engine (ap_alerts_router)
 app.include_router(vendor_eft_router)
 app.include_router(ap_alerts_router)
+
+# AR aging module: snapshot reads, write-down JE, Excel export.
+app.include_router(ar_router)
 
 
 @app.get("/health", response_model=HealthResponse)

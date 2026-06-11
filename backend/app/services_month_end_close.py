@@ -1016,6 +1016,69 @@ def _section_pos_reports(
     )
 
 
+# ----------------------------------------------------------------------
+# Section: AR aging snapshot
+# ----------------------------------------------------------------------
+
+
+def _section_ar_aging(
+    session,
+    entity_id: UUID,
+    period_start: date,
+    period_end: date,
+) -> dict[str, Any]:
+    """
+    Checks whether an AR aging snapshot has been uploaded for this period.
+    Missing → needs_review (WARNING, not a blocker — AR aging is important
+    context but doesn't block the GL from closing).
+    Present → ready, with the snapshot date and total AR for the summary.
+    """
+    if not _has_table(session, "aged_ar_snapshots"):
+        return {
+            "status": "no_data",
+            "module_present": False,
+            "summary": "aged_ar_snapshots table not present",
+        }
+
+    row = session.execute(
+        text(
+            """
+            SELECT id, snapshot_date, total_ar
+              FROM aged_ar_snapshots
+             WHERE entity_id = :entity_id
+               AND snapshot_date BETWEEN :period_start AND :period_end
+          ORDER BY snapshot_date DESC
+             LIMIT 1
+            """
+        ),
+        {
+            "entity_id": entity_id,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    ).mappings().first()
+
+    if not row:
+        return {
+            "status": "needs_review",
+            "module_present": True,
+            "summary": "No AR aging snapshot uploaded for this period",
+            "snapshot_date": None,
+            "total_ar": None,
+        }
+
+    return {
+        "status": "ready",
+        "module_present": True,
+        "summary": (
+            f"AR aging as of {row['snapshot_date'].isoformat()}, "
+            f"total ${_money(row['total_ar'])}"
+        ),
+        "snapshot_date": row["snapshot_date"].isoformat(),
+        "total_ar": _money_float(row["total_ar"]),
+    }
+
+
 def _section_pos_financial_validation(
     session,
     entity_id: UUID,
@@ -1304,6 +1367,9 @@ def get_month_end_close_status(
             session, entity["id"], period_start, period_end_date
         ),
         "pos_reports": _section_pos_reports(
+            session, entity["id"], period_start, period_end_date
+        ),
+        "ar_aging": _section_ar_aging(
             session, entity["id"], period_start, period_end_date
         ),
         "pos_financial_validation": _section_pos_financial_validation(
