@@ -73,6 +73,8 @@ ACCOUNT_BANK = "1020"
 # Bridlewood's GL for "Income Tax Payable" (corporate income tax), so
 # we use 2320 instead.
 ACCOUNT_CRA_PAYABLE = "2320"
+ACCOUNT_MANAGEMENT_SALARY = "6110"
+ACCOUNT_PAYROLL_FEES = "6160"
 
 
 def _derive_prov_tax(
@@ -1980,7 +1982,8 @@ def build_payroll_journal(
                    total_gross, total_net_pay, total_fed_tax,
                    total_cpp_ee, total_cpp_er, total_ei_ee, total_ei_er,
                    total_life_taxable, total_vacation_earned,
-                   total_vacation_paid, total_stat_pay, cra_remittance_amount
+                   total_vacation_paid, total_stat_pay, cra_remittance_amount,
+                   enet_fee
             FROM payroll_runs
             WHERE id = :id AND entity_id = :entity_id
             """
@@ -2002,37 +2005,55 @@ def build_payroll_journal(
             "the exact deductions before posting to the GL."
         )
 
-    # Pull per-line data so we can split the wages debit into reg / salary / etc.
+    # Pull per-line data to split wages between management (6110) and non-management (6120).
     lines = session.execute(
         text(
             """
-            SELECT reg_hours_pay, overtime_pay, salary_pay, stat_pay,
-                   vacation_paid
-            FROM payroll_run_lines
-            WHERE payroll_run_id = :id
+            SELECT prl.reg_hours_pay, prl.overtime_pay, prl.salary_pay, prl.stat_pay,
+                   prl.vacation_paid,
+                   COALESCE(pe.is_management, FALSE) AS is_management
+            FROM payroll_run_lines prl
+            LEFT JOIN payroll_employees pe ON pe.id = prl.employee_id
+            WHERE prl.payroll_run_id = :id
             """
         ),
         {"id": run_uuid},
     ).mappings().all()
-    sum_reg = sum((Decimal(str(l["reg_hours_pay"])) for l in lines), Decimal("0"))
-    sum_overtime = sum((Decimal(str(l["overtime_pay"])) for l in lines), Decimal("0"))
-    sum_salary = sum((Decimal(str(l["salary_pay"])) for l in lines), Decimal("0"))
-    sum_stat = sum((Decimal(str(l["stat_pay"])) for l in lines), Decimal("0"))
-    sum_vac_paid = sum(
-        (Decimal(str(l["vacation_paid"])) for l in lines), Decimal("0")
-    )
+    mgmt_gross = Decimal("0")
+    nonmgmt_gross = Decimal("0")
+    for _l in lines:
+        _emp_gross = (
+            _money(_l["reg_hours_pay"])
+            + _money(_l["overtime_pay"])
+            + _money(_l["salary_pay"])
+            + _money(_l["stat_pay"])
+            + _money(_l["vacation_paid"])
+        )
+        if _l["is_management"]:
+            mgmt_gross += _emp_gross
+        else:
+            nonmgmt_gross += _emp_gross
 
     cpp_ee = _money(run["total_cpp_ee"])
     cpp_er = _money(run["total_cpp_er"])
     ei_ee = _money(run["total_ei_ee"])
     ei_er = _money(run["total_ei_er"])
-    fed_tax = _money(run["total_fed_tax"])
-    life_taxable = _money(run["total_life_taxable"])
     vacation_earned = _money(run["total_vacation_earned"])
     net_pay = _money(run["total_net_pay"])
+    enet_fee = _money(run["enet_fee"])
+
+    # Benefit offset = gross not captured in tracked statutory deductions.
+    # Represents employee-paid benefit premiums (dental, health) withheld from net.
+    total_gross = _money(run["total_gross"])
+    fed_tax = _money(run["total_fed_tax"])
+    benefit_offset = max(
+        Decimal("0"),
+        total_gross - net_pay - fed_tax - cpp_ee - ei_ee,
+    )
 
     # ------------------------------------------------------------------
-    # Build journal lines
+    # Build journal lines — QBO model: Dr expenses / Cr 2220 + 6130 / Cr 1020 plug.
+    # No 2320 intermediate — ENet remits source deductions directly.
     # ------------------------------------------------------------------
     journal_lines: list[dict[str, Any]] = []
 
@@ -2051,63 +2072,90 @@ def build_payroll_journal(
 
     pay_run_label = run["pay_run_number"]
 
-    # Wages & Benefits (6120) — multiple debit lines for transparency
-    _add(ACCOUNT_WAGES, _money(sum_reg), Decimal("0.00"),
-         f"Reg hours — {pay_run_label}", "wages_reg")
-    if sum_overtime > 0:
-        _add(ACCOUNT_WAGES, _money(sum_overtime), Decimal("0.00"),
-             f"Overtime — {pay_run_label}", "wages_overtime")
-    _add(ACCOUNT_WAGES, _money(sum_salary), Decimal("0.00"),
-         f"Salary — {pay_run_label}", "wages_salary")
-    if sum_stat > 0:
-        _add(ACCOUNT_WAGES, _money(sum_stat), Decimal("0.00"),
-             f"Stat pay — {pay_run_label}", "wages_stat")
-    if sum_vac_paid > 0:
-        _add(ACCOUNT_WAGES, _money(sum_vac_paid), Decimal("0.00"),
-             f"Vacation paid — {pay_run_label}", "wages_vacation_paid")
-    _add(ACCOUNT_WAGES, cpp_er, Decimal("0.00"),
-         f"Employer CPP — {pay_run_label}", "cpp_er_expense")
-    _add(ACCOUNT_WAGES, ei_er, Decimal("0.00"),
-         f"Employer EI — {pay_run_label}", "ei_er_expense")
+    # Dr 6110 — management employees' gross wages (omitted if 0)
+    _add(
+        ACCOUNT_MANAGEMENT_SALARY,
+        mgmt_gross,
+        Decimal("0"),
+        f"Management salary — {pay_run_label}",
+        "mgmt_salary",
+    )
 
-    # Group insurance taxable benefit — Dr 6130, Cr 6130 (wash, but
-    # surfaces the benefit value on the GL)
-    if life_taxable > 0:
-        _add(ACCOUNT_GROUP_INSURANCE, life_taxable, Decimal("0.00"),
-             f"Group life taxable benefit — {pay_run_label}", "life_dr")
-        _add(ACCOUNT_GROUP_INSURANCE, Decimal("0.00"), life_taxable,
-             f"Group life taxable benefit offset — {pay_run_label}", "life_cr")
+    # Dr 6120 — non-management gross + employer CPP/EI + vacation accrual
+    wages_debit = nonmgmt_gross + cpp_er + ei_er + vacation_earned
+    _add(
+        ACCOUNT_WAGES,
+        wages_debit,
+        Decimal("0"),
+        f"Wages & benefits — {pay_run_label}",
+        "wages",
+    )
 
-    # Vacation accrual: Dr 6120 / Cr 2220 — but spec wants Dr 2220 + Cr 2220
-    # to track payable. Our composition: Dr 6120 already includes the
-    # gross above. Spec separately shows Dr 2220 / Cr 2220 (net zero on
-    # 2220 but the entry surfaces the accrual). Match the spec by adding
-    # both sides on 2220.
+    # Dr 6160 — eNetEmployer processing fee (omitted when fee is 0)
+    if enet_fee > 0:
+        _add(
+            ACCOUNT_PAYROLL_FEES,
+            enet_fee,
+            Decimal("0"),
+            f"eNetEmployer fee — {pay_run_label}",
+            "enet_fee",
+        )
+
+    # 2220 — Cr when net accrual (normal); Dr when net drawdown (vacation paid > accrued)
+    vac_cr = Decimal("0")
     if vacation_earned > 0:
-        _add(ACCOUNT_VACATION_PAYABLE, vacation_earned, Decimal("0.00"),
-             f"Vacation earned — {pay_run_label}", "vacation_earned_dr")
-        _add(ACCOUNT_VACATION_PAYABLE, Decimal("0.00"), vacation_earned,
-             f"Vacation earned — {pay_run_label}", "vacation_earned_cr")
+        _add(
+            ACCOUNT_VACATION_PAYABLE,
+            Decimal("0"),
+            vacation_earned,
+            f"Vacation earned — {pay_run_label}",
+            "vacation_accrual",
+        )
+        vac_cr = vacation_earned
+    elif vacation_earned < 0:
+        _add(
+            ACCOUNT_VACATION_PAYABLE,
+            abs(vacation_earned),
+            Decimal("0"),
+            f"Vacation drawdown — {pay_run_label}",
+            "vacation_drawdown",
+        )
 
-    # CRA remittance liability (uses 2300 placeholder until Spencer
-    # confirms a dedicated CRA payroll-payable account)
-    cra_total = fed_tax + cpp_ee + cpp_er + ei_ee + ei_er
-    _add(ACCOUNT_CRA_PAYABLE, Decimal("0.00"), fed_tax,
-         f"Federal+ON tax withheld — {pay_run_label}", "cra_fed_tax")
-    _add(ACCOUNT_CRA_PAYABLE, Decimal("0.00"), cpp_ee + cpp_er,
-         f"CPP (EE+ER) — {pay_run_label}", "cra_cpp")
-    _add(ACCOUNT_CRA_PAYABLE, Decimal("0.00"), ei_ee + ei_er,
-         f"EI (EE+ER) — {pay_run_label}", "cra_ei")
+    # Cr 6130 — employee benefit premium deductions offset (omitted when 0)
+    if benefit_offset > 0:
+        _add(
+            ACCOUNT_GROUP_INSURANCE,
+            Decimal("0"),
+            benefit_offset,
+            f"Employee benefit premiums — {pay_run_label}",
+            "ee_benefit_offset",
+        )
 
-    # Net pay clearing 1020
-    _add(ACCOUNT_BANK, Decimal("0.00"), net_pay,
-         f"Net pay EFT — {pay_run_label}", "net_pay")
-
+    # Cr 1020 — balancing plug
+    # When vacation is a Cr: plug = debits - vac_cr - benefit_offset
+    # When vacation is a Dr: vac_cr = 0, Dr 2220 already in total_debits, same formula holds
     total_debits = sum(l["debit_amount"] for l in journal_lines)
+    plug = total_debits - vac_cr - benefit_offset
+    _add(
+        ACCOUNT_BANK,
+        Decimal("0"),
+        plug,
+        f"Payroll EFT — {pay_run_label}",
+        "bank_plug",
+    )
     total_credits = sum(l["credit_amount"] for l in journal_lines)
+
+    # Sanity: plug should equal net_pay + CRA_remittance + enet_fee
+    _cra_check = _money(run["cra_remittance_amount"])
+    _expected_plug = net_pay + _cra_check + enet_fee
+    if abs(plug - _expected_plug) > Decimal("0.01"):
+        import warnings as _warnings
+        _warnings.warn(
+            f"Payroll {pay_run_label}: bank plug ${plug} differs from "
+            f"net+CRA+fee ${_expected_plug} by ${abs(plug - _expected_plug)}"
+        )
+
     if total_debits != total_credits:
-        # Should never happen given our inputs are consistent, but
-        # surface clearly if it does.
         raise ValueError(
             f"Payroll journal not balanced: Dr {total_debits} vs Cr {total_credits}"
         )
@@ -2118,21 +2166,18 @@ def build_payroll_journal(
         "period_end": run["period_end"].isoformat(),
         "pay_date": run["pay_date"].isoformat(),
         "totals": {
-            "gross": str(run["total_gross"]),
-            "net_pay": str(net_pay),
-            "fed_tax": str(fed_tax),
-            "cpp_ee": str(cpp_ee),
+            "gross": str(total_gross),
+            "mgmt_gross": str(mgmt_gross),
+            "nonmgmt_gross": str(nonmgmt_gross),
             "cpp_er": str(cpp_er),
-            "ei_ee": str(ei_ee),
             "ei_er": str(ei_er),
             "vacation_earned": str(vacation_earned),
-            "cra_remittance": str(cra_total),
+            "enet_fee": str(enet_fee),
+            "benefit_offset": str(benefit_offset),
+            "bank_plug": str(plug),
+            "net_pay": str(net_pay),
+            "cra_remittance": str(_cra_check),
         },
-        "cra_payable_account_note": (
-            f"Posted CRA remittance liabilities to {ACCOUNT_CRA_PAYABLE} "
-            "as a placeholder — confirm dedicated CRA payroll payable "
-            "account in the chart and update if needed."
-        ),
     }
 
     batch = session.execute(
