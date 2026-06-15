@@ -225,6 +225,96 @@ export async function getSnapshotDownloadUrl(
   return res.data;
 }
 
+// -------------------------------------------------------------------------
+// Dashboard summary types + API call (Steps 5–7)
+// -------------------------------------------------------------------------
+
+export interface DashboardSummaryNearMinEmployee {
+  employee_id: string;
+  full_name: string;
+  current_rate: string;
+  gap_to_min: string;
+  est_annual_raise_cost: string;
+}
+
+export interface DashboardSummarySalariedStaff {
+  employee_name: string;
+  annual_salary: string;
+  bonus: string;
+  annual_cost: string;
+  per_period: string;
+}
+
+export interface DashboardSummaryTrendPoint {
+  fy: number;
+  period_number: number;
+  label: string;
+  actual_wage_pct: string;
+  target_pct: string | null;
+  prior_year_pct: string;
+  actual_wages: string;
+  actual_sales: string;
+  basis: 'gl_6120' | 'runline_gross' | 'none';
+}
+
+export interface WagePlannerDashboardSummary {
+  fiscal_year: number;
+  settings_present: boolean;
+  ytd: {
+    start: string;
+    end: string;
+    periods_completed: number;
+    periods_remaining: number;
+  };
+  card1_headline: {
+    ytd_managed_wage_pct: string;
+    target_wage_pct: string;
+    prior_year_same_period_pct: string;
+    wage_basis: 'gl_6120' | 'runline_gross' | 'none';
+    prior_year_basis: 'gl_6120' | 'runline_gross' | 'none';
+    health: 'green' | 'yellow' | 'red';
+  };
+  card2_forward_target: {
+    next_unlocked_period_number: number | null;
+    adjusted_target_hours: string | null;
+    cum_over_under: string | null;
+    color: 'emerald' | 'red' | 'muted';
+  };
+  card3_ytd_actuals: {
+    actual_wages_ytd: string;
+    target_wages_ytd: string;
+    wages_variance: string;
+    actual_sales_ytd: string;
+    forecast_sales_ytd: string;
+    sales_variance: string;
+    wage_basis: 'gl_6120' | 'runline_gross' | 'none';
+  };
+  card4_salaried: {
+    per_period: string;
+    annual: string;
+    pct_of_annual_target: string | null;
+    staff: DashboardSummarySalariedStaff[];
+  };
+  card5_min_wage: {
+    ontario_min_wage: string;
+    alert_band: string;
+    near_min_employees: DashboardSummaryNearMinEmployee[];
+    affected_count: number;
+    total_delta_annual_est: string;
+  };
+  trend: DashboardSummaryTrendPoint[];
+}
+
+export async function getWagePlannerDashboardSummary(
+  entityCode: string,
+  fiscalYear?: number,
+): Promise<WagePlannerDashboardSummary> {
+  const res = await api.get('/api/wage-planner/dashboard-summary', {
+    params: { entity_code: entityCode, ...(fiscalYear ? { fiscal_year: fiscalYear } : {}) },
+  });
+  return res.data;
+}
+
 export async function downloadFreshExcel(
   entityCode: string,
   fiscalYear?: number,

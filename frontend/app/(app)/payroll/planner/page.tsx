@@ -16,6 +16,7 @@ import {
   type WagePlannerPeriod,
   type WagePlannerSettings,
 } from '@/lib/api/wage_planner';
+import { DashboardSummary } from './_components/dashboard-summary';
 
 const CURRENT_FY = new Date().getMonth() >= 9 ? new Date().getFullYear() + 1 : new Date().getFullYear();
 
@@ -224,6 +225,8 @@ export default function WagePlannerPage() {
           </div>
         </div>
       )}
+
+      <DashboardSummary entityCode={entityCode} fiscalYear={fiscalYear} />
 
       {!settings && !isLoading && (
         <Card>
