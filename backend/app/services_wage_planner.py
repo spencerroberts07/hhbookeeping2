@@ -344,6 +344,74 @@ def _prior_year_window(start: date, end: date) -> tuple[date, date]:
     return start - shift, end - shift
 
 
+def managed_wage_dollars(
+    session, entity_id: UUID, start: date, end: date
+) -> tuple[Decimal, str]:
+    """Return (managed_wage_$, basis) where basis ∈ {"gl_6120","runline_gross","none"}.
+
+    Prefers journal_lines account 6120 on source_module='payroll' batches when
+    any such batches exist for the window (current-FY GL path).  Falls back to
+    payroll_run_lines non-management gross_pay (FY2025 backfill path — those
+    runs are draft_confirmed and never posted to GL).
+
+    NOTE: The two bases are NOT equivalent:
+      gl_6120       = non-mgmt gross + employer CPP/EI + vacation accrual
+                      ("Wages & Benefits incl. employer CPP/EI & vacation accrual")
+      runline_gross = non-mgmt gross_pay only
+                      ("Gross wages, non-management — no statutory burden")
+    Callers must surface the basis label so dealers understand the difference.
+    """
+    # Branch A — preferred: literal GL account 6120 on payroll batches.
+    # Window on ap.period_end matches _account_sums() in reports.py:219-288.
+    # source_module='payroll' filter + GL-import writing to separate tables
+    # (gl_import_runs/gl_account_balances/gl_transactions, never journal_lines)
+    # gives double-count immunity.
+    row_a = session.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(jl.debit_amount), 0) AS amt,
+                   COUNT(DISTINCT jb.id)              AS batch_cnt
+            FROM journal_lines jl
+            JOIN journal_batches jb    ON jb.id = jl.journal_batch_id
+            JOIN accounting_periods ap ON ap.id = jb.accounting_period_id
+            WHERE jb.entity_id     = :eid
+              AND jl.account_code  = '6120'
+              AND jb.source_module = 'payroll'
+              AND jb.status NOT IN ('draft', 'voided', 'rejected')
+              AND ap.period_end BETWEEN :start AND :end
+            """
+        ),
+        {"eid": entity_id, "start": start, "end": end},
+    ).mappings().first()
+
+    if row_a and int(row_a["batch_cnt"]) > 0:
+        return Decimal(str(row_a["amt"])), "gl_6120"
+
+    # Branch B — fallback: non-management gross from payroll_run_lines.
+    # No _FINAL_STATUSES gate so FY2025 draft_confirmed runs are included.
+    row_b = session.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(prl.gross_pay), 0) AS amt
+            FROM payroll_run_lines prl
+            JOIN payroll_runs pr           ON pr.id = prl.payroll_run_id
+            LEFT JOIN payroll_employees pe ON pe.id = prl.employee_id
+            WHERE pr.entity_id = :eid
+              AND pr.period_end BETWEEN :start AND :end
+              AND COALESCE(pe.is_management, FALSE) = FALSE
+            """
+        ),
+        {"eid": entity_id, "start": start, "end": end},
+    ).mappings().first()
+
+    if row_b:
+        amt = Decimal(str(row_b["amt"]))
+        if amt > 0:
+            return amt, "runline_gross"
+
+    return Decimal("0"), "none"
+
+
 # ---------------------------------------------------------------------------
 # Core calculation
 # ---------------------------------------------------------------------------
@@ -993,6 +1061,311 @@ def min_wage_impact(
         "total_delta_annual_est": str(
             (total_projected_biweekly - total_current_biweekly) * Decimal("26")
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard summary (all 5 cards + multi-FY trend)
+# ---------------------------------------------------------------------------
+
+# Ontario minimum-wage constants for Card 5 (min-wage alert).
+# Update when Ontario raises the rate; $17.20 effective Oct 1 2024.
+_ONTARIO_MIN_WAGE = Decimal("17.20")
+_MIN_WAGE_ALERT_BAND = Decimal("2.00")   # alert if hourly_rate < min + $2.00
+_HOURS_PP_STANDARD = Decimal("80")       # estimated hours per period for cost projection
+
+
+def _safe_div_pct(a: Decimal | None, b: Decimal | None) -> Decimal | None:
+    """Divide and return 6-decimal precision (matches NUMERIC(7,6) settings columns)."""
+    if a is None or b is None or b == 0:
+        return None
+    return (a / b).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def compute_dashboard_summary(
+    session,
+    *,
+    entity_id: UUID,
+    fiscal_year: int,
+    fy_end_month: int,
+    fy_end_day: int,
+) -> dict:
+    """Aggregate all Wage Cost Planner dashboard cards + multi-FY trend series.
+
+    Returns a dict covering:
+      - card1_headline    : YTD managed wage % vs target and prior year
+      - card2_forward_target : adjusted_target_hours for next unlocked period
+      - card3_ytd_actuals : YTD wage $, sales $, vs targets
+      - card4_salaried    : per-period + annual salaried cost breakdown
+      - card5_min_wage    : near-min-wage employee alert (Ont. $17.20, $2 band)
+      - trend             : multi-FY [{fy, period_number, label, actual_wage_pct,
+                            target_pct, prior_year_pct, actual_wages, actual_sales,
+                            basis}] for the trend chart
+    """
+    # ----- 1. Settings + plan ------------------------------------------------
+    settings = get_settings(session, entity_id=entity_id, fiscal_year=fiscal_year)
+    if not settings:
+        return {
+            "fiscal_year": fiscal_year,
+            "settings_present": False,
+            "ytd": None,
+            "card1_headline": None,
+            "card2_forward_target": None,
+            "card3_ytd_actuals": None,
+            "card4_salaried": None,
+            "card5_min_wage": None,
+            "trend": [],
+        }
+
+    plan = compute_plan(session, entity_id=entity_id, fiscal_year=fiscal_year)
+    periods = plan["periods"]
+    plan_summary = plan.get("summary", {})
+
+    # ----- 2. Per-entity YTD window (no hardcoded fiscal-year-start month) ---
+    today = date.today()
+    fy_start = date(fiscal_year - 1, fy_end_month, fy_end_day) + timedelta(days=1)
+    fy_end_cal = date(fiscal_year, fy_end_month, fy_end_day)
+    ytd_end = min(today, fy_end_cal)
+
+    periods_completed = int(plan_summary.get("periods_locked") or 0)
+    periods_remaining = int(plan_summary.get("periods_remaining") or 0)
+
+    # ----- 3. Current-FY YTD wages + sales -----------------------------------
+    actual_wages_ytd, wage_basis = managed_wage_dollars(
+        session, entity_id, fy_start, ytd_end
+    )
+    actual_sales_ytd = _sum_sales(session, entity_id, fy_start, ytd_end)
+
+    # YTD targets derived from the plan rows (no extra SQL)
+    target_wages_ytd = sum(
+        (_d(p.get("target_wage_dollars")) or Decimal("0"))
+        for p in periods
+        if p.get("period_end") is not None and p["period_end"] <= ytd_end
+    )
+    forecast_sales_ytd = sum(
+        (_d(p.get("forecast_sales")) or Decimal("0"))
+        for p in periods
+        if p.get("period_end") is not None and p["period_end"] <= ytd_end
+    )
+
+    # ----- 4. Card 1 — headline KPI ------------------------------------------
+    twp = Decimal(str(settings["target_wage_pct"]))
+    ytd_pct = _safe_div_pct(actual_wages_ytd, actual_sales_ytd)
+
+    if ytd_pct is not None:
+        if ytd_pct <= twp:
+            health = "green"
+        elif ytd_pct <= twp + Decimal("0.005"):
+            health = "yellow"
+        else:
+            health = "red"
+    else:
+        health = "green"  # no data yet — neutral, not alarming
+
+    # Prior-year same-period (364-day shift for weekday alignment)
+    py_fy_start, py_ytd_end = _prior_year_window(fy_start, ytd_end)
+    py_wages, py_wage_basis = managed_wage_dollars(
+        session, entity_id, py_fy_start, py_ytd_end
+    )
+    py_sales = _sum_sales(session, entity_id, py_fy_start, py_ytd_end)
+    prior_year_pct = _safe_div_pct(py_wages, py_sales) if py_sales else None
+
+    # ----- 5. Card 2 — forward target ----------------------------------------
+    next_unlocked = next(
+        (p for p in periods if not p.get("locked")), None
+    )
+    next_period_number = next_unlocked["period_number"] if next_unlocked else None
+    next_adj_hours = next_unlocked.get("adjusted_target_hours") if next_unlocked else None
+
+    cum_ou = plan_summary.get("cum_over_under")
+    if cum_ou is not None:
+        c = Decimal(str(cum_ou))
+        card2_color = "red" if c > 0 else ("emerald" if c < 0 else "muted")
+    else:
+        card2_color = "muted"
+
+    # ----- 6. Card 3 — YTD actuals vs targets --------------------------------
+    wages_variance = actual_wages_ytd - (target_wages_ytd or Decimal("0"))
+    sales_variance = actual_sales_ytd - (forecast_sales_ytd or Decimal("0"))
+
+    # ----- 7. Card 4 — salaried breakdown ------------------------------------
+    bp = Decimal(str(settings["benefits_pct"]))
+    B = Decimal("1") + bp
+    salaried_pp, _ = _compute_salaried_totals(settings)
+    salaried_annual = (salaried_pp * Decimal("26")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    target_annual = _d(plan_summary.get("target_annual_wage_dollars"))
+    salaried_pct = _safe_div_pct(salaried_annual, target_annual)
+
+    staff_detail = []
+    for emp in (settings.get("salaried_staff") or []):
+        sal = Decimal(str(emp.get("annual_salary", 0)))
+        bonus = Decimal(str(emp.get("bonus", 0)))
+        annual_cost = ((sal + bonus) * B).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        per_period = (annual_cost / Decimal("26")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        staff_detail.append({
+            "employee_name": emp.get("employee_name", ""),
+            "annual_salary": str(sal),
+            "bonus": str(bonus),
+            "annual_cost": str(annual_cost),
+            "per_period": str(per_period),
+        })
+
+    # ----- 8. Card 5 — min-wage alert ----------------------------------------
+    # Alert threshold: employees within $2.00 of Ontario minimum wage ($17.20)
+    near_threshold = float(_ONTARIO_MIN_WAGE + _MIN_WAGE_ALERT_BAND)
+    near_rows = session.execute(
+        text(
+            """
+            SELECT id, full_name, hourly_rate
+            FROM payroll_employees
+            WHERE entity_id  = :eid
+              AND is_active   = TRUE
+              AND employment_type <> 'salaried'
+              AND hourly_rate < :threshold
+            ORDER BY hourly_rate ASC
+            """
+        ),
+        {"eid": entity_id, "threshold": near_threshold},
+    ).mappings().all()
+
+    near_min_list = []
+    total_delta_annual = Decimal("0")
+    for emp in near_rows:
+        current_rate = Decimal(str(emp["hourly_rate"]))
+        gap = max(Decimal("0"), _ONTARIO_MIN_WAGE - current_rate)
+        est_annual = (gap * _HOURS_PP_STANDARD * Decimal("26")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        total_delta_annual += est_annual
+        near_min_list.append({
+            "employee_id": str(emp["id"]),
+            "full_name": emp["full_name"],
+            "current_rate": str(current_rate),
+            "gap_to_min": str(gap),
+            "est_annual_raise_cost": str(est_annual),
+        })
+
+    # ----- 9. Trend series (all imported fiscal years) -----------------------
+    fy_rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT fiscal_year
+            FROM wage_planner_periods
+            WHERE entity_id = :eid
+            UNION
+            SELECT DISTINCT fiscal_year
+            FROM payroll_pay_periods
+            WHERE entity_id = :eid
+            ORDER BY fiscal_year
+            """
+        ),
+        {"eid": entity_id},
+    ).mappings().all()
+    all_fys = [r["fiscal_year"] for r in fy_rows]
+
+    trend: list[dict] = []
+    for fy in all_fys:
+        fy_settings = get_settings(session, entity_id=entity_id, fiscal_year=fy)
+        fy_target_pct = (
+            Decimal(str(fy_settings["target_wage_pct"])) if fy_settings else None
+        )
+        cal = get_pay_period_calendar(session, entity_id=entity_id, fiscal_year=fy)
+
+        for c in cal:
+            ps: date = c["period_start"]
+            pe: date = c["period_end"]
+
+            # Only emit periods that are fully in the past (or up to today)
+            if ps > today:
+                break
+
+            wage, basis = managed_wage_dollars(session, entity_id, ps, pe)
+            sales = _sum_sales(session, entity_id, ps, pe)
+            if wage == 0 and sales == 0:
+                continue  # no data yet, skip
+
+            actual_pct = _safe_div_pct(wage, sales)
+
+            # Prior-year comparison for this specific period slot
+            py_ps, py_pe = _prior_year_window(ps, pe)
+            py_w, _ = managed_wage_dollars(session, entity_id, py_ps, py_pe)
+            py_s = _sum_sales(session, entity_id, py_ps, py_pe)
+            py_pct = _safe_div_pct(py_w, py_s)
+
+            pn = c["period_number"]
+            # "P06 Mar 1–14" — %-d removes zero-padding (Linux); Render is Linux
+            label = (
+                f"P{pn:02d} "
+                + ps.strftime("%-d %b")
+                + "–"
+                + pe.strftime("%-d %b")
+            )
+
+            trend.append({
+                "fy": fy,
+                "period_number": pn,
+                "label": label,
+                "actual_wage_pct": str(actual_pct) if actual_pct is not None else None,
+                "target_pct": str(fy_target_pct) if fy_target_pct is not None else None,
+                "prior_year_pct": str(py_pct) if py_pct is not None else None,
+                "actual_wages": str(wage),
+                "actual_sales": str(sales),
+                "basis": basis,
+            })
+
+    # ----- 10. Assemble response ---------------------------------------------
+    return {
+        "fiscal_year": fiscal_year,
+        "settings_present": True,
+        "ytd": {
+            "start": fy_start.isoformat(),
+            "end": ytd_end.isoformat(),
+            "periods_completed": periods_completed,
+            "periods_remaining": periods_remaining,
+        },
+        "card1_headline": {
+            "ytd_managed_wage_pct": str(ytd_pct) if ytd_pct is not None else None,
+            "target_wage_pct": str(twp),
+            "prior_year_same_period_pct": str(prior_year_pct) if prior_year_pct is not None else None,
+            "wage_basis": wage_basis,
+            "prior_year_basis": py_wage_basis,
+            "health": health,
+        },
+        "card2_forward_target": {
+            "next_unlocked_period_number": next_period_number,
+            "adjusted_target_hours": (
+                str(next_adj_hours) if next_adj_hours is not None else None
+            ),
+            "cum_over_under": str(cum_ou) if cum_ou is not None else None,
+            "color": card2_color,
+        },
+        "card3_ytd_actuals": {
+            "actual_wages_ytd": str(actual_wages_ytd),
+            "target_wages_ytd": str(target_wages_ytd),
+            "wages_variance": str(wages_variance),
+            "actual_sales_ytd": str(actual_sales_ytd),
+            "forecast_sales_ytd": str(forecast_sales_ytd),
+            "sales_variance": str(sales_variance),
+            "wage_basis": wage_basis,
+        },
+        "card4_salaried": {
+            "per_period": str(salaried_pp),
+            "annual": str(salaried_annual),
+            "pct_of_annual_target": str(salaried_pct) if salaried_pct is not None else None,
+            "staff": staff_detail,
+        },
+        "card5_min_wage": {
+            "ontario_min_wage": str(_ONTARIO_MIN_WAGE),
+            "alert_band": str(_MIN_WAGE_ALERT_BAND),
+            "near_min_employees": near_min_list,
+            "affected_count": len(near_min_list),
+            "total_delta_annual_est": str(total_delta_annual),
+        },
+        "trend": trend,
     }
 
 

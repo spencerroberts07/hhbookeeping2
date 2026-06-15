@@ -35,6 +35,7 @@ from ..services_auth import enforce_entity_code, require_role
 from ..services_wage_planner import (
     apply_manual_override,
     backfill_calendar_from_runs,
+    compute_dashboard_summary,
     compute_plan,
     get_pay_period_calendar,
     get_settings,
@@ -247,6 +248,48 @@ def get_plan(
 
     import json
     return json.loads(json.dumps(plan, default=_serial))
+
+
+@router.get("/dashboard-summary")
+def get_dashboard_summary(
+    entity_code: str = Query(...),
+    fiscal_year: int | None = Query(None),
+    _user: dict = Depends(require_role("bookkeeper")),
+) -> dict[str, Any]:
+    """Return all dashboard-summary card data + multi-FY trend series.
+
+    Used by the WagePlannerDashboardSummary component that sits above the
+    period table on /payroll/planner.  Covers:
+      card1_headline    — YTD managed wage % (GL 6120 / sales) vs target + prior year
+      card2_forward_target — adjusted_target_hours for next unlocked period
+      card3_ytd_actuals — YTD wage $, sales $, vs forecast
+      card4_salaried    — per-period + annual salaried cost breakdown
+      card5_min_wage    — near-min-wage alert (Ont. $17.20, $2 band)
+      trend             — multi-FY bar/line series
+    """
+    enforce_entity_code(_user, entity_code)
+    with db_session() as session:
+        entity = _entity_or_404(session, entity_code)
+        fy = fiscal_year or _current_fiscal_year(entity)
+        result = compute_dashboard_summary(
+            session,
+            entity_id=entity["id"],
+            fiscal_year=fy,
+            fy_end_month=entity["fy_end_month"],
+            fy_end_day=entity["fy_end_day"],
+        )
+
+    # Serialize Decimals / dates exactly like /plan does
+    def _serial(obj):
+        from decimal import Decimal as _D
+        if isinstance(obj, _D):
+            return str(obj)
+        if isinstance(obj, DateType):
+            return obj.isoformat()
+        raise TypeError(f"Not serializable: {type(obj)}")
+
+    import json
+    return json.loads(json.dumps(result, default=_serial))
 
 
 # ---------------------------------------------------------------------------
