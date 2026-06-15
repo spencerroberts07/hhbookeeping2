@@ -237,10 +237,13 @@ def get_plan(
         fy = fiscal_year or _current_fiscal_year(entity)
         plan = compute_plan(session, entity_id=entity["id"], fiscal_year=fy)
 
-    # Serialize Decimals to strings for JSON transport
+    # Serialize Decimals / UUIDs / dates to strings for JSON transport
     def _serial(obj):
         from decimal import Decimal as _D
+        from uuid import UUID as _UUID
         if isinstance(obj, _D):
+            return str(obj)
+        if isinstance(obj, _UUID):
             return str(obj)
         if isinstance(obj, DateType):
             return obj.isoformat()
@@ -279,10 +282,13 @@ def get_dashboard_summary(
             fy_end_day=entity["fy_end_day"],
         )
 
-    # Serialize Decimals / dates exactly like /plan does
+    # Serialize Decimals / UUIDs / dates to strings for JSON transport
     def _serial(obj):
         from decimal import Decimal as _D
+        from uuid import UUID as _UUID
         if isinstance(obj, _D):
+            return str(obj)
+        if isinstance(obj, _UUID):
             return str(obj)
         if isinstance(obj, DateType):
             return obj.isoformat()
