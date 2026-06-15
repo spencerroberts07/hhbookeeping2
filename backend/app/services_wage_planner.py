@@ -1298,13 +1298,8 @@ def compute_dashboard_summary(
             py_pct = _safe_div_pct(py_w, py_s)
 
             pn = c["period_number"]
-            # "P06 Mar 1–14" — %-d removes zero-padding (Linux); Render is Linux
-            label = (
-                f"P{pn:02d} "
-                + ps.strftime("%-d %b")
-                + "–"
-                + pe.strftime("%-d %b")
-            )
+            # "P06 Mar 1–14" — use .day directly for cross-platform zero-free day
+            label = f"P{pn:02d} {ps.day} {ps.strftime('%b')}–{pe.day} {pe.strftime('%b')}"
 
             trend.append({
                 "fy": fy,
