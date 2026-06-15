@@ -377,7 +377,8 @@ def managed_wage_dollars(
             WHERE jb.entity_id     = :eid
               AND jl.account_code  = '6120'
               AND jb.source_module = 'payroll'
-              AND jb.status NOT IN ('draft', 'voided', 'rejected')
+              AND jb.status NOT IN ('voided', 'rejected')
+              AND jb.workflow_status IN ('approved_to_post', 'posted')
               AND ap.period_end BETWEEN :start AND :end
             """
         ),
